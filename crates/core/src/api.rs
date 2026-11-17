@@ -1065,7 +1065,7 @@ mod tests {
         let e = bearer.transcribe(&speech(), &TranscribeOptions::default()).unwrap_err();
         // A 5xx: the phone takes it as "server unavailable" and may fall back to its own model.
         assert_eq!(e.kind, ErrorKind::Unavailable);
-        assert!(e.detail.contains("502") && e.detail.contains("engine down"), "{}", e.detail);
+        assert_eq!(e.detail, "HTTP 502", "server error bodies must not enter client diagnostics");
         srv.stop();
     }
 

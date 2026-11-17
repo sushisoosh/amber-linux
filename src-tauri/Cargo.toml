@@ -1,6 +1,6 @@
 [package]
 name = "amber-pc"
-description = "Amber for Windows: dictation into any window"
+description = "Amber desktop dictation for Windows and Linux"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,12 +25,24 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Tauri's own runtime; only its timer is used directly.
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "sync", "macros"] }
 cpal = "0.15"
 arboard = { version = "3", default-features = false }
 # The phone page: the PC's addresses and a QR code of the one to use.
 if-addrs = "0.13"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+amber-inference = { path = "../crates/inference" }
+ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+gtk = "0.18"
+x11rb = { version = "0.13", features = ["xtest"] }
+secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+zeroize = "1"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

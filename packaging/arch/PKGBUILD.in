@@ -1,0 +1,58 @@
+# Generated from the current authorized checkout by tools/arch.sh.
+# This recipe deliberately does not download the unported upstream repository.
+pkgname=amber-dictation
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Local-first desktop dictation with explicit X11 text delivery'
+arch=('x86_64')
+license=('LicenseRef-Amber-Proprietary')
+depends=('alsa-lib' 'dbus' 'glibc' 'libgcc' 'libstdc++' 'gtk3' 'webkit2gtk-4.1'
+         'libappindicator' 'libx11' 'libxtst' 'bash' 'coreutils')
+makedepends=('rust' 'nodejs' 'npm' 'cmake' 'clang' 'pkgconf' 'desktop-file-utils')
+checkdepends=('python' 'xorg-server-xvfb' 'xorg-xauth' 'i3-wm' 'ttf-dejavu')
+optdepends=('pipewire-alsa: route the default ALSA microphone through PipeWire'
+            'pulseaudio-alsa: alternative ALSA routing through PulseAudio'
+            'gnome-keyring: persistent encrypted credentials and history through Secret Service'
+            'dunst: notifications in i3'
+            'dex: process XDG autostart entries in i3'
+            'i3lock: screen locker used by amber-i3-lock'
+            'xss-lock: connect the locker to idle and suspend events')
+options=('!lto')
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('@SHA256@')
+
+prepare() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    npm ci --no-audit --no-fund
+    cargo fetch --locked --target x86_64-unknown-linux-gnu
+}
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    export CARGO_TARGET_DIR="${srcdir}/target"
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+    npm run app:build -- --no-bundle -- --frozen
+}
+
+check() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    export CARGO_TARGET_DIR="${srcdir}/target"
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+    export CARGO_NET_OFFLINE=true
+    npm run test:ui
+    cargo test --workspace --frozen
+    python tools/test-x11.py
+    desktop-file-validate packaging/arch/amber-dictation.desktop
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    install -Dm755 "${srcdir}/target/release/amber-dictation" "${pkgdir}/usr/bin/amber-dictation"
+    install -Dm755 tools/amber-i3-lock "${pkgdir}/usr/bin/amber-i3-lock"
+    install -Dm644 packaging/arch/amber-dictation.desktop "${pkgdir}/usr/share/applications/app.amber.pc.desktop"
+    for size in 32 128; do
+        install -Dm644 "src-tauri/icons/${size}x${size}.png" "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/amber-dictation.png"
+    done
+    install -Dm644 src-tauri/icons/128x128@2x.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/amber-dictation.png"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

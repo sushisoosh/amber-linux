@@ -40,6 +40,7 @@ pub struct ModelInfo {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
+    platform: &'static str,
     settings: Settings,
     version: &'static str,
     providers: Vec<ProviderInfo>,
@@ -49,11 +50,78 @@ pub struct Overview {
 #[tauri::command]
 pub fn get_overview(core: State<Core>) -> Overview {
     Overview {
+        platform: if cfg!(target_os = "linux") { "linux" } else if cfg!(windows) { "windows" } else { "other" },
         settings: core.settings(),
         version: env!("CARGO_PKG_VERSION"),
         providers: providers_info(&core),
         phase: core.dictation.phase(),
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStatus {
+    session: String,
+    lifecycle: String,
+    shortcuts: String,
+    insertion: String,
+    clipboard: String,
+    secure_storage: String,
+}
+
+#[derive(Serialize)]
+pub struct StorageStatus {
+    credentials: String,
+    history: String,
+}
+
+#[tauri::command]
+pub fn get_storage_status(core: State<Core>) -> StorageStatus {
+    StorageStatus { credentials: crate::secrets::storage_status(&core.paths.secrets), history: core.memory.storage_status() }
+}
+
+#[tauri::command]
+pub fn get_desktop_status(core: State<Core>) -> DesktopStatus {
+    #[cfg(target_os = "linux")]
+    {
+        let status = crate::linux_desktop::status();
+        DesktopStatus {
+            session: status.session,
+            lifecycle: status.lifecycle,
+            shortcuts: status.shortcuts,
+            insertion: status.insertion,
+            clipboard: status.clipboard,
+            secure_storage: crate::secrets::storage_status(&core.paths.secrets),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    DesktopStatus {
+        session: "Windows desktop".into(), shortcuts: "System shortcuts".into(),
+        lifecycle: "Windows desktop session".into(),
+        insertion: "Windows text insertion".into(), clipboard: "System clipboard".into(),
+        secure_storage: crate::secrets::storage_status(&core.paths.secrets),
+    }
+}
+
+#[tauri::command]
+pub fn get_last_result(core: State<Core>) -> Option<crate::dictation::DictationResult> {
+    core.dictation.result()
+}
+
+#[tauri::command]
+pub fn clear_last_result(app: AppHandle) {
+    crate::dictation::clear_result(&app);
+}
+
+#[tauri::command]
+pub fn cancel_dictation(app: AppHandle) {
+    crate::dictation::cancel(&app);
+}
+
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    crate::dictation::cancel(&app);
+    app.exit(0);
 }
 
 fn providers_info(core: &Core) -> Vec<ProviderInfo> {
@@ -74,12 +142,26 @@ fn providers_info(core: &Core) -> Vec<ProviderInfo> {
 /// Saves the settings and applies what changed. A hotkey that cannot be registered is
 /// rolled back and reported; everything else is kept.
 #[tauri::command]
-pub fn save_settings(app: AppHandle, core: State<Core>, settings: Settings) -> Result<Settings, String> {
+pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        save_settings_inner(&app, &core, settings)
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn save_settings_inner(app: &AppHandle, core: &Core, settings: Settings) -> Result<Settings, String> {
+    let _transaction = core.settings_changes.lock().unwrap();
     let before = core.settings();
+    if settings.history && !before.history {
+        crate::secrets::check_available()?;
+    }
     if let Some(base) = (settings.server.provider == providers::CUSTOM.id).then(|| settings.server.base_url.trim()).filter(|b| !b.is_empty()) {
         providers::check_base_url(base)?;
     }
-    let mut after = core.update_settings(|s| *s = settings);
+    if settings.cleanup.provider == providers::CUSTOM.id && !settings.cleanup.base_url.trim().is_empty() {
+        providers::check_base_url(&settings.cleanup.base_url)?;
+    }
+    let mut after = core.try_update_settings(|s| *s = settings)?;
 
     let mut problem = None;
     let command_key = |s: &amber_core::settings::Settings| (s.terminal.enabled, s.terminal.hotkey.clone());
@@ -97,7 +179,10 @@ pub fn save_settings(app: AppHandle, core: State<Core>, settings: Settings) -> R
         bubble::apply(&app);
     }
     if after.autostart != before.autostart {
-        crate::autostart::set(after.autostart);
+        if let Err(e) = crate::autostart::set(after.autostart) {
+            after = core.try_update_settings(|s| s.autostart = before.autostart)?;
+            problem = Some(format!("Login startup was not changed: {e}"));
+        }
     }
     let local_changed = after.local != before.local || after.engine != before.engine;
     if local_changed {
@@ -121,12 +206,15 @@ pub fn save_settings(app: AppHandle, core: State<Core>, settings: Settings) -> R
             let _ = app.state::<Core>().llm.ensure(&app);
         });
     }
-    core.memory.set_enabled(after.history);
+    core.memory.set_enabled(after.history, after.history_days);
     if before.history && !after.history {
         // Switched off: what was kept goes too.
-        core.memory.clear_history();
+        if let Err(e) = core.memory.clear_history() { problem = Some(e); }
     } else if after.history_days < before.history_days {
-        core.memory.prune(after.history_days);
+        if let Err(e) = core.memory.prune(after.history_days) { problem = Some(e); }
+    }
+    if after.history {
+        if let Some(e) = core.memory.history_error() { problem = Some(e); }
     }
     if after.phone != before.phone {
         // Stopping may wait for a phone dictation in progress.
@@ -144,10 +232,21 @@ pub fn save_settings(app: AppHandle, core: State<Core>, settings: Settings) -> R
 }
 
 #[tauri::command]
-pub fn set_api_key(core: State<Core>, provider: String, key: Option<String>) -> Result<bool, String> {
+pub async fn set_api_key(app: AppHandle, provider: String, key: Option<String>, base_url: Option<String>) -> Result<bool, String> {
     providers::by_id(&provider).ok_or("Unknown provider.")?;
-    core.set_key(&provider, key)?;
-    Ok(core.has_key(&provider))
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        core.set_key_for(&provider, base_url.as_deref(), key)?;
+        Ok(if let Some(base) = base_url { core.key_for(&provider, &base).is_some() } else { core.has_key(&provider) })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn has_api_key(core: State<Core>, provider: String, base_url: Option<String>) -> Result<bool, String> {
+    providers::by_id(&provider).ok_or("Unknown provider.")?;
+    let base = base_url.unwrap_or_else(|| core.settings().server.base_url);
+    if provider == "custom" { providers::credential_origin(&base)?; }
+    Ok(core.key_for(&provider, &base).is_some())
 }
 
 /// Asks the server for its model list: address reachable, key accepted? Returns the round
@@ -157,7 +256,7 @@ pub async fn test_server(app: AppHandle, provider: String, base_url: String, key
     let p = providers::by_id(&provider).ok_or("Unknown provider.")?;
     let base = providers::effective_base_url(p, &base_url);
     providers::check_base_url(&base)?;
-    let key = key.filter(|k| !k.trim().is_empty()).or_else(|| app.state::<Core>().key(p.id)).unwrap_or_default();
+    let key = key.filter(|k| !k.trim().is_empty()).or_else(|| app.state::<Core>().key_for(p.id, &base)).unwrap_or_default();
     if p.needs_key && key.is_empty() {
         return Err(format!("Enter your {} API key first.", p.name));
     }
@@ -307,11 +406,14 @@ fn total_ram_mb() -> u64 {
 
 #[cfg(not(windows))]
 fn total_ram_mb() -> u64 {
-    0
+    std::fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
+        text.lines().find_map(|line| line.strip_prefix("MemTotal:")?.split_whitespace().next()?.parse::<u64>().ok())
+    }).unwrap_or(0) / 1024
 }
 
 /// The NVIDIA driver puts its CUDA library into System32.
 fn has_nvidia() -> bool {
+    if cfg!(target_os = "linux") { return false; }
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     std::path::Path::new(&root).join("System32").join("nvcuda.dll").exists()
 }
@@ -369,6 +471,9 @@ struct Fetch {
 type Install = Box<dyn FnOnce(&AppHandle) -> Result<(), DownloadError> + Send>;
 
 fn plan(core: &Core, kind: Kind, id: &str) -> Result<(Vec<Fetch>, Option<Install>), String> {
+    if cfg!(target_os = "linux") && matches!(kind, Kind::Runtime | Kind::Tunnel) {
+        return Err("The Linux CPU engine is built in. Tunnels are not included in this release.".into());
+    }
     let layout = core.paths.layout.clone();
     let downloads = layout.root.join("downloads");
     const MB: u64 = 1 << 20;
@@ -403,7 +508,7 @@ fn plan(core: &Core, kind: Kind, id: &str) -> Result<(Vec<Fetch>, Option<Install
                 .map(|(i, a)| Fetch {
                     url: a.url.into(),
                     sha256: a.sha256,
-                    file: downloads.join(format!("llama-{}-{}-{i}.zip", rt.id, local::LLAMA_CPP_BUILD)),
+                    file: downloads.join(format!("llama-{}-{}-{i}.{}", rt.id, local::LLAMA_CPP_BUILD, if cfg!(target_os = "linux") { "tar.gz" } else { "zip" })),
                     size: a.size_mb as u64 * MB,
                 })
                 .collect();
@@ -433,6 +538,8 @@ fn plan(core: &Core, kind: Kind, id: &str) -> Result<(Vec<Fetch>, Option<Install
 pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, select: bool) -> Result<(), String> {
     let key = key_of(kind, &id);
     let (fetches, install) = plan(&core, kind, &id)?;
+    #[cfg(target_os = "linux")]
+    check_download_space(&core.paths.layout.root, &fetches, install.is_some())?;
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut downloads = core.downloads.lock().unwrap();
@@ -514,6 +621,24 @@ pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, selec
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn check_download_space(root: &std::path::Path, fetches: &[Fetch], unpack: bool) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|_| "Invalid model directory.")?;
+    let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        return Err(format!("Could not check free space for the download: {}", std::io::Error::last_os_error()));
+    }
+    let info = unsafe { info.assume_init() };
+    let free = (info.f_bavail as u64).saturating_mul(info.f_frsize as u64);
+    let bytes = fetches.iter().fold(0u64, |sum, file| sum.saturating_add(file.size));
+    let needed = bytes.saturating_mul(if unpack { 3 } else { 1 }).saturating_add(256 * 1024 * 1024);
+    if free < needed {
+        return Err(format!("Not enough disk space. This download needs about {} MiB including installation headroom; {} MiB is available.", needed / (1 << 20), free / (1 << 20)));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn cancel_download(core: State<Core>, kind: Kind, id: String) {
     if let Some(flag) = core.downloads.lock().unwrap().get(&key_of(kind, &id)) {
@@ -523,6 +648,9 @@ pub fn cancel_download(core: State<Core>, kind: Kind, id: String) {
 
 #[tauri::command]
 pub async fn remove_download(app: AppHandle, kind: Kind, id: String) -> Result<(), String> {
+    if cfg!(target_os = "linux") && matches!(kind, Kind::Runtime | Kind::Tunnel) {
+        return Err("The built-in Linux runtime cannot be removed. Tunnels are not included in this release.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let core = app.state::<Core>();
         let layout = &core.paths.layout;
@@ -602,11 +730,13 @@ pub fn get_log() -> Vec<crate::diag::Entry> {
 
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> Result<Option<crate::updates::UpdateInfo>, String> {
+    if cfg!(target_os = "linux") { return Err("Linux updates are installed using release packages.".into()); }
     crate::updates::check(&app).await
 }
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<bool, String> {
+    if cfg!(target_os = "linux") { return Err("Linux updates are installed using release packages.".into()); }
     crate::updates::install(&app, false).await
 }
 
@@ -624,14 +754,16 @@ pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
 
 /// Whether the phone API runs, at which addresses (key included), and a QR code to scan.
 #[tauri::command]
-pub async fn phone_info(app: AppHandle) -> crate::phone::Info {
-    crate::phone::info(&app.state::<Core>())
+pub async fn phone_info(app: AppHandle) -> Result<crate::phone::Info, String> {
+    if cfg!(target_os = "linux") { return Err("Phone pairing is not included in the Linux desktop release.".into()); }
+    Ok(crate::phone::info(&app.state::<Core>()))
 }
 
 /// A new secret for an access key (the first if none is named): its old addresses stop
 /// working, the other keys go on.
 #[tauri::command]
 pub async fn phone_new_key(app: AppHandle, id: Option<String>) -> Result<crate::phone::Info, String> {
+    if cfg!(target_os = "linux") { return Err("Phone pairing is not included in the Linux desktop release.".into()); }
     let core = app.state::<Core>();
     crate::phone::new_key(&core, id.as_deref())?;
     crate::diag::info("phone API: new key");
@@ -641,6 +773,7 @@ pub async fn phone_new_key(app: AppHandle, id: Option<String>) -> Result<crate::
 /// Removes an access key: its devices are locked out, the others go on.
 #[tauri::command]
 pub async fn phone_remove_key(app: AppHandle, id: String) -> Result<crate::phone::Info, String> {
+    if cfg!(target_os = "linux") { return Err("Phone pairing is not included in the Linux desktop release.".into()); }
     let core = app.state::<Core>();
     let after = crate::phone::remove_key(&core, &id)?;
     // The page holds the settings too: without this its next save brings the key back.
@@ -653,6 +786,7 @@ pub async fn phone_remove_key(app: AppHandle, id: String) -> Result<crate::phone
 /// shows; None removes it.
 #[tauri::command]
 pub fn set_tunnel_token(app: AppHandle, core: State<Core>, token: Option<String>) -> Result<(), String> {
+    if cfg!(target_os = "linux") { return Err("Tunnels are not included in the Linux desktop release.".into()); }
     let token = match token.filter(|t| !t.trim().is_empty()) {
         Some(pasted) => Some(amber_core::api::tunnel_token(&pasted).ok_or(
             "That is not a tunnel token - copy the token (it starts with \"eyJ\") or the whole install command from Cloudflare.",
@@ -742,18 +876,18 @@ pub fn chat_providers(core: State<Core>) -> Vec<ChatProvider> {
 }
 
 #[tauri::command]
-pub fn history_list(core: State<Core>) -> Vec<amber_core::history::Entry> {
-    core.memory.history()
+pub async fn history_list(app: AppHandle) -> Result<Vec<amber_core::history::Entry>, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<Core>().memory.history()).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn history_delete(core: State<Core>, at: u64) {
-    core.memory.forget(at);
+pub async fn history_delete(app: AppHandle, at: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<Core>().memory.forget(at)).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn history_clear(core: State<Core>) {
-    core.memory.clear_history();
+pub async fn history_clear(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<Core>().memory.clear_history()).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

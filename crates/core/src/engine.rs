@@ -1,11 +1,10 @@
-//! Audio in, text out. Both engines speak HTTP: a server through the OpenAI audio endpoint,
-//! the local engine through whisper.cpp's own server on 127.0.0.1. The app only sees
-//! [Transcriber].
+//! Audio in, text out. HTTP adapters for OpenAI-compatible providers and the Windows local
+//! whisper.cpp helper. Embedded backends implement the same [Transcriber] contract.
 
 use std::time::Duration;
+use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
 
-use reqwest::blocking::{multipart, Client};
-use serde::Deserialize;
+use reqwest::{multipart, Client};
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscribeOptions {
@@ -122,6 +121,23 @@ pub fn wav_ms(wav: &[u8]) -> u64 {
     (wav.len().saturating_sub(44) / 2) as u64 * 1000 / 16_000
 }
 
+/// One dictation's cancellation, never reset or reused for another run. Native model loading
+/// may not be interruptible; callers must still serialize work and discard stale results.
+#[derive(Clone, Default, Debug)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) { self.0.store(true, Ordering::Release); }
+    pub fn is_cancelled(&self) -> bool { self.0.load(Ordering::Acquire) }
+    pub fn check(&self) -> Result<(), SttError> {
+        if self.is_cancelled() {
+            Err(SttError::new(ErrorKind::Cancelled, "Dictation cancelled.", "cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub trait Transcriber: Send + Sync {
     fn transcribe(&self, wav: &[u8], options: &TranscribeOptions) -> Result<String, SttError>;
 
@@ -130,10 +146,27 @@ pub trait Transcriber: Send + Sync {
     fn transcribe_detecting(&self, wav: &[u8], options: &TranscribeOptions) -> Result<(String, Option<String>), SttError> {
         self.transcribe(wav, options).map(|t| (t, None))
     }
+
+    /// Backends override this to stop work in flight. The default only prevents starting or
+    /// accepting cancelled work; it cannot interrupt an arbitrary legacy implementation.
+    fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        cancel.check()?;
+        let result = self.transcribe(wav, options);
+        cancel.check()?;
+        result
+    }
+
+    fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        cancel.check()?;
+        let result = self.transcribe_detecting(wav, options);
+        cancel.check()?;
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    Cancelled,
     Unauthorized,
     RateLimited,
     TooLarge,
@@ -168,13 +201,71 @@ impl SttError {
     }
 }
 
-fn client(timeout: Duration) -> Client {
-    Client::builder()
+pub(crate) fn client(timeout: Duration, base_url: &str) -> Client {
+    let mut builder = Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(8))
-        .user_agent(concat!("AmberPC/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("http client")
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .user_agent(concat!("AmberPC/", env!("CARGO_PKG_VERSION")));
+    if reqwest::Url::parse(base_url).ok().is_some_and(|u| crate::providers::is_loopback_host(u.host_str())) {
+        // A local helper's audio/key must not be forwarded to an environment-configured proxy.
+        builder = builder.no_proxy();
+    }
+    builder.build().unwrap_or_else(|_| panic!("Could not initialize HTTP client."))
+}
+
+pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CATALOG_BYTES: usize = 512 * 1024;
+
+pub(crate) fn validate_endpoint(url: &str) -> Result<(), SttError> {
+    crate::providers::check_base_url(url)
+        .map(|_| ())
+        .map_err(|message| SttError::new(ErrorKind::Server, message, "endpoint rejected"))
+}
+
+/// The synchronous engine API runs on a blocking worker. A shared async transport lets
+/// cancellation drop an in-flight upload/read instead of leaving a detached HTTP worker.
+pub(crate) fn request(http: &Client, request: reqwest::RequestBuilder, limit: usize, cancel: &CancellationToken) -> Result<(u16, Vec<u8>), SttError> {
+    cancel.check()?;
+    let request = request.build().map_err(network_error)?;
+    validate_endpoint(request.url().as_str())?;
+    static HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let runtime = HTTP_RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().expect("HTTP runtime"));
+    let result = runtime.block_on(async {
+        let response = async {
+            let mut resp = http.execute(request).await.map_err(network_error)?;
+            let status = resp.status().as_u16();
+            // Error bodies are neither needed nor trusted. Do not download or log them.
+            if !(200..300).contains(&status) { return Ok((status, Vec::new())); }
+            let too_large = || SttError::new(ErrorKind::BadResponse, "The engine's answer was too large.", format!("response exceeds {limit} bytes"));
+            if resp.content_length().is_some_and(|n| n > limit as u64) { return Err(too_large()); }
+            let mut body = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(network_error)? {
+                if chunk.len() > limit.saturating_sub(body.len()) { return Err(too_large()); }
+                body.extend_from_slice(&chunk);
+            }
+            Ok((status, body))
+        };
+        let cancelled = async {
+            loop {
+                if let Err(error) = cancel.check() { break error; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            error = cancelled => Err(error),
+            result = response => result,
+        }
+    });
+    cancel.check()?;
+    result
+}
+
+pub(crate) fn response_json(status: u16, body: &[u8]) -> Result<serde_json::Value, SttError> {
+    if !(200..300).contains(&status) { return Err(status_error(status, "")); }
+    serde_json::from_slice(body).map_err(|e| json_error(&e, body.len()))
 }
 
 /// Groq, OpenAI or an own server: `POST {base}/audio/transcriptions`.
@@ -183,48 +274,103 @@ pub struct OpenAiTranscriber {
     api_key: String,
     model: String,
     http: Client,
+    discover: bool,
+    catalog: OnceLock<Option<crate::providers::AmberCatalog>>,
 }
 
 impl OpenAiTranscriber {
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
         OpenAiTranscriber {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
             api_key: api_key.trim().to_string(),
             model: model.to_string(),
-            http: client(Duration::from_secs(90)),
+            http: client(Duration::from_secs(90), base_url.trim()),
+            discover: false,
+            catalog: OnceLock::new(),
         }
+    }
+
+    /// Enable only for custom endpoints. No paid requests or alternate destinations are
+    /// probed. A catalog is cached only for this immutable URL/key pair.
+    pub fn with_catalog_discovery(mut self) -> Self {
+        self.discover = true;
+        self
+    }
+
+    pub fn catalog(&self) -> Result<Option<crate::providers::AmberCatalog>, SttError> {
+        self.discover_catalog(&CancellationToken::default())
+    }
+
+    fn discover_catalog(&self, cancel: &CancellationToken) -> Result<Option<crate::providers::AmberCatalog>, SttError> {
+        cancel.check()?;
+        if let Some(catalog) = self.catalog.get() { return Ok(catalog.clone()); }
+        let (status, body) = self.models(cancel)?;
+        // Some ordinary compatible servers have no catalog. Other failures do not justify
+        // uploading audio to a service whose identity could not be established.
+        let catalog = if matches!(status, 404 | 405) {
+            None
+        } else {
+            let root = response_json(status, &body)?;
+            let catalog = crate::providers::AmberCatalog::parse(&root);
+            if catalog.is_none() && !root.get("data").is_some_and(|v| v.is_array()) {
+                return Err(SttError::new(ErrorKind::BadResponse, "The server did not send a model catalog.", "not a model list"));
+            }
+            catalog
+        };
+        let _ = self.catalog.set(catalog.clone());
+        Ok(catalog)
+    }
+
+    fn models(&self, cancel: &CancellationToken) -> Result<(u16, Vec<u8>), SttError> {
+        validate_endpoint(&self.base_url)?;
+        let mut req = self.http.get(format!("{}/models", self.base_url)).timeout(Duration::from_secs(5));
+        if !self.api_key.is_empty() { req = req.bearer_auth(&self.api_key); }
+        request(&self.http, req, MAX_CATALOG_BYTES, cancel)
     }
 
     /// `GET {base}/models` answers without spending anything: is the address right and the
     /// key accepted?
     pub fn check(&self) -> Result<(), SttError> {
-        let mut req = self.http.get(format!("{}/models", self.base_url)).timeout(Duration::from_secs(15));
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-        let resp = req.send().map_err(network_error)?;
-        let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            Err(status_error(status, &body))
-        }
+        let (status, body) = self.models(&CancellationToken::default())?;
+        response_json(status, &body).map(|_| ())
     }
 }
 
 impl Transcriber for OpenAiTranscriber {
     fn transcribe(&self, wav: &[u8], options: &TranscribeOptions) -> Result<String, SttError> {
+        self.transcribe_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        self.transcribe_detecting_cancellable(wav, options, cancel).map(|(text, _)| text)
+    }
+
+    fn transcribe_detecting(&self, wav: &[u8], options: &TranscribeOptions) -> Result<(String, Option<String>), SttError> {
+        self.transcribe_detecting_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        cancel.check()?;
+        validate_endpoint(&self.base_url)?;
+        let catalog = if self.discover { self.discover_catalog(cancel)? } else { None };
+        if catalog.as_ref().is_some_and(|c| !c.audio.iter().any(|f| f == "wav")) {
+            return Err(SttError::new(ErrorKind::BadResponse, "This Amber server does not advertise WAV uploads.", "WAV unavailable; no upload attempted"));
+        }
+        let model = if self.model.trim().is_empty() {
+            catalog.as_ref().and_then(|c| c.default_speech_model()).unwrap_or(&self.model)
+        } else { &self.model };
         let mut form = multipart::Form::new()
             .part("file", wav_part(wav))
-            .text("model", self.model.clone())
+            .text("model", model.to_string())
             .text("response_format", "json")
             .text("temperature", "0");
-        // A list ("de,en") is ours: the services detect by themselves then - but not in a
-        // short dictation.
-        if let Some(lang) = cloud_language(options, wav_ms(wav)) {
+        // Amber detects among the entire list. Ordinary services keep the existing single
+        // language/short-dictation policy rather than receiving an unsupported comma list.
+        let language = if catalog.is_some() { options.language.clone() } else { cloud_language(options, wav_ms(wav)) };
+        if let Some(lang) = language {
             form = form.text("language", lang.to_string());
         }
+        if catalog.is_some() { form = form.text("amber_cleanup", "client"); }
         if let Some(prompt) = &options.prompt {
             form = form.text("prompt", prompt.clone());
         }
@@ -232,7 +378,12 @@ impl Transcriber for OpenAiTranscriber {
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
-        read_text(req.send().map_err(network_error)?)
+        let (status, body) = request(&self.http, req, MAX_RESPONSE_BYTES, cancel)?;
+        let root = response_json(status, &body)?;
+        let text = parse_text_value(&root, body.len())?;
+        let language = root.get("language").and_then(|v| v.as_str()).map(str::to_string);
+        cancel.check()?;
+        Ok((text, language))
     }
 }
 
@@ -250,46 +401,57 @@ impl WhisperServerTranscriber {
     pub fn new(base_url: &str, context_slack: Option<u32>) -> Self {
         // Generous: a long dictation on a CPU takes a while, and nothing is billed per second.
         WhisperServerTranscriber {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
             context_slack,
-            http: client(Duration::from_secs(300)),
+            http: client(Duration::from_secs(300), base_url.trim()),
         }
     }
 }
 
 impl Transcriber for WhisperServerTranscriber {
     fn transcribe(&self, wav: &[u8], options: &TranscribeOptions) -> Result<String, SttError> {
-        self.request(wav, options, "json").map(|(text, _)| text)
+        self.transcribe_cancellable(wav, options, &CancellationToken::default())
     }
 
     fn transcribe_detecting(&self, wav: &[u8], options: &TranscribeOptions) -> Result<(String, Option<String>), SttError> {
-        self.request(wav, options, "verbose_json")
+        self.transcribe_detecting_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        self.request(wav, options, "json", cancel).map(|(text, _)| text)
+    }
+
+    fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        self.request(wav, options, "verbose_json", cancel)
     }
 }
 
 impl WhisperServerTranscriber {
-    fn request(&self, wav: &[u8], options: &TranscribeOptions, format: &str) -> Result<(String, Option<String>), SttError> {
+    fn request(&self, wav: &[u8], options: &TranscribeOptions, format: &str, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        cancel.check()?;
         let among = options.among();
         if among.len() < 2 {
-            return self.run(wav, options, format, false).map(|(text, language, _)| (text, language));
+            return self.run(wav, options, format, false, cancel).map(|(text, language, _)| (text, language));
         }
         // Several languages: one run with "auto", and the probabilities whisper-server works out
         // after it - on this dictation's own context (its detection before the run uses the
         // previous request's). Again in the likeliest allowed language when Whisper chose
         // another: short German speech is easily taken for Turkish or English.
         let any = TranscribeOptions { language: None, prompt: options.prompt.clone() };
-        let (text, language, probabilities) = self.run(wav, &any, "verbose_json", true)?;
+        let (text, language, probabilities) = self.run(wav, &any, "verbose_json", true, cancel)?;
         let picked = pick_language(&probabilities, &among, wav_ms(wav));
         if language.as_deref().and_then(crate::chunking::language_code) == Some(picked.as_str()) {
             return Ok((text, language));
         }
         let fixed = TranscribeOptions { language: Some(picked), prompt: options.prompt.clone() };
-        self.run(wav, &fixed, format, false).map(|(text, language, _)| (text, language))
+        self.run(wav, &fixed, format, false, cancel).map(|(text, language, _)| (text, language))
     }
 
     /// One inference: the text, the language whisper-server names, and - with
     /// [probabilities] - its language probabilities (`{"de": 0.6, ...}`).
-    fn run(&self, wav: &[u8], options: &TranscribeOptions, format: &str, probabilities: bool) -> Result<(String, Option<String>, serde_json::Value), SttError> {
+    fn run(&self, wav: &[u8], options: &TranscribeOptions, format: &str, probabilities: bool, cancel: &CancellationToken) -> Result<(String, Option<String>, serde_json::Value), SttError> {
+        cancel.check()?;
+        validate_endpoint(&self.base_url)?;
         let mut form = multipart::Form::new()
             .part("file", wav_part(wav))
             .text("response_format", format.to_string())
@@ -314,21 +476,18 @@ impl WhisperServerTranscriber {
             }
             full_window = ctx == 0;
         }
-        let resp = self.http.post(format!("{}/inference", self.base_url)).multipart(form).send().map_err(network_error)?;
-        let status = resp.status().as_u16();
-        let body = resp.text().map_err(network_error)?;
+        let req = self.http.post(format!("{}/inference", self.base_url)).multipart(form);
+        let (status, body) = request(&self.http, req, MAX_RESPONSE_BYTES, cancel)?;
+        let json = response_json(status, &body)?;
+        let text = parse_text_value(&json, body.len())?;
         if full_window {
             // whisper.cpp detects the language with the previous request's context; after a
             // full window that would cost the next short dictation a 30 s encoder pass.
-            let (http, base) = (self.http.clone(), self.base_url.clone());
-            std::thread::spawn(move || reset_context(&http, &base));
+            let (http, base, cancel) = (self.http.clone(), self.base_url.clone(), cancel.clone());
+            std::thread::spawn(move || reset_context(&http, &base, &cancel));
         }
-        if !(200..300).contains(&status) {
-            return Err(status_error(status, &body));
-        }
-        let text = parse_text(&body)?;
-        let json = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
         let language = json.get("language").and_then(|l| l.as_str()).map(str::to_string);
+        cancel.check()?;
         Ok((text, language, json["language_probabilities"].clone()))
     }
 }
@@ -337,13 +496,14 @@ impl WhisperServerTranscriber {
     /// Leaves the server's state at a short context: after loading a tuned model, and after a
     /// dictation that needed the full window.
     pub fn reset_context(&self) {
-        reset_context(&self.http, &self.base_url);
+        reset_context(&self.http, &self.base_url, &CancellationToken::default());
     }
 }
 
 /// A second of silence with a fixed language and the smallest context - whisper.cpp keeps
 /// that context for its next language detection. Also warms the GPU up.
-fn reset_context(http: &Client, base_url: &str) {
+fn reset_context(http: &Client, base_url: &str, cancel: &CancellationToken) {
+    if cancel.is_cancelled() || validate_endpoint(base_url).is_err() { return; }
     let silence = crate::audio::encode_wav(&vec![0.0; 19_200], crate::audio::TARGET_RATE);
     let form = multipart::Form::new()
         .part("file", wav_part(&silence))
@@ -351,20 +511,18 @@ fn reset_context(http: &Client, base_url: &str) {
         .text("no_timestamps", "true")
         .text("language", "en")
         .text("audio_ctx", "256");
-    let _ = http.post(format!("{base_url}/inference")).multipart(form).send();
+    let _ = request(http, http.post(format!("{base_url}/inference")).multipart(form), MAX_RESPONSE_BYTES, cancel);
 }
 
 /// Whether a local server (whisper.cpp, llama.cpp) is up and done loading. Both answer 503
 /// while their model loads - whisper.cpp even opens its port before that, so an open port
-/// alone says nothing. Any other answer, even a 404 for a missing /health, means ready.
+/// alone says nothing. Other non-redirect answers, even a 404 for a missing /health, mean
+/// ready. Use [health_ok] when identifying the expected helper is required.
 pub fn local_server_ready(base_url: &str) -> bool {
+    if validate_endpoint(base_url).is_err() { return false; }
     let url = format!("{}/health", base_url.trim_end_matches('/'));
-    Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .ok()
-        .and_then(|c| c.get(url).send().ok())
-        .is_some_and(|r| r.status().as_u16() != 503)
+    let http = client(Duration::from_secs(2), base_url);
+    request(&http, http.get(url), 64 * 1024, &CancellationToken::default()).is_ok_and(|(status, _)| status != 503 && !(300..400).contains(&status))
 }
 
 /// Whether the server at [base_url] says it is ready: `GET /health` answering 200 with
@@ -376,53 +534,33 @@ pub fn health_ok(base_url: &str) -> bool {
 
 /// What `GET /health` at [base_url] answered with 200, if anything.
 pub fn health(base_url: &str) -> Option<serde_json::Value> {
+    validate_endpoint(base_url).ok()?;
     let url = format!("{}/health", base_url.trim_end_matches('/'));
-    Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .ok()
-        .and_then(|c| c.get(url).send().ok())
-        .filter(|r| r.status().as_u16() == 200)
-        .and_then(|r| r.json::<serde_json::Value>().ok())
+    let http = client(Duration::from_secs(2), base_url);
+    let (status, body) = request(&http, http.get(url), 64 * 1024, &CancellationToken::default()).ok()?;
+    (status == 200).then(|| response_json(status, &body).ok()).flatten()
 }
 
 fn wav_part(wav: &[u8]) -> multipart::Part {
     multipart::Part::bytes(wav.to_vec()).file_name("dictation.wav").mime_str("audio/wav").expect("static mime")
 }
 
-#[derive(Deserialize)]
-struct TextResponse {
-    text: Option<String>,
-    error: Option<serde_json::Value>,
-}
-
-fn read_text(resp: reqwest::blocking::Response) -> Result<String, SttError> {
-    let status = resp.status().as_u16();
-    let body = resp.text().map_err(network_error)?;
-    if !(200..300).contains(&status) {
-        return Err(status_error(status, &body));
-    }
-    parse_text(&body)
-}
-
 pub fn parse_text(body: &str) -> Result<String, SttError> {
-    let parsed: TextResponse = serde_json::from_str(body)
-        // Not the body itself in the log: from a server answering in plain text, it is the
-        // dictated text.
-        .map_err(|e| SttError::new(ErrorKind::BadResponse, "The engine sent an answer Amber does not understand.", format!("{e} ({} bytes)", body.len())))?;
-    if let Some(err) = parsed.error {
-        return Err(SttError::new(ErrorKind::Server, "The engine reported an error.", clip(&err.to_string())));
-    }
-    parsed.text.ok_or_else(|| SttError::new(ErrorKind::BadResponse, "The engine sent no text.", format!("{} bytes without a text field", body.len())))
+    let parsed = serde_json::from_str(body).map_err(|e| json_error(&e, body.len()))?;
+    parse_text_value(&parsed, body.len())
 }
 
-pub fn status_error(status: u16, body: &str) -> SttError {
-    // OpenAI-style errors carry their reason in error.message.
-    let reason = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
-        .unwrap_or_else(|| clip(body));
-    let detail = format!("HTTP {status}: {reason}");
+fn parse_text_value(parsed: &serde_json::Value, bytes: usize) -> Result<String, SttError> {
+    if parsed.get("error").is_some_and(|v| !v.is_null()) {
+        return Err(SttError::new(ErrorKind::Server, "The engine reported an error.", "response contains an error field"));
+    }
+    parsed.get("text").and_then(|v| v.as_str()).map(str::to_string)
+        .ok_or_else(|| SttError::new(ErrorKind::BadResponse, "The engine sent no text.", format!("{bytes} bytes without a text field")))
+}
+
+pub fn status_error(status: u16, _body: &str) -> SttError {
+    // Bodies and headers can contain credentials, transcripts, or a proxy's reflected URL.
+    let detail = format!("HTTP {status}");
     match status {
         401 | 403 => SttError::new(ErrorKind::Unauthorized, "The API key was rejected - check it in the settings.", detail),
         404 => SttError::new(ErrorKind::Server, "The server does not know this address or model.", detail),
@@ -435,21 +573,18 @@ pub fn status_error(status: u16, body: &str) -> SttError {
 
 pub(crate) fn network_error(e: reqwest::Error) -> SttError {
     if e.is_timeout() {
-        SttError::new(ErrorKind::Timeout, "The engine took too long to answer.", e.to_string())
+        SttError::new(ErrorKind::Timeout, "The engine took too long to answer.", "request timeout")
     } else if e.is_connect() {
-        SttError::new(ErrorKind::Unreachable, "The engine is not reachable - check the connection.", e.to_string())
+        SttError::new(ErrorKind::Unreachable, "The engine is not reachable - check the connection.", "connection failed")
     } else {
-        SttError::new(ErrorKind::Unreachable, "The connection to the engine failed.", e.to_string())
+        SttError::new(ErrorKind::Unreachable, "The connection to the engine failed.", "request failed")
     }
 }
 
-fn clip(s: &str) -> String {
-    let s = s.trim();
-    if s.chars().count() > 300 {
-        format!("{}…", s.chars().take(300).collect::<String>())
-    } else {
-        s.to_string()
-    }
+pub(crate) fn json_error(error: &serde_json::Error, bytes: usize) -> SttError {
+    // serde's Display can quote a value from the response. Position and size are enough.
+    SttError::new(ErrorKind::BadResponse, "The engine sent an answer Amber does not understand.",
+        format!("invalid JSON at line {} column {} ({bytes} bytes)", error.line(), error.column()))
 }
 
 #[cfg(test)]
@@ -467,11 +602,19 @@ pub(crate) mod testserver {
     }
 
     pub fn serve(responses: Vec<(u16, &'static str, Vec<u8>)>) -> (String, mpsc::Receiver<Received>) {
+        serve_raw(responses.into_iter().map(|(status, content_type, body)| {
+            let mut response = format!("HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+            response.extend(body);
+            response
+        }).collect())
+    }
+
+    pub fn serve_raw(responses: Vec<Vec<u8>>) -> (String, mpsc::Receiver<Received>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            for (status, content_type, body) in responses {
+            for response in responses {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream);
                 let mut head = String::new();
@@ -489,12 +632,26 @@ pub(crate) mod testserver {
                 let mut req_body = vec![0; len];
                 reader.read_exact(&mut req_body).unwrap();
                 let mut stream = reader.into_inner();
-                write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-                stream.write_all(&body).unwrap();
-                tx.send(Received { head, body: req_body }).unwrap();
+                let _ = tx.send(Received { head, body: req_body });
+                let _ = stream.write_all(&response);
             }
         });
         (url, rx)
+    }
+
+    /// Hold an incomplete response until the test releases it, without timing-dependent sleeps.
+    pub fn stalled(prefix: &'static [u8]) -> (String, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(prefix);
+            let _ = ready_tx.send(());
+            let _ = release_rx.recv();
+        });
+        (url, ready_rx, release_tx)
     }
 }
 
@@ -702,7 +859,7 @@ mod tests {
         let o = TranscribeOptions::default();
         let e = t.transcribe(b"", &o).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Unauthorized);
-        assert!(e.detail.contains("Invalid API Key"));
+        assert_eq!(e.detail, "HTTP 401");
         assert_eq!(t.transcribe(b"", &o).unwrap_err().kind, ErrorKind::RateLimited);
         let down = t.transcribe(b"", &o).unwrap_err().kind;
         assert_eq!(down, ErrorKind::Unavailable);
@@ -772,5 +929,191 @@ mod tests {
         assert!(t.check().is_ok());
         assert!(rx.recv().unwrap().head.starts_with("GET /models "));
         assert_eq!(t.check().unwrap_err().kind, ErrorKind::Unauthorized);
+    }
+
+    #[test]
+    fn amber_discovery_preserves_wav_languages_model_and_client_cleanup() {
+        let (url, rx) = serve(vec![
+            json(200, r#"{"amber":{"service":"amber-server","audio":["wav","opus"]},"data":[{"id":"speech/default","amber":{"kind":"speech","default":true}}]}"#),
+            json(200, r#"{"text":"Hello.","language":"english"}"#),
+            json(200, r#"{"text":"Again."}"#),
+        ]);
+        let engine = OpenAiTranscriber::new(&format!("{url}/private-path/v1"), "test-key", "chosen/model:Q8").with_catalog_discovery();
+        let wav = crate::audio::encode_wav(&vec![0.1; 16_000 * 4], 16_000);
+        let (text, language) = engine.transcribe_detecting(&wav, &TranscribeOptions::new("de-DE,en_US", "Tauri")).unwrap();
+        assert_eq!((text.as_str(), language.as_deref()), ("Hello.", Some("english")));
+        let discovery = rx.recv().unwrap();
+        assert!(discovery.head.starts_with("GET /private-path/v1/models "));
+        assert!(discovery.head.to_lowercase().contains("authorization: bearer test-key"));
+        let upload = rx.recv().unwrap();
+        assert!(upload.head.starts_with("POST /private-path/v1/audio/transcriptions "));
+        assert!(upload.body.windows(wav.len()).any(|w| w == wav));
+        let form = String::from_utf8_lossy(&upload.body);
+        for field in ["name=\"language\"\r\n\r\nde,en\r\n", "name=\"model\"\r\n\r\nchosen/model:Q8\r\n", "name=\"amber_cleanup\"\r\n\r\nclient\r\n", "name=\"prompt\"\r\n\r\nTauri\r\n", "filename=\"dictation.wav\"", "Content-Type: audio/wav"] {
+            assert!(form.contains(field), "missing {field}");
+        }
+        engine.transcribe(b"short", &TranscribeOptions::new("en,de", "")).unwrap();
+        let second = rx.recv().unwrap();
+        assert!(second.head.starts_with("POST "), "discovery cached for this immutable endpoint");
+        assert!(String::from_utf8_lossy(&second.body).contains("name=\"language\"\r\n\r\nen,de\r\n"));
+    }
+
+    #[test]
+    fn amber_uses_catalog_default_only_for_an_empty_selection() {
+        let (url, rx) = serve(vec![
+            json(200, r#"{"amber":{},"data":[{"id":"first","amber":{"kind":"speech"}},{"id":"recommended","amber":{"kind":"speech","default":true}}]}"#),
+            json(200, r#"{"text":"x"}"#),
+        ]);
+        OpenAiTranscriber::new(&url, "", "").with_catalog_discovery().transcribe(b"wav", &TranscribeOptions::default()).unwrap();
+        rx.recv().unwrap();
+        assert!(String::from_utf8_lossy(&rx.recv().unwrap().body).contains("name=\"model\"\r\n\r\nrecommended\r\n"));
+    }
+
+    #[test]
+    fn ordinary_custom_catalogs_keep_openai_fields_and_no_blind_retries() {
+        for catalog in [json(200, r#"{"data":[]}"#), json(404, "missing"), json(405, "unsupported")] {
+            let (url, rx) = serve(vec![catalog, json(400, "prompt refused")]);
+            let error = OpenAiTranscriber::new(&url, "", "m").with_catalog_discovery()
+                .transcribe(b"wav", &TranscribeOptions::new("de,en", "vocab")).unwrap_err();
+            assert_eq!(error.detail, "HTTP 400");
+            rx.recv().unwrap();
+            let req = rx.recv().unwrap();
+            let body = String::from_utf8_lossy(&req.body);
+            assert!(body.contains("name=\"language\"\r\n\r\nde\r\n"));
+            assert!(!body.contains("amber_cleanup"));
+            assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no paid POST retry");
+        }
+    }
+
+    #[test]
+    fn discovery_failure_or_opus_only_catalog_prevents_audio_upload() {
+        for response in [json(401, "secret"), json(200, "<html>secret</html>"), json(200, r#"{"amber":{"audio":["opus"]},"data":[]}"#)] {
+            let (url, rx) = serve(vec![response]);
+            assert!(OpenAiTranscriber::new(&url, "", "m").with_catalog_discovery().transcribe(b"secret audio", &TranscribeOptions::default()).is_err());
+            assert!(rx.recv().unwrap().head.starts_with("GET "));
+            assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        }
+    }
+
+    #[test]
+    fn redirects_never_forward_credentials_or_audio() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        for status in [302, 307, 308] {
+            let (url, rx) = testserver::serve_raw(vec![format!("HTTP/1.1 {status} Redirect\r\nLocation: http://{}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target.local_addr().unwrap()).into_bytes()]);
+            let error = OpenAiTranscriber::new(&url, "private-key", "m").transcribe(b"private audio", &TranscribeOptions::default()).unwrap_err();
+            assert_eq!(error.detail, format!("HTTP {status}"));
+            rx.recv().unwrap();
+            assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn responses_are_bounded_with_and_without_content_length() {
+        let (url, _rx) = testserver::serve_raw(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n".to_vec()]);
+        let error = OpenAiTranscriber::new(&url, "", "m").transcribe(b"", &TranscribeOptions::default()).unwrap_err();
+        assert!(error.detail.contains("exceeds"));
+        let payload = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+        let mut chunked = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", payload.len()).into_bytes();
+        chunked.extend(payload);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (url, _rx) = testserver::serve_raw(vec![chunked]);
+        let error = OpenAiTranscriber::new(&url, "", "m").transcribe(b"", &TranscribeOptions::default()).unwrap_err();
+        assert!(error.detail.contains("exceeds"));
+        let (url, _rx) = serve(vec![(200, "application/json", vec![b'x'; MAX_CATALOG_BYTES + 1])]);
+        assert!(OpenAiTranscriber::new(&url, "", "m").catalog().unwrap_err().detail.contains("exceeds"));
+    }
+
+    #[test]
+    fn diagnostics_never_include_response_or_url_secrets() {
+        for body in [r#"{"text":"private transcript","error":{"message":"private credential"}}"#, r#"{"text":{"private credential":"private transcript"}}"#, r#"{"text":\"private credential"#] {
+            let error = parse_text(body).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains("private"));
+        }
+        for status in [401, 429, 500] {
+            assert!(!status_error(status, "private transcript / private credential").to_string().contains("private"));
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let error = OpenAiTranscriber::new(&format!("http://127.0.0.1:{port}/private-key/v1"), "private-bearer", "m").transcribe(b"", &TranscribeOptions::default()).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("private"));
+        assert_eq!(error.kind, ErrorKind::Unreachable);
+    }
+
+    #[test]
+    fn unsafe_endpoints_fail_before_connecting() {
+        for url in ["http://192.168.1.1/v1", "http://localhost/v1", "https://user:private@example.com/v1", "https://example.com/v1?private=key"] {
+            let error = OpenAiTranscriber::new(url, "private", "m").transcribe(b"private audio", &TranscribeOptions::default()).unwrap_err();
+            assert_eq!(error.detail, "endpoint rejected");
+            assert!(!error.to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_waiting_for_headers_and_partial_bodies() {
+        for prefix in [b"".as_slice(), b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n{\"text\":\"partial".as_slice()] {
+            let (url, ready, release) = testserver::stalled(prefix);
+            let token = CancellationToken::default();
+            let worker_token = token.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = OpenAiTranscriber::new(&url, "", "m").transcribe_cancellable(b"wav", &TranscribeOptions::default(), &worker_token);
+                tx.send(result).unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            token.cancel();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+            drop(release);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_before_a_request_sends_nothing_and_timeout_is_bounded() {
+        let token = CancellationToken::default();
+        token.cancel();
+        let error = OpenAiTranscriber::new("https://not-contacted.invalid/v1", "", "m")
+            .transcribe_cancellable(b"", &TranscribeOptions::default(), &token).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Cancelled);
+        assert!(!error.kind.service_unavailable());
+        let (url, _ready, release) = testserver::stalled(b"");
+        let http = client(Duration::from_millis(100), &url);
+        assert_eq!(request(&http, http.get(&url), 1024, &CancellationToken::default()).unwrap_err().kind, ErrorKind::Timeout);
+        drop(release);
+    }
+
+    #[test]
+    fn cancelled_http_operation_closes_its_connection() {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (closed_tx, closed) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            ready_tx.send(()).unwrap();
+            let mut byte = [0];
+            closed_tx.send(matches!(reader.read(&mut byte), Ok(0))).unwrap();
+        });
+        let token = CancellationToken::default();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || OpenAiTranscriber::new(&url, "", "m")
+            .transcribe_cancellable(b"wav", &TranscribeOptions::default(), &worker_token));
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        token.cancel();
+        assert_eq!(worker.join().unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        assert!(closed.recv_timeout(Duration::from_secs(3)).unwrap(), "cancellation must close the pending socket, not only hide its result");
+        server.join().unwrap();
     }
 }

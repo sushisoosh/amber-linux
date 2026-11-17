@@ -11,11 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 amber-core = { path = "../crates/core" }
+amber-inference = { path = "../crates/inference" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
-whisper-rs = { version = "0.16", features = ["raw-api"] }
+# The server also inspects ggml's device registry for its Vulkan diagnostics.
+whisper-rs = { version = "0.16", default-features = false, features = ["raw-api"] }
 serde_json = "1"
 qrcode = { version = "0.14", default-features = false }
 if-addrs = "0.13"
@@ -28,7 +30,7 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", 
 
 [features]
 # The GPU build: whisper.cpp through Vulkan (any vendor), and the Vulkan llama-server.
-vulkan = ["whisper-rs/vulkan"]
+vulkan = ["amber-inference/vulkan"]
 
 [dev-dependencies]
 tempfile = "3"

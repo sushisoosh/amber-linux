@@ -2,14 +2,20 @@
 //! started is remembered; if another program is in front by the time the text is ready, the
 //! text goes on the clipboard instead of into the wrong place. Otherwise it is pasted
 //! (clipboard + Ctrl+V) or typed (Unicode keystrokes).
+//! Linux uses explicit Copy or restricted, user-requested X11 paste; it never auto-pastes
+//! when the original editable field cannot be verified.
 
-use amber_core::settings::{InsertMethod, InsertSettings};
+#[cfg(not(target_os = "linux"))]
+use amber_core::settings::InsertMethod;
+use amber_core::settings::InsertSettings;
 
 /// The window the text is meant for.
 #[derive(Clone, Copy, Debug)]
 pub struct Target {
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     hwnd: isize,
+    #[cfg(target_os = "linux")]
+    x11: crate::linux_desktop::X11Target,
 }
 
 #[derive(Debug)]
@@ -389,7 +395,9 @@ impl Target {
             let n = unsafe { GetWindowTextW(windows::Win32::Foundation::HWND(self.hwnd as *mut _), &mut buf) };
             return String::from_utf16_lossy(&buf[..n.max(0) as usize]);
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        return crate::linux_desktop::target_title(self.x11).unwrap_or_default();
+        #[cfg(not(any(windows, target_os = "linux")))]
         String::new()
     }
 
@@ -397,7 +405,9 @@ impl Target {
     pub fn program(&self) -> Option<String> {
         #[cfg(windows)]
         return program_of_window(self.hwnd);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        return crate::linux_desktop::target_program(self.x11);
+        #[cfg(not(any(windows, target_os = "linux")))]
         None
     }
 }
@@ -407,24 +417,55 @@ pub fn running_programs() -> Vec<(String, String)> {
     Vec::new()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn to_clipboard(_text: &str) -> Result<(), String> {
     Err("The clipboard is only implemented on Windows.".into())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn remember() -> Option<Target> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn press_enter(_target: Option<Target>) -> Result<(), String> {
     Err("Keystrokes are only implemented on Windows.".into())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn insert(text: &str, _settings: &InsertSettings, _target: Option<Target>) -> Result<Outcome, String> {
     let _ = text;
     let _ = InsertMethod::Paste;
     Err("Inserting is only implemented on Windows.".into())
+}
+
+#[cfg(target_os = "linux")]
+pub use crate::linux_desktop::to_clipboard;
+
+#[cfg(target_os = "linux")]
+pub fn remember() -> Option<Target> {
+    crate::linux_desktop::remember_target().map(|x11| Target { x11 })
+}
+
+/// X11 window identity is not editable-field identity, even in the same browser window.
+#[cfg(target_os = "linux")]
+pub fn auto_insert_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn insert(_text: &str, _settings: &InsertSettings, _target: Option<Target>) -> Result<Outcome, String> {
+    Err("Automatic insertion is unavailable: the original editable field cannot be verified. Review the result, then Copy and paste manually.".into())
+}
+
+/// Only for an explicit user action, with a target captured at that action, not at recording
+/// start. Success means submitted, never confirmed. Clipboard replacement is intentional.
+#[cfg(target_os = "linux")]
+pub fn paste_explicit(text: &str, target: Target) -> Result<crate::linux_desktop::Submission, String> {
+    crate::linux_desktop::paste_explicit(text, target.x11)
+}
+
+#[cfg(target_os = "linux")]
+pub fn press_enter(_target: Option<Target>) -> Result<(), String> {
+    Err("Automatic Enter is disabled on Linux. Review and submit text manually.".into())
 }

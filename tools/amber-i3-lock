@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Always reach the locker, even if Amber is absent or its UI is unresponsive.
+set -u
+
+if ! command -v i3lock >/dev/null 2>&1; then
+    printf '%s\n' 'i3lock is not installed; the screen has NOT been locked.' >&2
+    exit 127
+fi
+
+if command -v amber-dictation >/dev/null 2>&1; then
+    timeout --kill-after=1s 3s amber-dictation --cancel >/dev/null 2>&1 || true
+fi
+exec i3lock "$@"

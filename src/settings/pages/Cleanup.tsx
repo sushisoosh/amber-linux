@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { ChatProvider, CleanupPreview, WritingStyle } from "../../shared/types";
+import type { ChatProvider, CleanupPreview, Overview, WritingStyle } from "../../shared/types";
 import type { PageProps } from "../App";
 import { DownloadItem, StatusLabel, useLocal } from "../downloads";
 import { Row, Section, Segmented, Switch } from "../ui";
@@ -13,11 +13,12 @@ const EXAMPLE = "Ähm, lass uns morgen um drei Uhr treffen, nee stopp, um vier U
 
 export function CleanupPage(p: PageProps) {
   const { s, save } = p;
+  const linux = p.ov.platform === "linux";
   const c = s.cleanup;
   return (
     <>
       <h1>Cleanup</h1>
-      <p className="lead">What happens to your words before they are inserted. Hesitation sounds go out by rule; a language model can also untangle what you corrected while speaking.</p>
+      <p className="lead">{linux ? "Optional processing before you review the result. Rules run on this PC; smart cleanup uses the selected local model or sends recognized text to your chosen server." : "What happens to your words before they are inserted. Hesitation sounds go out by rule; a language model can also untangle what you corrected while speaking."}</p>
       <Section>
         <Row label="Remove filler words" hint="äh, ähm, öhm, hm … - by fixed rules, on this PC, instantly. Real words like “um” stay.">
           <Switch on={c.fillers} onChange={(v) => save((x) => (x.cleanup.fillers = v))} />
@@ -30,7 +31,7 @@ export function CleanupPage(p: PageProps) {
         </Row>
         <Row
           label="Smart cleanup"
-          hint="A language model resolves self-corrections (“at three, no wait, at four” → “at four”), false starts and punctuation. If it fails or changes too much, the text goes in as recognized."
+           hint={linux ? "A language model can resolve self-corrections, false starts and punctuation. If it fails or changes too much, the recognized text is retained for review." : "A language model resolves self-corrections (“at three, no wait, at four” → “at four”), false starts and punctuation. If it fails or changes too much, the text goes in as recognized."}
         >
           <Switch on={c.smart} onChange={(v) => save((x) => (x.cleanup.smart = v))} />
         </Row>
@@ -40,7 +41,7 @@ export function CleanupPage(p: PageProps) {
           <div className="cards">
             <button className={`card ${c.engine === "local" ? "on" : ""}`} onClick={() => save((x) => (x.cleanup.engine = "local"))}>
               <div className="title">On this PC</div>
-              <div className="hint">llama.cpp with Qwen3 4B on your GPU. Private, offline, free.</div>
+              <div className="hint">{linux ? "llama.cpp on your CPU. Works offline after downloading the runtime and model; speed and memory needs depend on the model." : "llama.cpp with Qwen3 4B on your GPU. Private, offline, free."}</div>
             </button>
             <button className={`card ${c.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.cleanup.engine = "server"))}>
               <div className="title">Server with API key</div>
@@ -55,7 +56,7 @@ export function CleanupPage(p: PageProps) {
   );
 }
 
-function LocalModel({ s, save, toast }: PageProps) {
+function LocalModel({ s, save, toast, ov }: PageProps) {
   const local = useLocal();
   const info = local.info;
   if (!info) return null;
@@ -71,7 +72,7 @@ function LocalModel({ s, save, toast }: PageProps) {
             item={r}
             selected={s.cleanup.localRuntime === r.id}
             onSelect={() => save((x) => (x.cleanup.localRuntime = r.id))}
-            recommended={(info.hasNvidia ? "cuda" : "cpu") === r.id}
+            recommended={(ov.platform !== "linux" && info.hasNvidia ? "cuda" : "cpu") === r.id}
             warning={r.wantsGpu && !info.hasNvidia ? "no NVIDIA driver found on this PC" : undefined}
             toast={toast}
           />
@@ -89,9 +90,9 @@ function LocalModel({ s, save, toast }: PageProps) {
             toast={toast}
           />
         ))}
-        <Row label={<StatusLabel status={st} />} hint={st.message ?? "Loaded with Amber while the smart cleanup is on; uses about 3 GB of graphics memory."}>
+        <Row label={<StatusLabel status={st} />} hint={st.message ?? (ov.platform === "linux" ? "Loaded while smart cleanup is on. Uses system memory; leave cleanup off on a low-memory PC." : "Loaded with Amber while the smart cleanup is on; uses about 3 GB of graphics memory.")}>
           {st.state !== "ready" && (
-            <button className="btn" disabled={st.state === "starting"} onClick={() => invoke("start_llm")}>
+            <button className="btn" disabled={st.state === "starting"} onClick={() => invoke("start_llm").catch((e) => toast(String(e)))}>
               Load now
             </button>
           )}
@@ -101,13 +102,60 @@ function LocalModel({ s, save, toast }: PageProps) {
   );
 }
 
-function ServerModel({ s, save, go }: PageProps) {
+function ServerModel({ s, save, go, ov, refresh, desktop, toast }: PageProps) {
+  const linux = ov.platform === "linux";
   const [providers, setProviders] = useState<ChatProvider[]>([]);
+  const [baseUrl, setBaseUrl] = useState(s.cleanup.baseUrl);
+  const [key, setKey] = useState("");
+  const [hasCustomKey, setHasCustomKey] = useState<boolean | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [savingKey, setSavingKey] = useState(false);
+  const effectiveBase = baseUrl.trim() || s.server.baseUrl;
+  useEffect(() => setBaseUrl(s.cleanup.baseUrl), [s.cleanup.baseUrl]);
   useEffect(() => {
     void invoke<ChatProvider[]>("chat_providers").then(setProviders);
   }, []);
+  useEffect(() => {
+    if (!linux || s.cleanup.provider !== "custom") return;
+    let disposed = false;
+    setKey("");
+    setHasCustomKey(null);
+    setKeyError(null);
+    void invoke<boolean>("has_api_key", { provider: "custom", baseUrl: effectiveBase }).then((available) => {
+      if (!disposed) setHasCustomKey(available);
+    }).catch((e) => {
+      if (!disposed) setKeyError(`Could not check this server's key: ${e}`);
+    });
+    return () => { disposed = true; };
+  }, [linux, s.cleanup.provider, effectiveBase]);
   const c = s.cleanup;
   const provider = providers.find((x) => x.id === c.provider);
+
+  const saveCustomKey = async (value: string | null) => {
+    setSavingKey(true);
+    setKeyError(null);
+    try {
+      // Blur also saves the address; verify its committed value before binding a credential.
+      await save((x) => (x.cleanup.baseUrl = baseUrl.trim()));
+      const current = (await invoke<Overview>("get_overview")).settings;
+      if (current.cleanup.provider !== "custom" || current.cleanup.baseUrl !== baseUrl.trim() || (current.cleanup.baseUrl || current.server.baseUrl) !== effectiveBase) {
+        throw new Error("The cleanup address was not saved. The key was not changed.");
+      }
+      await invoke("set_api_key", { provider: "custom", baseUrl: effectiveBase, key: value });
+      setKey("");
+      toast(value ? "Key saved for this server's origin." : "Key removed for this server's origin.", true);
+    } catch (e) {
+      setKeyError(`Key update was not confirmed. If credential storage failed, the changed key may be active for this session only. ${e}`);
+    } finally {
+      await Promise.all([
+        refresh(),
+        desktop.refresh(),
+        invoke<boolean>("has_api_key", { provider: "custom", baseUrl: effectiveBase }).then(setHasCustomKey),
+      ]).catch((e) => setKeyError((error) => error ?? `Could not refresh key status: ${e}`));
+      setSavingKey(false);
+    }
+  };
+
   if (!provider) return null;
   return (
     <Section title="Server">
@@ -115,22 +163,25 @@ function ServerModel({ s, save, go }: PageProps) {
         <Segmented
           value={provider.id}
           options={providers.map((x) => [x.id, x.name] as [string, string])}
-          onChange={(id) =>
-            save((x) => {
+          onChange={(id) => {
+            if (savingKey) return;
+            void save((x) => {
               x.cleanup.provider = id;
               x.cleanup.model = providers.find((q) => q.id === id)?.models[0]?.id ?? "";
-            })
-          }
+            });
+          }}
         />
       </Row>
       {provider.id === "custom" && (
-        <Row label="Address" hint="Empty: the speech engine's own-server address.">
+        <Row label="Address" hint="Empty: the speech engine's own-server address. Use HTTPS, or HTTP only on a literal loopback address.">
           <input
             type="text"
             style={{ width: 300 }}
-            defaultValue={c.baseUrl}
-            placeholder={s.server.baseUrl || "http://…/v1"}
-            onBlur={(e) => e.target.value !== c.baseUrl && save((x) => (x.cleanup.baseUrl = e.target.value.trim()))}
+            value={baseUrl}
+            disabled={savingKey}
+            placeholder={s.server.baseUrl || "https://…/v1"}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            onBlur={() => baseUrl !== c.baseUrl && save((x) => (x.cleanup.baseUrl = baseUrl.trim()))}
           />
         </Row>
       )}
@@ -147,27 +198,40 @@ function ServerModel({ s, save, go }: PageProps) {
           <input type="text" defaultValue={c.model} placeholder="llama3.2" onBlur={(e) => e.target.value !== c.model && save((x) => (x.cleanup.model = e.target.value.trim()))} />
         )}
       </Row>
-      <Row
+      {linux && provider.id === "custom" ? <>
+        <Row label="API key for this server" hint={<>Keys are scoped to scheme, host and port. A key from another server is never reused. {hasCustomKey === null ? "Key availability is not yet confirmed." : hasCustomKey ? "A key is available for this origin in the current session." : "No key is available for this origin; unauthenticated servers can leave it empty."}</>}>
+          <input type="password" style={{ width: 220 }} aria-label="Custom cleanup server API key" autoComplete="off" value={key} disabled={savingKey} placeholder={hasCustomKey ? "Key available" : "Paste key"} onChange={(e) => setKey(e.target.value)} />
+          <button className="btn primary" disabled={savingKey || !key.trim() || !effectiveBase} onClick={() => void saveCustomKey(key)}>{savingKey ? "Saving..." : "Save key"}</button>
+          {hasCustomKey && <button className="btn danger" disabled={savingKey} onClick={() => void saveCustomKey(null)}>Remove</button>}
+        </Row>
+        {keyError && <div className="row"><div className="note error" role="alert">{keyError}</div></div>}
+        <Row label="Credential storage" hint={desktop.storage?.credentials ?? desktop.error ?? "Checking secure storage..."} />
+      </> : <Row
         label="API key"
-        hint={provider.hasKey ? `Uses the ${provider.name} key saved on the Engine page.` : provider.id === "custom" ? "Optional for your own server." : `No ${provider.name} key yet.`}
+        hint={provider.hasKey ? `Uses the ${provider.name} key ${ov.platform === "linux" ? "available" : "saved"} on the Engine page.` : provider.id === "custom" ? "Optional for your own server." : `No ${provider.name} key yet.`}
       >
         <button className="btn" onClick={() => go("engine")}>
           {provider.hasKey ? "Change" : "Add key"}
         </button>
-      </Row>
+      </Row>}
     </Section>
   );
 }
 
-function TryIt({ s }: PageProps) {
+function TryIt({ s, toast }: PageProps) {
   const [text, setText] = useState(EXAMPLE);
   const [result, setResult] = useState<CleanupPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [style, setStyle] = useState<WritingStyle>("asSpoken");
   const run = async () => {
     setBusy(true);
-    setResult(await invoke<CleanupPreview>("cleanup_preview", { text, style }));
-    setBusy(false);
+    try {
+      setResult(await invoke<CleanupPreview>("cleanup_preview", { text, style }));
+    } catch (e) {
+      toast(String(e));
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <Section title="Try it">

@@ -19,6 +19,9 @@ import { ProgramsPage } from "./pages/Programs";
 import { HistoryPage } from "./pages/History";
 import { SnippetsPage } from "./pages/Snippets";
 import { StatisticsPage } from "./pages/Statistics";
+import { Recorder } from "./pages/Recorder";
+import { useDesktop } from "./desktop";
+import { phaseLabel } from "./ui";
 
 export interface PageProps {
   ov: Overview;
@@ -28,11 +31,16 @@ export interface PageProps {
   go: (page: PageId) => void;
   toast: (message: string, ok?: boolean) => void;
   phase: Phase;
+  phaseMessage: string | null;
+  desktop: ReturnType<typeof useDesktop>;
 }
 
-export type PageId = "welcome" | "engine" | "cleanup" | "programs" | "snippets" | "microphone" | "hotkeys" | "bubble" | "insert" | "phone" | "history" | "statistics" | "app";
+export type PageId = "recorder" | "welcome" | "engine" | "cleanup" | "programs" | "snippets" | "microphone" | "hotkeys" | "bubble" | "insert" | "phone" | "history" | "statistics" | "app";
+
+const LINUX_HIDDEN = new Set<PageId>(["programs", "bubble", "insert", "phone"]);
 
 const PAGES: { id: PageId; label: string; value: (o: Overview) => string }[] = [
+  { id: "recorder", label: "Recorder", value: () => "" },
   { id: "engine", label: "Engine", value: (o) => (o.settings.engine === "local" ? "Local" : providerName(o)) },
   {
     id: "cleanup",
@@ -57,9 +65,9 @@ function providerName(o: Overview) {
 
 function initialPage(): PageId {
   const p = new URLSearchParams(location.search).get("page");
-  return (["welcome", "engine", "cleanup", "programs", "snippets", "microphone", "hotkeys", "bubble", "insert", "phone", "history", "statistics", "app"] as PageId[]).includes(p as PageId)
+  return (["recorder", "welcome", "engine", "cleanup", "programs", "snippets", "microphone", "hotkeys", "bubble", "insert", "phone", "history", "statistics", "app"] as PageId[]).includes(p as PageId)
     ? (p as PageId)
-    : "engine";
+    : "recorder";
 }
 
 export function App() {
@@ -67,19 +75,33 @@ export function App() {
   const [page, setPage] = useState<PageId>(initialPage);
   const [toastMsg, setToast] = useState<{ text: string; ok: boolean } | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
+  const [phaseMessage, setPhaseMessage] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const phaseVersion = useRef(0);
+  const linux = ov?.platform === "linux";
+  const desktop = useDesktop(linux);
   // The latest settings, so two quick changes in a row build on each other - set by save()
   // and by answers that are still current, not by every render.
   const latest = useRef<Settings | null>(null);
   // Saves in flight: an answer to an older one must not undo a newer change, and closing the
   // window waits for them.
   const saveSeq = useRef(0);
+  const saveTail = useRef<Promise<void>>(Promise.resolve());
   const pending = useRef(new Set<Promise<void>>());
   if (latest.current === null && ov) latest.current = ov.settings;
 
   const refresh = useCallback(async () => {
+    const version = phaseVersion.current;
+    const settingsVersion = saveSeq.current;
     const o = await invoke<Overview>("get_overview");
-    setOv(o);
-    setPhase(o.phase);
+    setLoadError(null);
+    if (settingsVersion === saveSeq.current && pending.current.size === 0) {
+      latest.current = o.settings;
+      setOv(o);
+    } else {
+      setOv((current) => current ? { ...o, settings: current.settings } : o);
+    }
+    if (version === phaseVersion.current) setPhase(o.phase);
   }, []);
 
   const toast = useCallback((text: string, ok = false) => {
@@ -88,7 +110,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    let disposed = false;
     const subs = [
       listen<Settings>("settings-changed", (e) => {
         // While a save of this window is under way, its own answer is the one to take.
@@ -97,20 +119,32 @@ export function App() {
         setOv((o) => (o ? { ...o, settings: e.payload } : o));
       }),
       listen<string>("navigate", (e) => setPage(e.payload as PageId)),
-      listen<DictationEvent>("dictation-state", (e) => setPhase(e.payload.state)),
+      listen<DictationEvent>("dictation-state", (e) => {
+        phaseVersion.current++;
+        setPhase(e.payload.state);
+        setPhaseMessage(e.payload.message ?? null);
+      }),
     ];
+    void Promise.all(subs).then(() => {
+      if (!disposed) return refresh();
+    }).catch((e) => setLoadError(String(e)));
     // A field saves when it loses the focus - closing the window must not skip that: the
     // focus is taken first, and the window closes once the saves are through.
-    const closing = getCurrentWindow().onCloseRequested(async () => {
+    const closing = getCurrentWindow().onCloseRequested(async (event) => {
       (document.activeElement as HTMLElement | null)?.blur();
       await new Promise((r) => setTimeout(r, 0));
-      await Promise.race([Promise.allSettled([...pending.current]), new Promise((r) => setTimeout(r, 2000))]);
+      if (!linux) await Promise.race([Promise.allSettled([...pending.current]), new Promise((r) => setTimeout(r, 2000))]);
+      if (pending.current.size > 0) {
+        event.preventDefault();
+        toast("Settings are still saving. This window has been kept open so queued changes are not lost. Close it again after the save finishes.");
+      }
     });
     return () => {
-      subs.forEach((p) => p.then((un) => un()));
+      disposed = true;
+      subs.forEach((p) => p.then((un) => un()).catch(() => {}));
       void closing.then((un) => un());
     };
-  }, [refresh]);
+  }, [refresh, toast, linux]);
 
   const save = useCallback(
     async (change: (s: Settings) => void) => {
@@ -120,7 +154,8 @@ export function App() {
       latest.current = next;
       setOv((o) => (o ? { ...o, settings: next } : o));
       const mine = ++saveSeq.current;
-      const run = (async () => {
+      // A later full snapshot must not commit before a slow wallet-backed save.
+      const run = saveTail.current.then(async () => {
         try {
           const saved = await invoke<Settings>("save_settings", { settings: next });
           if (mine === saveSeq.current) {
@@ -130,68 +165,83 @@ export function App() {
         } catch (e) {
           toast(String(e));
           if (mine === saveSeq.current) {
-            const o = await invoke<Overview>("get_overview");
-            latest.current = o.settings;
-            setOv(o);
+            try {
+              const o = await invoke<Overview>("get_overview");
+              if (mine === saveSeq.current) {
+                latest.current = o.settings;
+                setOv(o);
+              }
+            } catch (refreshError) {
+              toast(`Could not reload settings after the save failed: ${refreshError}`);
+            }
           }
         }
-      })();
+      });
+      saveTail.current = run;
       pending.current.add(run);
       await run;
       pending.current.delete(run);
+      await desktop.refresh();
     },
-    [refresh, toast],
+    [desktop.refresh, toast],
   );
 
-  if (!ov) return null;
-  const props: PageProps = { ov, s: ov.settings, save, refresh, go: setPage, toast, phase };
+  const quit = async () => {
+    (document.activeElement as HTMLElement | null)?.blur();
+    await new Promise((r) => setTimeout(r, 0));
+    if (pending.current.size > 0) {
+      toast("Settings are still saving. Amber will stay open so queued changes are not lost. Quit again after the save finishes.");
+      return;
+    }
+    try {
+      await invoke("quit_app");
+    } catch (e) {
+      toast(`Could not quit Amber: ${e}`);
+    }
+  };
+
+  if (!ov) return <main><h1>Amber</h1><p className="lead">{loadError ?? "Loading settings..."}</p>
+    {loadError && <button className="btn" onClick={() => void refresh().catch((e) => setLoadError(String(e)))}>Retry</button>}
+  </main>;
+  const currentPage = linux && LINUX_HIDDEN.has(page) ? "recorder" : !linux && page === "recorder" ? "engine" : page;
+  const props: PageProps = { ov, s: ov.settings, save, refresh, go: setPage, toast, phase, phaseMessage, desktop };
 
   return (
     <>
-      <nav>
+      <nav aria-label="Settings pages" className={linux ? "linux-nav" : undefined}>
         <div className="brand">
           <div className="disc" />
           Amber
         </div>
-        {PAGES.map((p) => (
-          <button key={p.id} className={page === p.id ? "active" : ""} onClick={() => setPage(p.id)}>
+        {PAGES.filter((p) => linux ? !LINUX_HIDDEN.has(p.id) : p.id !== "recorder").map((p) => (
+          <button key={p.id} className={currentPage === p.id ? "active" : ""} onClick={() => setPage(p.id)}>
             {p.label}
             <span className="value">{p.value(ov)}</span>
           </button>
         ))}
         <div className="spacer" />
-        <button className={page === "welcome" ? "active" : ""} onClick={() => setPage("welcome")}>
+        <button className={currentPage === "welcome" ? "active" : ""} onClick={() => setPage("welcome")}>
           Setup guide
         </button>
-        <div className="status">{phaseLabel(phase)}</div>
+        <div className="status" role="status">{phaseLabel(phase)}</div>
       </nav>
-      <main>
-        {page === "welcome" && <WelcomePage {...props} />}
-        {page === "engine" && <EnginePage {...props} />}
-        {page === "cleanup" && <CleanupPage {...props} />}
-        {page === "programs" && <ProgramsPage {...props} />}
-        {page === "snippets" && <SnippetsPage {...props} />}
-        {page === "microphone" && <MicrophonePage {...props} />}
-        {page === "hotkeys" && <HotkeysPage {...props} />}
-        {page === "bubble" && <BubblePage {...props} />}
-        {page === "insert" && <InsertPage {...props} />}
-        {page === "phone" && <PhonePage {...props} />}
-        {page === "history" && <HistoryPage {...props} />}
-        {page === "statistics" && <StatisticsPage {...props} />}
-        {page === "app" && <AppPage {...props} />}
+      <main className={linux ? "linux-settings" : undefined}>
+        {linux && <Recorder {...props} compact={currentPage !== "recorder"} />}
+        {currentPage === "welcome" && <WelcomePage {...props} />}
+        {currentPage === "engine" && <EnginePage {...props} />}
+        {currentPage === "cleanup" && <CleanupPage {...props} />}
+        {currentPage === "programs" && <ProgramsPage {...props} />}
+        {currentPage === "snippets" && <SnippetsPage {...props} />}
+        {currentPage === "microphone" && <MicrophonePage {...props} />}
+        {currentPage === "hotkeys" && <HotkeysPage {...props} />}
+        {currentPage === "bubble" && <BubblePage {...props} />}
+        {currentPage === "insert" && <InsertPage {...props} />}
+        {currentPage === "phone" && <PhonePage {...props} />}
+        {currentPage === "history" && <HistoryPage {...props} />}
+        {currentPage === "statistics" && <StatisticsPage {...props} />}
+        {currentPage === "app" && <AppPage {...props} quit={quit} />}
       </main>
-      {toastMsg && <div className={`toast ${toastMsg.ok ? "ok" : ""}`}>{toastMsg.text}</div>}
+      {toastMsg && <div role="status" className={`toast ${toastMsg.ok ? "ok" : ""}`}>{toastMsg.text}</div>}
     </>
   );
-}
-
-function phaseLabel(p: Phase) {
-  return {
-    idle: "Ready",
-    recording: "Listening…",
-    transcribing: "Recognizing…",
-    inserting: "Inserting…",
-    done: "Done",
-    error: "Failed",
-  }[p];
 }

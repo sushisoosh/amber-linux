@@ -43,7 +43,13 @@ export function useLocal() {
     const key = `${kind}:${id}`;
     setErrors(({ [key]: _, ...rest }) => rest);
     setProgress((p) => ({ ...p, [key]: { key, done: 0, total: null, state: "running" } }));
-    await invoke("download", { kind, id, select });
+    try {
+      await invoke("download", { kind, id, select });
+    } catch (e) {
+      setProgress(({ [key]: _, ...rest }) => rest);
+      setErrors((x) => ({ ...x, [key]: String(e) }));
+      throw e;
+    }
   };
 
   return { info, progress, errors, reload, download };
@@ -60,6 +66,7 @@ export function DownloadItem({
   recommended,
   warning,
   measured,
+  builtIn = false,
   toast,
 }: {
   local: Local;
@@ -71,10 +78,12 @@ export function DownloadItem({
   warning?: string;
   /** Measured milliseconds for 10 s of speech on this PC. */
   measured?: number;
+  builtIn?: boolean;
   toast: (message: string) => void;
 }) {
   const { info, progress, errors, reload, download } = local;
   const key = `${kind}:${item.id}`;
+  const included = builtIn || (kind === "runtime" && item.sizeMb === 0 && item.installed);
   const running = progress[key] ?? (info?.downloads.includes(key) ? { key, done: 0, total: null, state: "running" as const } : null);
   return (
     <div className="item">
@@ -91,13 +100,13 @@ export function DownloadItem({
           {item.installed && <span className="tag ok">installed</span>}
         </div>
         <div className="hint">
-          {item.note} · {size(item.sizeMb)}
+          {item.note} · {included ? "Built into Amber; no download needed" : size(item.sizeMb)}
           {measured !== undefined && ` · ${(measured / 1000).toFixed(1)} s for 10 s of speech here`}
           {warning && ` · ${warning}`}
         </div>
         {errors[key] && <div className="note error">{errors[key]}</div>}
       </div>
-      {running ? (
+      {included ? <span className="tag ok">built-in</span> : running ? (
         <>
           <Progress done={running.done} total={running.total} />
           <button className="btn" onClick={() => invoke("cancel_download", { kind, id: item.id })}>
@@ -119,7 +128,7 @@ export function DownloadItem({
           Delete
         </button>
       ) : (
-        <button className="btn" onClick={() => download(kind, item.id, true)}>
+        <button className="btn" onClick={() => download(kind, item.id, true).catch((e) => toast(String(e)))}>
           Download
         </button>
       )}

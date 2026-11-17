@@ -1,4 +1,4 @@
-# Every push and pull request: core tests on Linux (fast), the whole app on Windows.
+# Every push and pull request: shared tests and native Linux/Windows builds.
 name: CI
 
 on:
@@ -14,6 +14,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  arch-linux:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Native Arch dependencies
+        run: >-
+          pacman -Syu --needed --noconfirm git rust nodejs npm cmake clang pkgconf
+          desktop-file-utils alsa-lib dbus gtk3 webkit2gtk-4.1 libappindicator libx11 libxtst
+          python xorg-server-xvfb xorg-xauth i3-wm ttf-dejavu
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare authorized local sources as an unprivileged builder
+        run: |
+          useradd --create-home builder
+          install -d -o builder -g builder /build
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- env HOME=/home/builder python tools/test-arch.py
+          runuser -u builder -- env HOME=/home/builder bash tools/arch.sh --prepare-only /build/package
+      - name: Build and check native Arch package
+        working-directory: /build/package
+        run: runuser -u builder -- env HOME=/home/builder CARGO_BUILD_JOBS=2 makepkg --cleanbuild --check --noconfirm
+      # No public package/source upload: redistribution permission is a separate release gate.
+
+  linux-desktop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Native build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential cmake pkg-config clang libclang-dev
+          libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
+          libayatana-appindicator3-dev librsvg2-dev libxdo-dev libxtst-dev
+          libssl-dev libdbus-1-dev rpm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:ui
+      - run: python3 tools/test-arch.py
+      - run: cargo test -p amber-core -p amber-inference -p amber-server -p amber-pc --locked
+      - name: Build Linux packages
+        run: npm run app:build -- --bundles deb,rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-packages
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
+
   core:
     runs-on: ubuntu-latest
     steps:

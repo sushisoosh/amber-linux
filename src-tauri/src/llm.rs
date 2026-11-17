@@ -1,20 +1,21 @@
-//! The smart cleanup's local model: llama.cpp's `llama-server.exe` with the chosen model on
+//! The smart cleanup's local model: llama.cpp's `llama-server` with the chosen model on
 //! a free port on 127.0.0.1, managed like the whisper server (see `process`). And the
 //! choice between it and a server with an API key.
 
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use amber_core::cleanup::{Ask, ChatCleaner};
+use amber_core::engine::CancellationToken;
 use amber_core::profiles::{self, CleanupChoice, Profile};
 use amber_core::local;
 use amber_core::providers;
 use amber_core::settings::{EngineKind, Settings};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::process::{self, Output};
+use crate::process::{self, Output, SupervisedChild};
 use crate::state::Core;
 use crate::whisper::Status;
 
@@ -25,10 +26,10 @@ struct Key {
 }
 
 struct Running {
-    child: Child,
+    child: SupervisedChild,
     port: u16,
     key: Key,
-    /// Its `--api-key`: without one, any web page could use the model by scanning loopback.
+    /// Its LLAMA_API_KEY: without one, any web page could use the model by scanning loopback.
     api_key: String,
 }
 
@@ -130,7 +131,7 @@ impl Llm {
         if model.is_none() && !wants_local(&settings) {
             // Switched off (or to a server) while this waited for the lock.
             if let Some(mut r) = running.take() {
-                process::stop(&mut r.child);
+                r.child.stop();
                 crate::diag::info("cleanup model stopped");
             }
             self.status_if(own, app, Status::of("stopped", None));
@@ -156,7 +157,7 @@ impl Llm {
             if !alive {
                 crate::diag::warn(format!("cleanup model had exited: {}", process::last_lines(&self.output, 6)));
             }
-            process::stop(&mut r.child);
+            r.child.stop();
             *running = None;
         }
         if let Some(msg) = missing {
@@ -191,30 +192,24 @@ impl Llm {
     fn spawn(&self, layout: &local::Layout, rt: &local::LlmRuntime, model: &local::LlmModel, key: &Key) -> Result<Running, String> {
         let port = process::free_port().map_err(|e| format!("No free port: {e}"))?;
         let api_key = amber_core::api::new_key();
-        let mut cmd = Command::new(layout.llm_server_exe(rt));
-        // Run in the models folder and pass only the file name: the path of a user folder
-        // with unusual characters could arrive mangled. No --n-gpu-layers: left unset,
-        // llama.cpp fits as many layers as the graphics memory next to Whisper allows.
-        let model_path = layout.llm_model_path(model);
-        cmd.current_dir(model_path.parent().unwrap_or(&layout.root))
-            .args(["--model", model.file, "--host", "127.0.0.1", "--port", &port.to_string()])
-            .args(["--ctx-size", CONTEXT, "--parallel", "1", "--api-key", &api_key])
-            .args(["--threads", &process::default_threads().to_string()]);
-        let mut child = process::spawn(cmd, &self.output).map_err(|e| format!("The cleanup engine could not be started: {e}"))?;
+        let cmd = llama_command(layout, rt, model, port, &api_key);
+        let mut child = SupervisedChild::spawn(cmd, &self.output).map_err(|e| format!("The cleanup engine could not be started: {e}"))?;
 
         // llama-server opens its port at once and answers /health with 503 until the model
         // has loaded.
         let base = format!("http://127.0.0.1:{port}");
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!("The cleanup engine stopped while loading ({status}). {}", self.explain()));
+            match child.try_wait() {
+                Ok(Some(status)) => return Err(format!("The cleanup engine stopped while loading ({status}). {}", self.explain())),
+                Err(e) => return Err(format!("The cleanup engine could not be monitored: {e}")),
+                Ok(None) => {}
             }
-            if amber_core::engine::local_server_ready(&base) {
+            // A different listener or a loading/unauthorized response is not a ready model.
+            if amber_core::engine::health_ok(&base) {
                 return Ok(Running { child, port, key: key.clone(), api_key });
             }
             if Instant::now() > deadline {
-                process::stop(&mut child);
                 return Err("The cleanup engine took too long to load its model.".into());
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -225,7 +220,11 @@ impl Llm {
         let out = process::last_lines(&self.output, 6);
         let lower = out.to_lowercase();
         if lower.contains("out of memory") || lower.contains("failed to allocate") || lower.contains("cudamalloc") {
-            format!("Not enough graphics memory - try the CPU, or a smaller speech model. ({out})")
+            if cfg!(target_os = "linux") {
+                format!("Not enough memory - free some memory or leave smart cleanup off. ({out})")
+            } else {
+                format!("Not enough graphics memory - try the CPU, or a smaller speech model. ({out})")
+            }
         } else {
             out
         }
@@ -233,7 +232,7 @@ impl Llm {
 
     pub fn stop(&self, app: &AppHandle) {
         if let Some(mut r) = self.running.lock().unwrap().take() {
-            process::stop(&mut r.child);
+            r.child.stop();
             crate::diag::info("cleanup model stopped");
         }
         self.set_status(app, Status::of("stopped", None));
@@ -266,6 +265,23 @@ impl Llm {
 
 }
 
+fn llama_command(layout: &local::Layout, rt: &local::LlmRuntime, model: &local::LlmModel, port: u16, api_key: &str) -> Command {
+    let mut cmd = Command::new(layout.llm_server_exe(rt));
+    // Keep the Windows filename workaround. Linux's bundled libraries resolve via $ORIGIN;
+    // no global library path changes are needed. Environment secrets remain visible to the
+    // same OS user, but unlike argv they are not exposed to other users by default.
+    let model_path = layout.llm_model_path(model);
+    cmd.current_dir(model_path.parent().unwrap_or(&layout.root))
+        .args(["--model", model.file, "--host", "127.0.0.1", "--port", &port.to_string()])
+        .args(["--ctx-size", CONTEXT, "--parallel", "1"])
+        .args(["--threads", &process::default_threads().to_string()])
+        .env("LLAMA_API_KEY", api_key);
+    if cfg!(target_os = "linux") || rt.id == "cpu" {
+        cmd.args(["--n-gpu-layers", "0"]);
+    }
+    cmd
+}
+
 /// Whether the smart cleanup wants the local model loaded: switched on, or always on for
 /// some program.
 pub fn wants_local(s: &Settings) -> bool {
@@ -294,7 +310,9 @@ pub fn cleaner(app: &AppHandle, s: &Settings, wait: bool) -> Result<ChatCleaner,
             let custom = if c.base_url.trim().is_empty() { &s.server.base_url } else { &c.base_url };
             let base = providers::effective_base_url(provider, custom);
             providers::check_base_url(&base)?;
-            let key = app.state::<Core>().key(provider.id).unwrap_or_default();
+            // A cleanup-specific custom URL must not inherit the speech server's key unless
+            // its scheme, host and effective port match the credential's saved origin.
+            let key = app.state::<Core>().key_for(provider.id, &base).unwrap_or_default();
             if provider.needs_key && key.is_empty() {
                 return Err(format!("No API key for {} - add it on the Engine page.", provider.name));
             }
@@ -358,15 +376,29 @@ pub fn command(app: &AppHandle, s: &Settings, spoken: &str, shell: amber_core::t
 /// model's tidy-up in that program's style. A failing model leaves the text as it was: never
 /// lost, never stuck. Returns why the model was skipped, if it was.
 pub fn tidy(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool) -> (String, Option<String>) {
+    let (text, why, _) = tidy_cancellable(app, s, recognized, profile, snippets, &CancellationToken::default());
+    (text, why)
+}
+
+/// The third result conservatively records a configured remote cleanup attempt, even on
+/// failure/cancellation. It must not be inferred from whether the returned text changed.
+pub fn tidy_cancellable(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken) -> (String, Option<String>, bool) {
+    tidy_with_cleaner(s, recognized, profile, snippets, cancel, || cleaner(app, s, false))
+}
+
+fn tidy_with_cleaner(s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken, make_cleaner: impl FnOnce() -> Result<ChatCleaner, String>) -> (String, Option<String>, bool) {
+    if let Err(e) = cancel.check() {
+        return (recognized.to_string(), Some(e.message), false);
+    }
     // A snippet's phrase on its own: its saved text, exactly as saved.
     if let Some(snippet) = amber_core::snippets::find(&s.snippets, recognized).filter(|_| snippets) {
         // The trigger is what was just said: logged only where dictated text is.
-        crate::diag::info(if s.log_text { format!("snippet \"{}\"", snippet.trigger) } else { "snippet inserted".to_string() });
-        return (snippet.text.clone(), None);
+        crate::diag::info(if s.log_text && !cfg!(target_os = "linux") { format!("snippet \"{}\"", snippet.trigger) } else { "snippet inserted".to_string() });
+        return (snippet.text.clone(), None, false);
     }
     let text = by_rule(s, recognized);
     if !profiles::smart_cleanup(s.cleanup.smart, profile) || text.is_empty() {
-        return (text, None);
+        return (text, None, false);
     }
     let started = Instant::now();
     // One language chosen for recognition: the cleanup is told it; several: it tells by itself.
@@ -377,15 +409,24 @@ pub fn tidy(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Pr
         vocabulary: &s.vocabulary,
         language: languages.fixed(),
     };
-    // Never waits for a model that is still loading: the text goes in as recognized.
-    match cleaner(app, s, false).and_then(|c| c.clean(&text, &ask).map_err(|e| format!("{} ({})", e.message, e.detail))) {
+    let mut remote_attempted = false;
+    // Never waits for a model that is still loading. Mark remote exposure before the call,
+    // not after success: a failed or cancelled HTTP request may already have sent the text.
+    let result = cancel.check().map_err(|e| e.message).and_then(|_| make_cleaner()).and_then(|c| {
+        cancel.check().map_err(|e| e.message)?;
+        remote_attempted = s.cleanup.engine == EngineKind::Server;
+        let cleaned = c.clean_cancellable(&text, &ask, cancel).map_err(|e| e.message)?;
+        cancel.check().map_err(|e| e.message)?;
+        Ok(cleaned)
+    });
+    match result {
         Ok(cleaned) => {
             crate::diag::info(format!("cleanup: {} -> {} chars in {} ms", text.chars().count(), cleaned.chars().count(), started.elapsed().as_millis()));
-            (cleaned, None)
+            (cleaned, None, remote_attempted)
         }
         Err(e) => {
             crate::diag::warn(format!("cleanup skipped: {e}"));
-            (text, Some(e))
+            (text, Some(e), remote_attempted)
         }
     }
 }
@@ -401,4 +442,148 @@ pub fn by_rule(s: &Settings, recognized: &str) -> String {
             language: (s.language != "auto").then_some(s.language.as_str()),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn helper_key_is_not_in_argv_and_cpu_is_explicit() {
+        let layout = local::Layout { root: std::path::PathBuf::from("/test/amber") };
+        let rt = local::llm_runtime("cpu").unwrap();
+        let model = &local::LLM_MODELS[0];
+        let cmd = llama_command(&layout, rt, model, 54321, "private-test-key");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(!args.iter().any(|a| a.contains("private-test-key") || a == "--api-key"));
+        for pair in [["--host", "127.0.0.1"], ["--port", "54321"], ["--parallel", "1"], ["--n-gpu-layers", "0"]] {
+            assert!(args.windows(2).any(|w| w == pair));
+        }
+        assert!(cmd.get_envs().any(|(k, v)| k == "LLAMA_API_KEY" && v == Some(std::ffi::OsStr::new("private-test-key"))));
+        assert!(!cmd.get_envs().any(|(k, _)| k == "LD_LIBRARY_PATH"));
+        assert_eq!(cmd.get_program(), layout.llm_server_exe(rt).as_os_str());
+        #[cfg(target_os = "linux")]
+        assert_eq!(std::path::Path::new(cmd.get_program()).file_name().unwrap(), "llama-server");
+    }
+
+    fn settings(engine: EngineKind) -> Settings {
+        let mut s = Settings::default();
+        s.cleanup.engine = engine;
+        s.cleanup.smart = true;
+        s
+    }
+
+    #[test]
+    fn skipped_cleanup_and_precancellation_do_not_expose_text() {
+        let mut s = settings(EngineKind::Server);
+        let cancel = CancellationToken::default();
+        let no_client = || -> Result<ChatCleaner, String> { panic!("must not construct a cleaner") };
+        s.cleanup.smart = false;
+        let (_, why, remote) = tidy_with_cleaner(&s, "Hello.", None, true, &cancel, no_client);
+        assert!(why.is_none() && !remote);
+        s.cleanup.smart = true;
+        let (_, why, remote) = tidy_with_cleaner(&s, "", None, true, &cancel, no_client);
+        assert!(why.is_none() && !remote);
+        s.snippets.push(amber_core::snippets::Snippet { trigger: "signature".into(), text: "Saved text".into() });
+        let result = tidy_with_cleaner(&s, "Signature.", None, true, &cancel, no_client);
+        assert_eq!(result, ("Saved text".into(), None, false));
+        cancel.cancel();
+        let (text, why, remote) = tidy_with_cleaner(&s, "Signature.", None, true, &cancel, no_client);
+        assert_eq!(text, "Signature.");
+        assert!(why.is_some() && !remote);
+    }
+
+    #[test]
+    fn missing_configuration_keeps_rules_without_remote_exposure() {
+        let s = settings(EngineKind::Server);
+        let text = "Please send the report tomorrow.";
+        let result = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), || Err("No chat model chosen.".into()));
+        assert_eq!(result, (by_rule(&s, text), Some("No chat model chosen.".into()), false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_never_logs_snippet_text_even_with_a_stale_log_text_setting() {
+        let mut s = settings(EngineKind::Server);
+        s.log_text = true;
+        let trigger = "private snippet trigger test";
+        let body = "private snippet body test";
+        s.snippets.push(amber_core::snippets::Snippet { trigger: trigger.into(), text: body.into() });
+        let result = tidy_with_cleaner(&s, trigger, None, true, &CancellationToken::default(), || panic!("snippet must not use a model"));
+        assert_eq!(result, (body.into(), None, false));
+        assert!(!crate::diag::entries().iter().any(|entry| entry.message.contains(trigger) || entry.message.contains(body)));
+    }
+
+    /// A single loopback HTTP response, never a paid provider or a model download.
+    fn reply(status: u16, body: String, cancel: Option<CancellationToken>) -> (ChatCleaner, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("cleanup request did not arrive: {e}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" { break; }
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = n.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(length > 0 && length < 100_000);
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            drop(reader);
+            if let Some(cancel) = cancel { cancel.cancel(); }
+            let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        (ChatCleaner::new(&base, "test-key", "test-model", None), server)
+    }
+
+    #[test]
+    fn failed_remote_cleanup_still_records_exposure_and_keeps_text() {
+        let s = settings(EngineKind::Server);
+        let text = "Please send the report tomorrow.";
+        let (cleaner, server) = reply(503, r#"{"error":{"message":"private echoed transcript"}}"#.into(), None);
+        let (out, why, remote) = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), || Ok(cleaner));
+        server.join().unwrap();
+        assert_eq!(out, by_rule(&s, text));
+        assert!(why.is_some() && remote);
+        assert!(!why.unwrap().contains("private echoed transcript"));
+    }
+
+    #[test]
+    fn completed_cleanup_exposure_depends_on_configuration_not_text_changes() {
+        for engine in [EngineKind::Local, EngineKind::Server] {
+            let s = settings(engine);
+            let text = "Please send the report tomorrow.";
+            let body = serde_json::json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}).to_string();
+            let (cleaner, server) = reply(200, body, None);
+            let result = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), || Ok(cleaner));
+            server.join().unwrap();
+            assert_eq!(result, (text.into(), None, engine == EngineKind::Server));
+        }
+    }
+
+    #[test]
+    fn cancelled_remote_cleanup_keeps_text_and_exposure() {
+        let s = settings(EngineKind::Server);
+        let text = "Please send the report tomorrow.";
+        let cancel = CancellationToken::default();
+        let (cleaner, server) = reply(200, "{}".into(), Some(cancel.clone()));
+        let (out, why, remote) = tidy_with_cleaner(&s, text, None, false, &cancel, || Ok(cleaner));
+        server.join().unwrap();
+        assert_eq!(out, by_rule(&s, text));
+        assert!(why.is_some() && remote && cancel.is_cancelled());
+    }
 }

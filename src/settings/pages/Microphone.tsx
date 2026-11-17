@@ -9,7 +9,8 @@ interface Microphones {
   default: string | null;
 }
 
-export function MicrophonePage({ s, save, toast, phase }: PageProps) {
+export function MicrophonePage({ s, save, toast, phase, ov }: PageProps) {
+  const linux = ov.platform === "linux";
   const [mics, setMics] = useState<Microphones | null>(null);
   const [level, setLevel] = useState(0);
   const [testing, setTesting] = useState(false);
@@ -95,23 +96,23 @@ export function MicrophonePage({ s, save, toast, phase }: PageProps) {
                 Stop test
               </button>
             ) : (
-              <button className="btn primary" onClick={() => startTest(s.microphone)}>
+              <button className="btn primary" disabled={linux && (phase === "recording" || phase === "transcribing" || phase === "inserting")} onClick={() => startTest(s.microphone)}>
                 Test microphone
               </button>
             )}
           </div>
         </div>
       </Section>
-      <Section title="Discord">
+      {!linux && <Section title="Discord">
         <Row
           label="Mute me in Discord while dictating"
           hint="While Amber listens it switches your microphone off in Discord - the switch at the bottom left - and on again at the stop, without taking the focus from your game. Nothing to set up; if you were muted already, you stay muted. Not for dictations into Discord itself. Discord must not be minimized or in the tray (behind other windows is fine), and must be in English or German."
         >
           <Switch on={s.discord.muteWhileDictating} onChange={(v) => save((x) => (x.discord.muteWhileDictating = v))} />
         </Row>
-      </Section>
+      </Section>}
       <p className="note">
-        If no microphone shows up or the meter stays flat: Windows Settings → Privacy &amp; security → Microphone → "Let desktop apps access your microphone".
+        {linux ? "If no microphone appears or the meter stays flat, check the input device and mute controls in your desktop sound settings. Check that your audio service is running and refresh the device list after reconnecting a microphone." : <>If no microphone shows up or the meter stays flat: Windows Settings → Privacy &amp; security → Microphone → "Let desktop apps access your microphone".</>}
       </p>
     </>
   );

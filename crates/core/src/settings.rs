@@ -334,6 +334,30 @@ pub struct DiscordSettings {
 pub const BUBBLE_SIZES: std::ops::RangeInclusive<u32> = 40..=96;
 
 impl Settings {
+    /// Linux desktop v1 deliberately excludes unattended input, listeners and command execution.
+    pub fn for_linux(mut self, first_start: bool) -> Self {
+        if first_start {
+            self.autostart = false;
+            self.history = false;
+            self.statistics = false;
+        }
+        self.auto_update = false;
+        self.log_text = false;
+        self.local.runtime = "cpu".into();
+        self.cleanup.local_runtime = "cpu".into();
+        self.phone.enabled = false;
+        self.phone.tunnel = false;
+        self.terminal.enabled = false;
+        self.terminal.automatic = false;
+        self.terminal.run_commands = false;
+        self.terminal.hotkey.clear();
+        self.discord.mute_while_dictating = false;
+        self.profiles.clear();
+        self.bubble.visibility = BubbleVisibility::Hidden;
+        self.hotkey.toggle_bubble.clear();
+        self
+    }
+
     /// Values out of range are pulled back in, so a hand-edited file cannot break the app.
     pub fn sanitized(mut self) -> Self {
         let d = Settings::default();
@@ -422,16 +446,40 @@ impl Settings {
     /// Reads the file; a missing file is a first start. A broken one is kept aside as
     /// `settings.broken.json` and the defaults take over, instead of the app not starting.
     pub fn load(path: &Path) -> (Settings, Option<String>) {
+        Self::load_for_platform(path, false)
+    }
+
+    pub fn load_linux(path: &Path) -> (Settings, Option<String>) {
+        Self::load_for_platform(path, true)
+    }
+
+    fn load_for_platform(path: &Path, linux: bool) -> (Settings, Option<String>) {
+        let defaults = || if linux { Settings::default().for_linux(true) } else { Settings::default() };
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
-            Err(e) => return (Settings::default(), Some(format!("settings unreadable: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (defaults(), None),
+            Err(e) => return (defaults(), Some(format!("settings unreadable: {e}"))),
         };
-        match serde_json::from_str::<Settings>(&raw) {
-            Ok(s) => (s.sanitized(), None),
+        let parsed = if linux {
+            serde_json::from_str::<serde_json::Value>(&raw).and_then(|mut value| {
+                if let Some(fields) = value.as_object_mut() {
+                    for name in ["history", "statistics", "autostart"] {
+                        fields.entry(name).or_insert(serde_json::Value::Bool(false));
+                    }
+                }
+                serde_json::from_value::<Settings>(value)
+            })
+        } else {
+            serde_json::from_str::<Settings>(&raw)
+        };
+        match parsed {
+            Ok(s) => {
+                let s = s.sanitized();
+                (if linux { s.for_linux(false) } else { s }, None)
+            }
             Err(e) => {
                 let _ = std::fs::rename(path, path.with_file_name("settings.broken.json"));
-                (Settings::default(), Some(format!("settings broken, reset to defaults: {e}")))
+                (defaults(), Some(format!("settings broken, reset to defaults: {e}")))
             }
         }
     }
@@ -444,7 +492,14 @@ impl Settings {
         }
         let tmp = path.with_extension("json.tmp");
         {
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&tmp)?;
             f.write_all(serde_json::to_string_pretty(self).expect("settings serialize").as_bytes())?;
             f.sync_all()?;
         }
@@ -455,6 +510,48 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_missing_partial_and_corrupt_settings_never_imply_privacy_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let check = |s: Settings| assert!(!s.history && !s.statistics && !s.autostart && !s.auto_update);
+        check(Settings::load_linux(&path).0);
+        std::fs::write(&path, "{}").unwrap();
+        check(Settings::load_linux(&path).0);
+        std::fs::write(&path, "{broken").unwrap();
+        let (s, error) = Settings::load_linux(&path);
+        assert!(error.is_some());
+        check(s);
+        assert!(dir.path().join("settings.broken.json").exists());
+        std::fs::write(&path, r#"{"history":true,"statistics":true,"autostart":true}"#).unwrap();
+        let (s, error) = Settings::load_linux(&path);
+        assert!(error.is_none());
+        assert!(s.history && s.statistics && s.autostart);
+    }
+
+    #[test]
+    fn linux_defaults_are_private_and_unsupported_features_stay_off() {
+        let mut s = Settings::default();
+        s.phone.enabled = true;
+        s.phone.tunnel = true;
+        s.terminal.run_commands = true;
+        s.local.runtime = "cuda".into();
+        s.log_text = true;
+        let s = s.for_linux(true);
+        assert!(!s.history && !s.statistics && !s.autostart && !s.auto_update && !s.log_text);
+        assert!(!s.phone.enabled && !s.phone.tunnel && !s.terminal.enabled && !s.terminal.run_commands);
+        assert!(s.profiles.is_empty());
+        assert_eq!(s.local.runtime, "cpu");
+        assert_eq!(s.cleanup.local_runtime, "cpu");
+        assert_eq!(s.bubble.visibility, BubbleVisibility::Hidden);
+        let mut opted_in = s;
+        opted_in.history = true;
+        opted_in.autostart = true;
+        opted_in.statistics = true;
+        let opted_in = opted_in.for_linux(false);
+        assert!(opted_in.history && opted_in.autostart && opted_in.statistics);
+    }
 
     #[test]
     fn terminal_mode_is_on_with_its_prefixes() {

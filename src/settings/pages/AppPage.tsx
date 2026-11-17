@@ -4,12 +4,20 @@ import type { LogEntry, UpdateInfo } from "../../shared/types";
 import type { PageProps } from "../App";
 import { Row, Section, Switch } from "../ui";
 
-export function AppPage({ s, save, ov, toast }: PageProps) {
+export function AppPage({ s, save, ov, toast, phase, quit }: PageProps & { quit: () => Promise<void> }) {
+  const linux = ov.platform === "linux";
+  const [quitting, setQuitting] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null | undefined>(undefined);
   const [busy, setBusy] = useState<"check" | "install" | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
 
-  const loadLog = async () => setLog((await invoke<LogEntry[]>("get_log")).reverse());
+  const loadLog = async () => {
+    try {
+      setLog((await invoke<LogEntry[]>("get_log")).reverse());
+    } catch (e) {
+      toast(`Could not load diagnostics: ${e}`);
+    }
+  };
   useEffect(() => {
     void loadLog();
   }, []);
@@ -43,10 +51,16 @@ export function AppPage({ s, save, ov, toast }: PageProps) {
       <h1>App</h1>
       <p className="lead">Amber {ov.version}</p>
       <Section>
-        <Row label="Start with Windows" hint="Amber waits quietly in the tray until you dictate.">
+        <Row label={linux ? "Start at desktop login" : "Start with Windows"} hint={linux ? "Writes a user XDG autostart entry. Bare i3 needs an XDG launcher such as dex, or an explicit exec line in its config; this switch alone does not start programs in i3." : "Amber waits quietly in the tray until you dictate."}>
           <Switch on={s.autostart} onChange={(v) => save((x) => (x.autostart = v))} />
         </Row>
-        <Row label="Update automatically" hint="New versions are installed in the background when you are not dictating.">
+        {linux && <Row label="Quit Amber" hint="Stops Amber and discards the in-memory result. Stop or cancel any active dictation first. A tray icon is not needed to quit.">
+          <button className="btn danger" disabled={quitting || phase === "recording" || phase === "transcribing" || phase === "inserting"} onClick={async () => {
+            setQuitting(true);
+            try { await quit(); } finally { setQuitting(false); }
+          }}>{quitting ? "Quitting..." : "Quit Amber"}</button>
+        </Row>}
+        {!linux && <><Row label="Update automatically" hint="New versions are installed in the background when you are not dictating.">
           <Switch on={s.autoUpdate} onChange={(v) => save((x) => (x.autoUpdate = v))} />
         </Row>
         <Row
@@ -73,12 +87,12 @@ export function AppPage({ s, save, ov, toast }: PageProps) {
           <button className="btn" onClick={() => invoke("open_url", { url: "https://github.com/EinFabo/amberpc/releases" })}>
             Open
           </button>
-        </Row>
+        </Row></>}
       </Section>
       <Section title="Diagnostics">
-        <Row label="Keep the recognized text in the log" hint="Off: only lengths and timings are logged, never what you said.">
+        {linux ? <Row label="Text logging disabled" hint="Recognized text logging is disabled on Linux. Review diagnostics before sharing them." /> : <Row label="Keep the recognized text in the log" hint="Off: only lengths and timings are logged, never what you said.">
           <Switch on={s.logText} onChange={(v) => save((x) => (x.logText = v))} />
-        </Row>
+        </Row>}
         <div className="row">
           <div className="label">
             <div>Recent events</div>
@@ -90,7 +104,9 @@ export function AppPage({ s, save, ov, toast }: PageProps) {
             className="btn"
             onClick={async () => {
               try {
-                await navigator.clipboard.writeText(log.map((l) => `${l.time} ${l.level} ${l.message}`).join("\n"));
+                const text = log.map((l) => `${l.time} ${l.level} ${l.message}`).join("\n");
+                if (linux) await invoke("copy_text", { text });
+                else await navigator.clipboard.writeText(text);
                 toast("Log copied.", true);
               } catch (e) {
                 toast(`Could not copy: ${e}`);

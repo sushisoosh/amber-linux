@@ -133,7 +133,7 @@ fn open(
     let fell_back = !wanted.is_empty() && named.is_none();
     let device = named
         .or_else(|| host.default_input_device())
-        .ok_or_else(|| "No microphone found. Plug one in or check the Windows sound settings.".to_string())?;
+        .ok_or_else(|| "No microphone found. Plug one in or check the system sound settings.".to_string())?;
     let name = device.name().unwrap_or_else(|_| "Microphone".into());
     let config = device.default_input_config().map_err(|e| denied_hint(&e.to_string()))?;
     let rate = config.sample_rate().0;
@@ -204,7 +204,11 @@ where
 fn denied_hint(e: &str) -> String {
     let lower = e.to_lowercase();
     if lower.contains("denied") || lower.contains("0x80070005") {
-        "Windows blocks the microphone. Settings → Privacy & security → Microphone → allow desktop apps.".into()
+        if cfg!(windows) {
+            "Windows blocks the microphone. Settings → Privacy & security → Microphone → allow desktop apps.".into()
+        } else {
+            "Microphone access was denied. Check your desktop's sound settings and audio permissions.".into()
+        }
     } else {
         format!("The microphone could not be opened: {e}")
     }

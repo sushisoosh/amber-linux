@@ -1,6 +1,27 @@
 // Mirrors of the Rust types the windows exchange (serde, camelCase).
 
-export type Phase = "idle" | "recording" | "transcribing" | "inserting" | "done" | "error";
+export type Phase = "idle" | "recording" | "transcribing" | "ready" | "inserting" | "done" | "error";
+
+export interface DictationResult {
+  text: string;
+  message: string;
+  engine: string;
+  exposure: string;
+}
+
+export interface DesktopStatus {
+  session: string;
+  shortcuts: string;
+  insertion: string;
+  clipboard: string;
+  secureStorage: string;
+  lifecycle?: string;
+}
+
+export interface StorageStatus {
+  credentials: string;
+  history: string;
+}
 
 export interface DictationEvent {
   state: Phase;
@@ -94,6 +115,7 @@ export interface ProviderInfo {
 }
 
 export interface Overview {
+  platform: "linux" | "windows" | "other";
   settings: Settings;
   version: string;
   providers: ProviderInfo[];

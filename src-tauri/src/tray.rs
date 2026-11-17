@@ -15,7 +15,11 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let sep = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let sep3 = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&dictate, &bubble, &sep, &copy_last, &again, &sep3, &settings, &update, &sep2, &quit])?;
+    let menu = if cfg!(target_os = "linux") {
+        Menu::with_items(app, &[&dictate, &sep, &copy_last, &again, &sep3, &settings, &sep2, &quit])?
+    } else {
+        Menu::with_items(app, &[&dictate, &bubble, &sep, &copy_last, &again, &sep3, &settings, &update, &sep2, &quit])?
+    };
 
     let mut tray = TrayIconBuilder::with_id("amber")
         .tooltip("Amber - dictation")
@@ -29,7 +33,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 // Recognition may take a while; the menu must not wait for it.
                 let app = app.clone();
                 std::thread::spawn(move || match crate::dictation::recognize_again(&app) {
-                    Ok(_) => crate::notify(&app, "Amber", "Recognized again - the text is on the clipboard."),
+                    Ok(_) => crate::notify(&app, "Amber", if cfg!(target_os = "linux") { "Recognized again - review and copy the result in the recorder." } else { "Recognized again - the text is on the clipboard." }),
                     Err(e) => crate::notify(&app, "Amber", &e),
                 });
             }
@@ -52,6 +56,14 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
 
 fn copy_last_dictation(app: &AppHandle) {
     use tauri::Manager;
+    #[cfg(target_os = "linux")]
+    if let Some(result) = app.state::<crate::state::Core>().dictation.result() {
+        match crate::insert::to_clipboard(&result.text) {
+            Ok(()) => crate::notify(app, "Amber", "The last dictation is on the clipboard."),
+            Err(e) => crate::notify(app, "Amber", &format!("Could not copy: {e}")),
+        }
+        return;
+    }
     let latest = app.state::<crate::state::Core>().memory.latest();
     match latest {
         Some(entry) => match crate::insert::to_clipboard(&entry.text) {

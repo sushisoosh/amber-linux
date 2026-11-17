@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Overview } from "../../shared/types";
 import type { PageProps } from "../App";
 import { Row, Section, Segmented, Switch } from "../ui";
 import { DownloadItem, StatusLabel, useLocal } from "../downloads";
@@ -17,14 +18,15 @@ const LANGUAGES: [string, string][] = [
 
 export function EnginePage(p: PageProps) {
   const { s, save } = p;
+  const linux = p.ov.platform === "linux";
   return (
     <>
       <h1>Engine</h1>
-      <p className="lead">Where your voice is turned into text. Locally nothing leaves this PC; a server is quick on any PC but needs an API key.</p>
+      <p className="lead">{linux ? "Choose where your audio is recognized. Local recognition stays on this PC; server recognition sends audio to the selected provider. Optional cleanup has its own destination." : "Where your voice is turned into text. Locally nothing leaves this PC; a server is quick on any PC but needs an API key."}</p>
       <div className="cards">
         <button className={`card ${s.engine === "local" ? "on" : ""}`} onClick={() => save((x) => (x.engine = "local"))}>
           <div className="title">On this PC</div>
-          <div className="hint">whisper.cpp on your CPU or NVIDIA GPU. Private, works offline, free.</div>
+          <div className="hint">{linux ? "Built-in whisper.cpp on your CPU. Recognition works offline after downloading a model." : "whisper.cpp on your CPU or NVIDIA GPU. Private, works offline, free."}</div>
         </button>
         <button className={`card ${s.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.engine = "server"))}>
           <div className="title">Server with API key</div>
@@ -91,7 +93,7 @@ function Vocabulary({ value, onSave }: { value: string; onSave: (v: string) => v
   );
 }
 
-function LocalEngine({ s, save, toast }: PageProps) {
+function LocalEngine({ s, save, toast, ov }: PageProps) {
   // A download is selected by Amber once it is complete, so the engine that works now keeps
   // working until then.
   const local = useLocal();
@@ -108,6 +110,7 @@ function LocalEngine({ s, save, toast }: PageProps) {
             local={local}
             kind="runtime"
             item={r}
+            builtIn={ov.platform === "linux"}
             selected={s.local.runtime === r.id}
             onSelect={() => save((x) => (x.local.runtime = r.id))}
             recommended={info.recommended[0] === r.id}
@@ -149,7 +152,7 @@ function LocalEngine({ s, save, toast }: PageProps) {
       <Section title="Local engine">
         <Row label={<StatusLabel status={st} />} hint={st.message ?? undefined}>
           {st.state !== "ready" && (
-            <button className="btn" disabled={st.state === "starting"} onClick={() => invoke("start_local")}>
+            <button className="btn" disabled={st.state === "starting"} onClick={() => invoke("start_local").catch((e) => toast(String(e)))}>
               Load now
             </button>
           )}
@@ -178,25 +181,57 @@ function LocalEngine({ s, save, toast }: PageProps) {
   );
 }
 
-function ServerEngine({ s, save, ov, refresh, toast }: PageProps) {
+function ServerEngine({ s, save, ov, refresh, toast, desktop }: PageProps) {
+  const linux = ov.platform === "linux";
   const provider = ov.providers.find((p) => p.id === s.server.provider) ?? ov.providers[0];
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(s.server.baseUrl);
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
   const [testing, setTesting] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [savingKey, setSavingKey] = useState(false);
+  const [customKeyStatus, setCustomKeyStatus] = useState<boolean | null>(null);
   useEffect(() => setBaseUrl(s.server.baseUrl), [s.server.baseUrl]);
-  useEffect(() => setTest(null), [provider.id]);
+  useEffect(() => { setTest(null); setKeyError(null); setKey(""); }, [provider.id, baseUrl]);
 
   const custom = provider.id === "custom";
+  const hasKey = linux && custom ? customKeyStatus === true : provider.hasKey;
+
+  useEffect(() => {
+    if (!linux || !custom) return;
+    let disposed = false;
+    setCustomKeyStatus(null);
+    void invoke<boolean>("has_api_key", { provider: "custom", baseUrl: baseUrl.trim() }).then((available) => {
+      if (!disposed) setCustomKeyStatus(available);
+    }).catch((e) => {
+      if (!disposed) setKeyError(`Could not check this server's key: ${e}`);
+    });
+    return () => { disposed = true; };
+  }, [linux, custom, baseUrl]);
 
   const saveKey = async (value: string | null) => {
+    setKeyError(null);
+    setSavingKey(true);
     try {
-      await invoke("set_api_key", { provider: provider.id, key: value });
+      if (custom) {
+        await save((x) => (x.server.baseUrl = baseUrl.trim()));
+        const current = (await invoke<Overview>("get_overview")).settings.server;
+        if (current.provider !== provider.id || current.baseUrl !== baseUrl.trim()) {
+          throw new Error("The server address was not saved. The key was not changed.");
+        }
+      }
+      await invoke("set_api_key", { provider: provider.id, key: value, ...(custom ? { baseUrl: baseUrl.trim() } : {}) });
       setKey("");
-      await refresh();
       toast(value ? "Key saved." : "Key removed.", true);
     } catch (e) {
+      if (linux) setKeyError(`Key storage could not be confirmed. A changed key may still be active for this session only. ${e}`);
       toast(String(e));
+    } finally {
+      await Promise.all([
+        refresh(), desktop.refresh(),
+        linux && custom ? invoke<boolean>("has_api_key", { provider: "custom", baseUrl: baseUrl.trim() }).then(setCustomKeyStatus) : Promise.resolve(),
+      ]).catch((e) => toast(`Could not refresh key status: ${e}`));
+      setSavingKey(false);
     }
   };
 
@@ -218,20 +253,22 @@ function ServerEngine({ s, save, ov, refresh, toast }: PageProps) {
         <Segmented
           value={provider.id}
           options={ov.providers.map((p) => [p.id, p.name] as [string, string])}
-          onChange={(id) =>
-            save((x) => {
+          onChange={(id) => {
+            if (savingKey) return;
+            void save((x) => {
               x.server.provider = id;
               x.server.model = ov.providers.find((p) => p.id === id)?.models[0]?.id ?? x.server.model;
-            })
-          }
+            });
+          }}
         />
       </Row>
       {custom && (
-        <Row label="Address" hint="The OpenAI-compatible base URL, e.g. http://192.168.1.20:8000/v1. Plain http only inside your own network.">
+        <Row label="Address" hint="An OpenAI-compatible HTTPS base URL. Plain HTTP is allowed only on a literal loopback address, such as http://127.0.0.1:8000/v1.">
           <input
             type="text"
             style={{ width: 300 }}
             value={baseUrl}
+            disabled={savingKey}
             placeholder="https://…/v1"
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={() => baseUrl !== s.server.baseUrl && save((x) => (x.server.baseUrl = baseUrl.trim()))}
@@ -260,7 +297,8 @@ function ServerEngine({ s, save, ov, refresh, toast }: PageProps) {
         label="API key"
         hint={
           <>
-            {provider.hasKey ? "A key is saved (encrypted for your Windows account)." : provider.needsKey ? "No key saved yet." : "Optional for your own server."}{" "}
+            {hasKey ? linux ? "A key is available for this session. See credential storage status below for persistence." : "A key is saved (encrypted for your Windows account)." : provider.needsKey ? linux ? "No key available yet." : "No key saved yet." : "Optional for your own server."}{" "}
+            {linux && custom && "Keys are scoped to the server's scheme, host and port. "}
             {provider.keyUrl && (
               <a className="link" onClick={() => invoke("open_url", { url: provider.keyUrl })}>
                 Get a key
@@ -269,16 +307,25 @@ function ServerEngine({ s, save, ov, refresh, toast }: PageProps) {
           </>
         }
       >
-        <input type="password" style={{ width: 220 }} value={key} placeholder={provider.hasKey ? "••••••••" : "Paste key"} onChange={(e) => setKey(e.target.value)} />
-        <button className="btn primary" disabled={!key.trim()} onClick={() => saveKey(key)}>
-          Save
+        <input type="password" style={{ width: 220 }} value={key} disabled={savingKey} placeholder={hasKey ? "••••••••" : "Paste key"} onChange={(e) => setKey(e.target.value)} />
+        <button className="btn primary" disabled={savingKey || !key.trim()} onClick={() => saveKey(key)}>
+          {savingKey ? "Saving..." : "Save"}
         </button>
-        {provider.hasKey && (
-          <button className="btn danger" onClick={() => saveKey(null)}>
+        {hasKey && (
+          <button className="btn danger" disabled={savingKey} onClick={() => saveKey(null)}>
             Remove
           </button>
         )}
       </Row>
+      {linux && <>
+        {keyError && <div className="row"><div className="note error" role="alert">{keyError}</div></div>}
+        <Row label="Credential storage" hint={desktop.storage?.credentials ?? desktop.error ?? "Checking secure storage..."}>
+          <button className="btn" disabled={desktop.loading || savingKey} onClick={() => void Promise.all([
+            refresh(), desktop.refresh(),
+            custom ? invoke<boolean>("has_api_key", { provider: "custom", baseUrl: baseUrl.trim() }).then(setCustomKeyStatus) : Promise.resolve(),
+          ]).catch((e) => toast(String(e)))}>Refresh</button>
+        </Row>
+      </>}
       <Row
         label="Fall back to this PC"
         hint="When the server cannot be reached (offline, down), the recording is recognized by the model set under “On this PC” instead of being lost - if it is downloaded. Never the other way round."

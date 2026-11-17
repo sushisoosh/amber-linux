@@ -1,6 +1,19 @@
 // Small building blocks for the settings pages.
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import type { Phase } from "../shared/types";
+
+export function phaseLabel(phase: Phase) {
+  return {
+    idle: "Ready",
+    recording: "Listening…",
+    transcribing: "Recognizing…",
+    ready: "Result ready",
+    inserting: "Inserting…",
+    done: "Done",
+    error: "Failed",
+  }[phase];
+}
 
 /** A row's label, for the switch in it - screen readers announce what it switches. */
 const RowLabel = createContext<string | undefined>(undefined);

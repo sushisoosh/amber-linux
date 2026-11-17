@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "mainBinaryName": "amber-dictation",
+  "bundle": {
+    "targets": ["deb", "rpm"],
+    "createUpdaterArtifacts": false,
+    "shortDescription": "Local-first desktop dictation",
+    "longDescription": "Record speech, recognize it locally or with a selected server, then review and copy the result. Linux desktop integration is capability-based.",
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libasound2t64", "libayatana-appindicator3-1", "libxtst6"]
+      },
+      "rpm": {
+        "depends": ["webkit2gtk4.1", "gtk3", "alsa-lib", "libappindicator-gtk3", "libXtst"]
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [],
+      "pubkey": ""
+    }
+  }
+}

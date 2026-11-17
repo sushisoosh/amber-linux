@@ -1,5 +1,54 @@
 # Amber for Windows
 
+## Linux Desktop Preview
+
+This worktree also contains a Linux desktop port targeting GNOME and KDE. It is a
+preview until the real-desktop integration matrix has passed, not a claim of
+Windows feature parity. Upstream source, artwork, and redistribution remain subject
+to the repository license and the author's written permission.
+
+- Local CPU Whisper inference is built in; only model weights need downloading.
+  OpenAI-compatible recognition and optional local/server cleanup are supported.
+- The Linux Recorder page keeps results in memory for review and explicit Copy.
+  Recognition completion never silently replaces the clipboard or pastes into an
+  unknown field. On X11, `amber --insert-last` can submit a single-line result to a
+  supported native editor; it is an explicit, unverified paste, not automatic typing.
+- Wayland shortcuts use the desktop portal when available. GNOME 48+ and KDE Plasma
+  6 are the primary targets. On older/missing portal backends, configure a desktop
+  shortcut for `amber --toggle`; `amber --cancel` stops/cancels a dictation. That
+  fallback is toggle-only. Clipboard access is an explicit foreground action.
+- Credentials and optional history use authenticated encryption with a key in Secret
+  Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
+  causes plaintext persistence. Credential-save errors leave keys available only
+  for the current session. History, statistics, and login startup are opt-in.
+- Phone/tunnel/control servers, terminal-command generation, Discord mute, automatic
+  per-app profiles, the Windows updater, and the Windows floating bubble are disabled
+  in the Linux desktop. Updates are installed from Linux packages.
+
+Build on Ubuntu 24.04 with Rust (see the workspace MSRV), Node.js 22, and:
+
+```bash
+sudo apt-get install build-essential cmake pkg-config clang libclang-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev \
+  librsvg2-dev libxdo-dev libxtst-dev libssl-dev libdbus-1-dev rpm
+npm ci
+npm run build
+npm run test:ui
+cargo test -p amber-core -p amber-inference -p amber-server -p amber-pc --locked
+npm run app
+npm run app:build -- --bundles deb,rpm
+```
+
+The Linux Tauri configuration is selected automatically. `.deb`/`.rpm` outputs are
+under `target/release/bundle/`. Model tests marked ignored require explicitly
+provided model files; ordinary tests do not download models or contact paid APIs.
+CI builds/tests/packages are not substitutes for microphone, keyring, clipboard,
+focus, suspend/revocation, native Wayland/XWayland, and clean-install testing on real
+GNOME/KDE sessions. Wayland automatic text injection is not implemented; use review,
+Copy, and manual paste. GPU/ARM/Flatpak/AppImage support is deferred.
+
+The remainder of this README describes the upstream Windows application.
+
 Dictation into **any** window - Amber's Android dictation, on the PC. Speak, and the text
 appears where your cursor is: in Notepad, the browser, Discord, VS Code, Word.
 

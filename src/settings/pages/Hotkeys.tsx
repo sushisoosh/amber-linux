@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { HotkeyMode } from "../../shared/types";
 import type { PageProps } from "../App";
 import { Row, Section, Segmented } from "../ui";
+import { DesktopDiagnostics } from "../desktop";
 
 const MODES: [HotkeyMode, string][] = [
   ["both", "Tap or hold"],
@@ -15,32 +16,41 @@ const MODE_HINT: Record<HotkeyMode, string> = {
   hold: "Dictates while you hold the keys (push to talk).",
 };
 
-export function HotkeysPage({ s, save }: PageProps) {
+export function HotkeysPage({ s, save, ov, desktop }: PageProps) {
+  const linux = ov.platform === "linux";
   return (
     <>
       <h1>Hotkeys</h1>
-      <p className="lead">Work in every app, also when Amber's windows are closed. Use Ctrl, Alt or Win (Shift alone is not enough) so normal typing is not caught - or a function key.</p>
+      <p className="lead">{linux ? "Global shortcuts depend on your desktop and its permissions. The recorder window always provides Record, Stop, and Cancel controls. Use Ctrl, Alt or Super, or a function key." : "Work in every app, also when Amber's windows are closed. Use Ctrl, Alt or Win (Shift alone is not enough) so normal typing is not caught - or a function key."}</p>
       <Section title="Dictation">
-        <Row label="Hotkey">
-          <HotkeyInput value={s.hotkey.dictate} onChange={(v) => save((x) => (x.hotkey.dictate = v))} />
+        <Row label="Hotkey" hint={linux ? "On Wayland this is a preferred binding. The portal permission dialog or desktop settings may assign a different shortcut; check the status below." : undefined}>
+          <HotkeyInput value={s.hotkey.dictate} linux={linux} onChange={(v) => save((x) => (x.hotkey.dictate = v))} />
         </Row>
-        <Row label="Behaviour" hint={MODE_HINT[s.hotkey.mode]}>
+        <Row label="Behaviour" hint={linux ? `${MODE_HINT[s.hotkey.mode]} Hold needs shortcut-release events; use toggle when your desktop cannot supply them.` : MODE_HINT[s.hotkey.mode]}>
           <Segmented value={s.hotkey.mode} options={MODES} onChange={(m) => save((x) => (x.hotkey.mode = m))} />
         </Row>
       </Section>
-      {s.terminal.enabled && (
+      {!linux && s.terminal.enabled && (
         <Section title="Terminal commands">
           <Row label="Command hotkey" hint="Optional. Like the dictation hotkey, but what you say becomes a shell command, typed without Enter - in any window (set up on the Programs page).">
             <HotkeyInput value={s.terminal.hotkey} onChange={(v) => save((x) => (x.terminal.hotkey = v))} />
           </Row>
         </Section>
       )}
-      <Section title="Bubble">
+      {!linux && <Section title="Bubble">
         <Row label="Show / hide the bubble" hint="Optional.">
           <HotkeyInput value={s.hotkey.toggleBubble} onChange={(v) => save((x) => (x.hotkey.toggleBubble = v))} />
         </Row>
-      </Section>
-      <p className="note">The bubble works with the mouse as well: click to start and stop, hold to talk, drag to move it, right-click for the settings.</p>
+      </Section>}
+      {linux ? <>
+        <Section title="Custom desktop shortcuts">
+          <Row label="Start / stop recording" hint={<>Add a desktop or i3 shortcut for <code>amber-dictation --toggle</code>. Press once to start, again to stop. This fallback is toggle-only. Do not assign the same binding in both i3 and Amber.</>} />
+          <Row label="Cancel dictation" hint={<>Assign a second shortcut to <code>amber-dictation --cancel</code>. Cancellation stops dictation and microphone testing, not a previously completed result.</>} />
+          <Row label="Optional explicit X11 paste" hint={<>For supported native editors, assign <code>amber-dictation --insert-last</code> to a desktop shortcut. Review a single-line result, focus its destination, then invoke the shortcut. Submission is not verified. Wayland, terminals, multiline text and other unsupported targets require Copy and manual paste.</>} />
+          <Row label="If a shortcut is denied or unavailable" hint="Keep the recorder window available. Portal support and permissions vary by desktop version; a tray icon or extension is not required." />
+        </Section>
+        <DesktopDiagnostics desktop={desktop} />
+      </> : <p className="note">The bubble works with the mouse as well: click to start and stop, hold to talk, drag to move it, right-click for the settings.</p>}
     </>
   );
 }
@@ -77,14 +87,14 @@ export function accelerator(e: KeyboardEvent): string | null {
   return [...mods, keyName(e)].join("+");
 }
 
-export function pretty(acc: string) {
+export function pretty(acc: string, linux = false) {
   return acc
     .split("+")
-    .map((k) => k.replace(/^Key([A-Z])$/, "$1").replace(/^Digit(\d)$/, "$1").replace("Super", "Win"))
+    .map((k) => k.replace(/^Key([A-Z])$/, "$1").replace(/^Digit(\d)$/, "$1").replace("Super", linux ? "Super" : "Win"))
     .join(" + ");
 }
 
-function HotkeyInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function HotkeyInput({ value, onChange, linux = false }: { value: string; onChange: (v: string) => void; linux?: boolean }) {
   const [recording, setRecording] = useState(false);
 
   useEffect(() => {
@@ -109,7 +119,7 @@ function HotkeyInput({ value, onChange }: { value: string; onChange: (v: string)
   return (
     <>
       <button className={`btn hotkey ${recording ? "recording" : ""}`} onClick={() => setRecording(!recording)} onBlur={() => setRecording(false)}>
-        {recording ? "Press the keys…" : value ? pretty(value) : "Not set"}
+        {recording ? "Press the keys…" : value ? pretty(value, linux) : "Not set"}
       </button>
       {value && !recording && (
         <button className="btn" onClick={() => onChange("")}>

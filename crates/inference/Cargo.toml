@@ -1,0 +1,19 @@
+[package]
+name = "amber-inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared in-process Whisper recognition for Amber"
+license-file = "../../LICENSE"
+
+[dependencies]
+amber-core = { path = "../core" }
+serde_json = "1"
+whisper-rs = { version = "0.16", default-features = false }
+
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
+
+[dev-dependencies]
+tempfile = "3"

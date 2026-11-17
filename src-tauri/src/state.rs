@@ -24,7 +24,9 @@ pub struct Paths {
 pub struct Core {
     pub paths: Paths,
     settings: RwLock<Settings>,
+    pub settings_changes: Mutex<()>,
     keys: Mutex<HashMap<String, String>>,
+    credential_changes: Mutex<()>,
     pub dictation: Dictation,
     pub whisper: Whisper,
     pub hotkey_gesture: Mutex<Gesture>,
@@ -50,7 +52,10 @@ pub struct Core {
 
 impl Core {
     pub fn new(paths: Paths) -> Self {
+        #[cfg(not(target_os = "linux"))]
         let (settings, problem) = Settings::load(&paths.settings);
+        #[cfg(target_os = "linux")]
+        let (settings, problem) = Settings::load_linux(&paths.settings);
         if let Some(problem) = problem {
             crate::diag::warn(problem);
         }
@@ -61,7 +66,9 @@ impl Core {
         Core {
             paths,
             settings: RwLock::new(settings),
+            settings_changes: Mutex::new(()),
             keys: Mutex::new(keys),
+            credential_changes: Mutex::new(()),
             dictation: Dictation::default(),
             whisper: Whisper::default(),
             hotkey_gesture: Mutex::new(Gesture::new(mode)),
@@ -86,15 +93,25 @@ impl Core {
 
     /// Changes, sanitizes and saves the settings; returns the new ones.
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Settings {
+        match self.try_update_settings(change) {
+            Ok(settings) => settings,
+            Err(e) => {
+                crate::diag::error(&e);
+                self.settings()
+            }
+        }
+    }
+
+    pub fn try_update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
         let mut s = self.settings.write().unwrap();
         let mut next = s.clone();
         change(&mut next);
         let next = next.sanitized();
-        if let Err(e) = next.save(&self.paths.settings) {
-            crate::diag::error(format!("settings not saved: {e}"));
-        }
+        #[cfg(target_os = "linux")]
+        let next = next.for_linux(false);
+        next.save(&self.paths.settings).map_err(|e| format!("Settings were not saved: {e}"))?;
         *s = next.clone();
-        next
+        Ok(next)
     }
 
     pub fn key(&self, provider: &str) -> Option<String> {
@@ -102,16 +119,48 @@ impl Core {
     }
 
     pub fn has_key(&self, provider: &str) -> bool {
-        self.key(provider).is_some()
+        if provider == "custom" {
+            self.key_for(provider, &self.settings().server.base_url).is_some()
+        } else {
+            self.key(provider).is_some()
+        }
+    }
+
+    /// A custom credential is never forwarded to another scheme, host or port.
+    pub fn key_for(&self, provider: &str, base: &str) -> Option<String> {
+        if provider != "custom" {
+            return self.key(provider);
+        }
+        let origin = amber_core::providers::credential_origin(base).ok()?;
+        self.key(&format!("custom:{origin}"))
     }
 
     pub fn set_key(&self, provider: &str, key: Option<String>) -> Result<(), String> {
-        let mut keys = self.keys.lock().unwrap();
-        match key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
-            Some(k) => keys.insert(provider.to_string(), k),
-            None => keys.remove(provider),
+        self.set_key_for(provider, None, key)
+    }
+
+    pub fn set_key_for(&self, provider: &str, base: Option<&str>, key: Option<String>) -> Result<(), String> {
+        let _change = self.credential_changes.lock().unwrap();
+        let storage_id = if provider == "custom" {
+            let settings = self.settings();
+            format!("custom:{}", amber_core::providers::credential_origin(base.unwrap_or(&settings.server.base_url))?)
+        } else {
+            provider.to_string()
         };
-        crate::secrets::save(&self.paths.secrets, &keys)
+        let mut keys = self.keys.lock().unwrap();
+        if provider == "custom" {
+            // Legacy unbound credentials must be re-entered for a known origin.
+            keys.remove("custom");
+        }
+        match key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+            Some(k) => keys.insert(storage_id, k),
+            None => keys.remove(&storage_id),
+        };
+        let snapshot = keys.clone();
+        drop(keys);
+        crate::secrets::save(&self.paths.secrets, &snapshot).map_err(|e| {
+            format!("The credential change is active in this session, but persistence failed or could not be confirmed. Do not rely on it surviving a restart. {e}")
+        })
     }
 
     /// Milliseconds since start, the gesture machine's clock.

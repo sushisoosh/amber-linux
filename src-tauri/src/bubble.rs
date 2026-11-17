@@ -7,7 +7,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use amber_core::settings::{BubbleVisibility, Edge};
+use amber_core::settings::BubbleVisibility;
+#[cfg(windows)]
+use amber_core::settings::Edge;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -225,7 +227,14 @@ fn build_settings(app: &AppHandle, url: String) {
             if let Ok(hwnd) = w.hwnd() {
                 SETTINGS_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
             }
-            w.on_window_event(|e| {
+            let app = app.clone();
+            w.on_window_event(move |e| {
+                #[cfg(target_os = "linux")]
+                if let tauri::WindowEvent::CloseRequested { .. } = e {
+                    if app.state::<Core>().dictation.is_recording() {
+                        crate::dictation::cancel(&app);
+                    }
+                }
                 if let tauri::WindowEvent::Destroyed = e {
                     SETTINGS_HWND.store(0, Ordering::Relaxed);
                 }

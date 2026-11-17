@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use amber_core::audio::{self, Rejected};
-use amber_core::engine::{ErrorKind, OpenAiTranscriber, TranscribeOptions, Transcriber, WhisperServerTranscriber};
+use amber_core::engine::{CancellationToken, ErrorKind, OpenAiTranscriber, TranscribeOptions, Transcriber};
+#[cfg(not(target_os = "linux"))]
+use amber_core::engine::WhisperServerTranscriber;
 use amber_core::chunking::{self, ChunkPlanner, FrameVad, Parts};
 use amber_core::{estimate, local};
 use amber_core::providers;
@@ -25,6 +27,7 @@ pub enum Phase {
     Idle,
     Recording,
     Transcribing,
+    Ready,
     Inserting,
     Done,
     Error,
@@ -41,6 +44,15 @@ pub struct StateEvent {
     /// A terminal request, not a dictation: the bubble shows ">_".
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub command: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationResult {
+    pub text: String,
+    pub message: String,
+    pub engine: String,
+    pub exposure: String,
 }
 
 struct Inner {
@@ -60,10 +72,20 @@ struct Inner {
     stop_requested: bool,
     /// Recognizes finished parts while the user is still speaking.
     chunks: Option<ChunkJob>,
+    cancel: CancellationToken,
+    result: Option<DictationResult>,
+    pending_paste: Option<CancellationToken>,
+}
+
+impl Inner {
+    fn cancel_pending_paste(&mut self) {
+        if let Some(cancel) = self.pending_paste.take() { cancel.cancel(); }
+    }
 }
 
 pub struct Dictation {
     inner: Mutex<Inner>,
+    processing: AtomicBool,
 }
 
 impl Default for Dictation {
@@ -80,7 +102,11 @@ impl Default for Dictation {
                 started: None,
                 stop_requested: false,
                 chunks: None,
+                cancel: CancellationToken::default(),
+                result: None,
+                pending_paste: None,
             }),
+            processing: AtomicBool::new(false),
         }
     }
 }
@@ -98,23 +124,107 @@ impl Dictation {
     pub fn phase(&self) -> Phase {
         self.inner.lock().unwrap().phase
     }
+
+    pub fn result(&self) -> Option<DictationResult> {
+        self.inner.lock().unwrap().result.clone()
+    }
+}
+
+pub fn clear_result(app: &AppHandle) {
+    let core = app.state::<Core>();
+    let mut inner = core.dictation.inner.lock().unwrap();
+    if inner.phase == Phase::Inserting { return; }
+    inner.cancel_pending_paste();
+    inner.result = None;
+    if inner.phase == Phase::Ready {
+        inner.phase = Phase::Idle;
+    }
+    let phase = inner.phase;
+    let _ = app.emit("dictation-result", Option::<DictationResult>::None);
+    drop(inner);
+    announce(app, phase, None);
+}
+
+fn keep_result(app: &AppHandle, session: u64, result: DictationResult) -> bool {
+    let core = app.state::<Core>();
+    let mut inner = core.dictation.inner.lock().unwrap();
+    if inner.session != session || inner.cancel.is_cancelled() {
+        return false;
+    }
+    inner.cancel_pending_paste();
+    inner.result = Some(result.clone());
+    inner.phase = Phase::Ready;
+    let _ = app.emit("dictation-result", &result);
+    drop(inner);
+    announce(app, Phase::Ready, Some(result.message));
+    true
+}
+
+#[cfg(target_os = "linux")]
+pub fn insert_last_result(app: &AppHandle) {
+    let core = app.state::<Core>();
+    let Some(target) = insert::remember() else {
+        crate::notify(app, "Amber", "This desktop cannot identify the destination. Use Copy in the recorder window.");
+        return;
+    };
+    let (result, session, cancel) = {
+        let mut inner = core.dictation.inner.lock().unwrap();
+        if matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) || inner.pending_paste.is_some() {
+            return;
+        }
+        let Some(result) = inner.result.clone() else {
+            crate::notify(app, "Amber", "There is no dictation result to insert.");
+            return;
+        };
+        let cancel = CancellationToken::default();
+        inner.pending_paste = Some(cancel.clone());
+        (result, inner.session, cancel)
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Let a desktop shortcut's modifiers release, then revalidate the target once.
+        std::thread::sleep(Duration::from_millis(200));
+        let core = app.state::<Core>();
+        {
+            let mut inner = core.dictation.inner.lock().unwrap();
+            if inner.session != session || cancel.is_cancelled() || crate::linux_desktop::session_is_blocked() { return; }
+            inner.pending_paste = None;
+            inner.phase = Phase::Inserting;
+        }
+        announce(&app, Phase::Inserting, None);
+        let message = match insert::paste_explicit(&result.text, target) {
+            Ok(_) => "Paste submitted. Check the destination; insertion cannot be verified automatically.".into(),
+            Err(e) => format!("Paste was not confirmed: {e} The result is still in the recorder."),
+        };
+        core.dictation.inner.lock().unwrap().phase = Phase::Ready;
+        announce(&app, Phase::Ready, Some(message.clone()));
+        crate::notify(&app, "Amber", &message);
+    });
 }
 
 fn announce(app: &AppHandle, phase: Phase, message: Option<String>) {
     let core = app.state::<Core>();
     // Only what is still true: an Idle from a dictation that just ended must not arrive after
     // the next one's Recording - the bubble would show idle, Discord would be unmuted.
-    let (current, program) = {
+    let program = {
         let inner = core.dictation.inner.lock().unwrap();
-        (inner.phase, inner.program.clone())
+        if inner.phase != phase { return; }
+        let _ = app.emit("dictation-state", StateEvent { state: phase, message, expected_ms: None, command: false });
+        inner.program.clone()
     };
-    if current != phase {
-        return;
-    }
     // Muted in Discord exactly while Amber listens - stop, cancel and a failed microphone alike.
     crate::mute::follow(&core.settings().discord, program.as_deref(), || core.dictation.phase() == Phase::Recording);
-    let _ = app.emit("dictation-state", StateEvent { state: phase, message, expected_ms: None, command: false });
-    crate::bubble::sync_visibility(app, !matches!(phase, Phase::Idle));
+    crate::bubble::sync_visibility(app, !matches!(core.dictation.phase(), Phase::Idle));
+}
+
+fn progress(app: &AppHandle, session: u64, expected_ms: Option<u64>, command: bool) -> bool {
+    let core = app.state::<Core>();
+    let inner = core.dictation.inner.lock().unwrap();
+    if inner.session != session || inner.cancel.is_cancelled() || inner.phase != Phase::Transcribing {
+        return false;
+    }
+    let _ = app.emit("dictation-state", StateEvent { state: Phase::Transcribing, message: None, expected_ms, command });
+    true
 }
 
 /// Leaves Done/Error for Idle after a moment, unless a new dictation started meanwhile.
@@ -133,6 +243,10 @@ fn settle(app: &AppHandle, session: u64, after: Duration) {
 }
 
 fn fail(app: &AppHandle, session: u64, message: String, notify: bool) {
+    fail_with(app, session, message, notify, || {});
+}
+
+fn fail_with(app: &AppHandle, session: u64, message: String, notify: bool, retain: impl FnOnce()) {
     let core = app.state::<Core>();
     {
         let mut inner = core.dictation.inner.lock().unwrap();
@@ -140,6 +254,7 @@ fn fail(app: &AppHandle, session: u64, message: String, notify: bool) {
         if inner.session != session || !matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) {
             return;
         }
+        retain();
         inner.phase = Phase::Error;
     }
     crate::diag::warn(format!("dictation failed: {message}"));
@@ -147,6 +262,7 @@ fn fail(app: &AppHandle, session: u64, message: String, notify: bool) {
     if notify {
         crate::notify(app, "Amber", &message);
     }
+    #[cfg(not(target_os = "linux"))]
     settle(app, session, Duration::from_millis(2500));
 }
 
@@ -156,14 +272,24 @@ pub fn start(app: &AppHandle) {
 
 /// A dictation - with [command] (the command hotkey) a terminal request wherever it goes.
 pub fn start_as(app: &AppHandle, command: bool) {
+    #[cfg(target_os = "linux")]
+    if crate::linux_desktop::session_is_blocked() { return; }
     let core = app.state::<Core>();
+    if core.dictation.processing.load(Ordering::Acquire) {
+        crate::notify(app, "Amber", "The previous dictation is still finishing. Wait for it to finish before recording again.");
+        return;
+    }
     let settings = core.settings();
     let session = {
         let mut inner = core.dictation.inner.lock().unwrap();
-        if matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) {
+        if core.dictation.processing.load(Ordering::Acquire) || matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) {
             return;
         }
+        #[cfg(target_os = "linux")]
+        if crate::linux_desktop::session_is_blocked() { return; }
+        inner.cancel_pending_paste();
         inner.session += 1;
+        inner.cancel = CancellationToken::default();
         inner.phase = Phase::Recording;
         inner.target = insert::remember();
         inner.program = inner.target.and_then(|t| t.program());
@@ -175,6 +301,8 @@ pub fn start_as(app: &AppHandle, command: bool) {
     };
     // The bubble answers at once; the microphone opens in the background.
     announce(app, Phase::Recording, None);
+    #[cfg(target_os = "linux")]
+    crate::bubble::open_settings(app, Some("recorder"));
 
     let app = app.clone();
     std::thread::spawn(move || {
@@ -200,7 +328,7 @@ pub fn start_as(app: &AppHandle, command: bool) {
                 return;
             }
             if settings.engine == EngineKind::Local && settings.local.chunking {
-                inner.chunks = ChunkJob::start(&app, &settings, recorder.shared_samples(), recorder.rate);
+                inner.chunks = ChunkJob::start(&app, &settings, recorder.shared_samples(), recorder.rate, inner.cancel.clone());
             }
             inner.recorder = Some(recorder);
             std::mem::take(&mut inner.stop_requested)
@@ -239,7 +367,7 @@ pub fn start_as(app: &AppHandle, command: bool) {
 /// Ends the recording and sends it off.
 pub fn stop(app: &AppHandle) {
     let core = app.state::<Core>();
-    let (recorder, target, program, session, started, chunks, asked) = {
+    let (recorder, target, program, session, started, chunks, asked, cancel) = {
         let mut inner = core.dictation.inner.lock().unwrap();
         if inner.phase != Phase::Recording {
             return;
@@ -249,12 +377,19 @@ pub fn stop(app: &AppHandle) {
             return;
         };
         inner.phase = Phase::Transcribing;
+        core.dictation.processing.store(true, Ordering::Release);
         let asked = Asked { title: std::mem::take(&mut inner.title), command: inner.command };
-        (recorder, inner.target.take(), inner.program.take(), inner.session, inner.started.take(), inner.chunks.take(), asked)
+        (recorder, inner.target.take(), inner.program.take(), inner.session, inner.started.take(), inner.chunks.take(), asked, inner.cancel.clone())
     };
     announce(app, Phase::Transcribing, None);
     let app = app.clone();
     std::thread::spawn(move || {
+        struct Working<'a>(&'a AtomicBool);
+        impl Drop for Working<'_> {
+            fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+        }
+        let core = app.state::<Core>();
+        let _working = Working(&core.dictation.processing);
         // What the user waits from here on counts as the wait - also for a part still being
         // recognized.
         let stopped = Instant::now();
@@ -262,18 +397,24 @@ pub fn stop(app: &AppHandle) {
         let recording = recorder.finish();
         // Waits for a part still being recognized; what is left after it is the tail.
         let parts = chunks.map(ChunkJob::finish);
-        run(&app, session, recording, parts, target, program, asked, held_ms, stopped);
+        run(&app, session, recording, parts, target, program, asked, held_ms, stopped, &cancel);
     });
 }
 
 /// Throws the recording away (the press turned into a drag).
 pub fn cancel(app: &AppHandle) {
     let core = app.state::<Core>();
+    if let Some(meter) = core.mic_test.lock().unwrap().take() {
+        std::thread::spawn(move || drop(meter));
+    }
     let recorder = {
         let mut inner = core.dictation.inner.lock().unwrap();
-        if inner.phase != Phase::Recording {
+        inner.cancel_pending_paste();
+        if !matches!(inner.phase, Phase::Recording | Phase::Transcribing) {
             return;
         }
+        inner.cancel.cancel();
+        inner.session += 1;
         inner.phase = Phase::Idle;
         inner.target = None;
         if let Some(job) = inner.chunks.take() {
@@ -281,7 +422,8 @@ pub fn cancel(app: &AppHandle) {
         }
         inner.recorder.take()
     };
-    drop(recorder);
+    // Some audio drivers block while closing; cancellation must not freeze the GUI thread.
+    std::thread::spawn(move || drop(recorder));
     announce(app, Phase::Idle, None);
 }
 
@@ -331,7 +473,7 @@ fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, pr
     }
     let core = app.state::<Core>();
     let emit = |command: bool| {
-        let _ = app.emit("dictation-state", StateEvent { state: Phase::Transcribing, message: None, expected_ms: None, command });
+        progress(app, session, None, command);
     };
     // An ordinary dictation after all - the ">_" goes.
     let dictate = |why: &str| {
@@ -427,7 +569,11 @@ fn run(
     asked: Asked,
     held_ms: u64,
     stopped: Instant,
+    cancel: &CancellationToken,
 ) {
+    if cancel.is_cancelled() { return; }
+    #[cfg(target_os = "linux")]
+    let interrupted = recording.interrupted;
     let core = app.state::<Core>();
     let settings = core.settings();
     if recording.interrupted && recording.samples.is_empty() {
@@ -457,7 +603,7 @@ fn run(
         None => prepared.spoken_ms,
     };
     let expected = core.estimates.expected_ms(&estimate_key, left_ms, typical, OVERHEAD_MS);
-    let _ = app.emit("dictation-state", StateEvent { state: Phase::Transcribing, message: None, expected_ms: Some(expected), command: false });
+    if !progress(app, session, Some(expected), false) { return; }
 
     let recognized = match (&parts, tail) {
         (Some(p), Some(Ok(t))) => {
@@ -466,36 +612,62 @@ fn run(
             let options = TranscribeOptions::new(&language, &chunking::prompt(&settings.vocabulary, &p.texts));
             // A short tail costs the context floor, not its length: not worth learning from.
             let learn = t.spoken_ms >= 5_000;
-            recognize(app, &settings, &t.wav, &options, t.spoken_ms, learn).map(|(raw, engine, ms)| (p.with_tail(Some(&raw)), engine, ms))
+            recognize(app, &settings, &t.wav, &options, t.spoken_ms, learn, cancel).map(|(raw, engine, ms)| (p.with_tail(Some(&raw)), engine, ms))
         }
         // The tail held no speech: the parts are the whole dictation.
         (Some(p), Some(Err(_))) => Ok((p.with_tail(None), p.engine.clone(), 0)),
         _ => {
             let options = TranscribeOptions::new(&settings.language, &settings.vocabulary);
-            recognize(app, &settings, &prepared.wav, &options, prepared.spoken_ms, true)
+            recognize(app, &settings, &prepared.wav, &options, prepared.spoken_ms, true, cancel)
         }
     };
     if let Some(p) = &parts {
         crate::diag::info(format!("recognized while speaking: {} parts, then the last {} ms", p.texts.len(), left_ms));
     }
+    if cancel.is_cancelled() { return; }
     let (raw, engine, recognize_ms) = match recognized {
         Ok(r) => r,
         Err(message) => {
             // Kept in memory for a few minutes: one click recognizes it again.
-            core.memory.keep_failed(prepared.wav, prepared.spoken_ms, program);
-            return fail(app, session, format!("{message} The recording is kept - tray → \"Recognize again\"."), true);
+            return fail_with(app, session, format!("{message} The recording is kept for ten minutes; use Recognize again."), true, || {
+                core.memory.keep_failed(prepared.wav, prepared.spoken_ms, program, settings.engine == EngineKind::Server);
+            });
         }
     };
     if terminal(app, &settings, session, &text::clean(&raw), program.as_deref(), &asked, target, prepared.spoken_ms) {
         return;
     }
     let profile = program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
-    let (cleaned, _skipped) = crate::llm::tidy(app, &settings, &text::clean(&raw), profile, true);
+    let (cleaned, _skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &text::clean(&raw), profile, true, cancel);
+    if cancel.is_cancelled() { return; }
     if cleaned.is_empty() {
         crate::diag::info(format!("{} ms of audio, nothing recognized", prepared.spoken_ms));
         return fail(app, session, "Nothing recognized.".into(), false);
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        let exposure = exposure_label(settings.engine == EngineKind::Server, remote_cleanup);
+        let result = DictationResult {
+            text: text::compose(&cleaned, settings.insert.trailing_space),
+            message: if interrupted {
+                "The microphone stopped unexpectedly, so this result may be incomplete. Review and copy; the clipboard has not been changed."
+            } else {
+                "Ready to review and copy. The clipboard has not been changed."
+            }.into(),
+            engine: engine.clone(),
+            exposure: exposure.into(),
+        };
+        if keep_result(app, session, result) {
+            core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
+                prepared.spoken_ms, stopped.elapsed().as_millis() as u64);
+        }
+        let _ = (recognize_ms, target);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+    let _ = remote_cleanup;
     {
         let mut inner = core.dictation.inner.lock().unwrap();
         if inner.session != session {
@@ -550,33 +722,85 @@ fn run(
             fail(app, session, format!("The text could not be inserted ({e}).{where_}"), true)
         }
     }
+    }
 }
 
-/// Recognizes the last failed recording once more (with the engine set now) and puts the
-/// text on the clipboard - by now the window it was meant for may be anywhere.
+/// Retries with the current engine. Linux retains a result for review; Windows copies it.
 pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    if crate::linux_desktop::session_is_blocked() { return Err("Unlock the desktop before retrying a dictation.".into()); }
     let core = app.state::<Core>();
-    let failed = core.memory.take_failed().ok_or("No failed recording from the last ten minutes.")?;
+    let (mut failed, session, cancel) = {
+        let mut inner = core.dictation.inner.lock().unwrap();
+        if matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) || core.dictation.processing.load(Ordering::Acquire) {
+            return Err("A dictation is already running.".into());
+        }
+        #[cfg(target_os = "linux")]
+        if crate::linux_desktop::session_is_blocked() { return Err("Unlock the desktop before retrying a dictation.".into()); }
+        let failed = core.memory.take_failed().ok_or("No failed recording from the last ten minutes.")?;
+        core.dictation.processing.store(true, Ordering::Release);
+        inner.cancel_pending_paste();
+        inner.session += 1;
+        inner.cancel = CancellationToken::default();
+        inner.phase = Phase::Transcribing;
+        (failed, inner.session, inner.cancel.clone())
+    };
+    struct Working<'a>(&'a AtomicBool);
+    impl Drop for Working<'_> {
+        fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+    }
+    let _working = Working(&core.dictation.processing);
+    announce(app, Phase::Transcribing, None);
     let settings = core.settings();
+    failed.remote_speech |= settings.engine == EngineKind::Server;
     let started = Instant::now();
     let options = TranscribeOptions::new(&settings.language, &settings.vocabulary);
-    let (raw, engine, _) = match recognize(app, &settings, &failed.wav, &options, failed.spoken_ms, true) {
+    let (raw, engine, _) = match recognize(app, &settings, &failed.wav, &options, failed.spoken_ms, true, &cancel) {
         Ok(r) => r,
         Err(e) => {
             // Still there for another try (another engine, the key fixed) - unless a newer
             // dictation failed meanwhile; that one is the one to keep.
-            core.memory.return_failed(failed);
+            if !cancel.is_cancelled() { core.memory.return_failed(failed); }
+            fail(app, session, e.clone(), false);
             return Err(e);
         }
     };
     let profile = failed.program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
-    let (text, _) = crate::llm::tidy(app, &settings, &text::clean(&raw), profile, true);
+    cancel.check().map_err(|e| e.message)?;
+    let (text, _, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &text::clean(&raw), profile, true, &cancel);
+    cancel.check().map_err(|e| e.message)?;
     if text.is_empty() {
+        fail(app, session, "Nothing recognized.".into(), false);
         return Err("Nothing recognized.".into());
     }
-    insert::to_clipboard(&text)?;
+    #[cfg(target_os = "linux")]
+    if !keep_result(app, session, DictationResult {
+        text: text.clone(),
+        message: "Ready to review and copy. The clipboard has not been changed.".into(),
+        engine: engine.clone(),
+        exposure: exposure_label(failed.remote_speech, remote_cleanup).into(),
+    }) {
+        return Err("Dictation was cancelled.".into());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        {
+            let mut inner = core.dictation.inner.lock().unwrap();
+            if inner.session != session || cancel.is_cancelled() { return Err("Dictation was cancelled.".into()); }
+            inner.phase = Phase::Inserting;
+        }
+        announce(app, Phase::Inserting, None);
+        if let Err(e) = insert::to_clipboard(&text) {
+            fail(app, session, e.clone(), false);
+            return Err(e);
+        }
+        core.dictation.inner.lock().unwrap().phase = Phase::Done;
+        announce(app, Phase::Done, Some("The result is on the clipboard.".into()));
+        settle(app, session, Duration::from_millis(900));
+        let _ = remote_cleanup;
+    }
     core.memory.remember(&settings, &text, failed.program.as_deref().unwrap_or(""), &engine, false, failed.spoken_ms, started.elapsed().as_millis() as u64);
-    crate::diag::info(format!("recognized again: {} words, on the clipboard", text::words(&text)));
+    crate::diag::info(format!("recognized again: {} words", text::words(&text)));
     Ok(text)
 }
 
@@ -592,7 +816,7 @@ impl ChunkJob {
     /// Only for models tuned to a short encoder context - a stock model works through 30 s
     /// for any part, and parts would only make it slower. Judged by the model the server
     /// actually runs, which may still be the previous one while the chosen one downloads.
-    fn start(app: &AppHandle, settings: &Settings, samples: Arc<Mutex<Vec<f32>>>, rate: u32) -> Option<ChunkJob> {
+    fn start(app: &AppHandle, settings: &Settings, samples: Arc<Mutex<Vec<f32>>>, rate: u32, cancel: CancellationToken) -> Option<ChunkJob> {
         let model = app.state::<Core>().whisper.running_model().unwrap_or_else(|| settings.local.model.clone());
         if !local::model(&model).is_some_and(|m| m.short_context) {
             return None;
@@ -614,7 +838,7 @@ impl ChunkJob {
                     return parts;
                 };
                 for f in fresh.chunks_exact(frame) {
-                    if flag.load(Ordering::SeqCst) {
+                    if flag.load(Ordering::SeqCst) || cancel.is_cancelled() {
                         // Stopped: whatever is not recognized yet belongs to the tail.
                         return parts;
                     }
@@ -635,9 +859,9 @@ impl ChunkJob {
                     let result = transcriber(&app, &settings).and_then(|p| {
                         parts.engine = p.label.clone();
                         let r = if detect {
-                            p.transcriber.transcribe_detecting(&part.wav, &options)
+                            p.transcriber.transcribe_detecting_cancellable(&part.wav, &options, &cancel)
                         } else {
-                            p.transcriber.transcribe(&part.wav, &options).map(|t| (t, None))
+                            p.transcriber.transcribe_cancellable(&part.wav, &options, &cancel).map(|t| (t, None))
                         };
                         r.map_err(|e| e.message)
                     });
@@ -658,7 +882,7 @@ impl ChunkJob {
                         }
                     }
                 }
-                if flag.load(Ordering::SeqCst) {
+                if flag.load(Ordering::SeqCst) || cancel.is_cancelled() {
                     return parts;
                 }
                 std::thread::sleep(Duration::from_millis(150));
@@ -699,11 +923,14 @@ fn recognize(
     options: &TranscribeOptions,
     spoken_ms: u64,
     learn: bool,
+    cancel: &CancellationToken,
 ) -> Result<(String, String, u128), String> {
+    cancel.check().map_err(|e| e.message)?;
     let core = app.state::<Core>();
     let mut picked = transcriber(app, settings)?;
     let mut t0 = Instant::now();
-    let mut result = picked.transcriber.transcribe(wav, options);
+    let mut result = picked.transcriber.transcribe_cancellable(wav, options, cancel);
+    cancel.check().map_err(|e| e.message)?;
 
     if let Err(e) = &result {
         // Not when the engine was switched to a server meanwhile - that stopped the local one.
@@ -712,13 +939,13 @@ fn recognize(
             crate::diag::warn("local engine went away during the request, trying again");
             picked = transcriber(app, settings)?;
             t0 = Instant::now();
-            result = picked.transcriber.transcribe(wav, options);
+            result = picked.transcriber.transcribe_cancellable(wav, options, cancel);
         } else if settings.engine == EngineKind::Server && e.kind.service_unavailable() && settings.server.local_fallback && local_ready(&core, settings) {
             crate::diag::warn(format!("server unavailable ({}), recognizing on this PC", e.detail));
             let server_error = e.message.clone();
             let local_result = local(app).and_then(|p| {
                 let t = Instant::now();
-                let r = p.transcriber.transcribe(wav, options).map_err(|e| e.message);
+                let r = p.transcriber.transcribe_cancellable(wav, options, cancel).map_err(|e| e.message);
                 Ok((p, t, r))
             });
             match local_result {
@@ -784,9 +1011,13 @@ fn local(app: &AppHandle) -> Result<Picked, String> {
 /// The local engine with [model] instead of the configured one (the phone's choice).
 fn local_model(app: &AppHandle, model: Option<&str>) -> Result<Picked, String> {
     let served = app.state::<Core>().whisper.ensure_model(app, model)?;
+    #[cfg(not(target_os = "linux"))]
     let slack = local::model(&served.model).filter(|m| m.short_context).map(|m| m.context_slack);
     Ok(Picked {
+        #[cfg(not(target_os = "linux"))]
         transcriber: Box::new(WhisperServerTranscriber::new(&served.url, slack)),
+        #[cfg(target_os = "linux")]
+        transcriber: served.transcriber,
         label: format!("local {}/{}", served.runtime, served.model),
         estimate_key: estimate::key("local", &served.runtime, &served.model),
     })
@@ -818,15 +1049,26 @@ pub fn transcriber(app: &AppHandle, settings: &Settings) -> Result<Picked, Strin
             let provider = providers::by_id(&settings.server.provider).ok_or("Unknown server provider.")?;
             let base = providers::effective_base_url(provider, &settings.server.base_url);
             providers::check_base_url(&base)?;
-            let key = core.key(provider.id).unwrap_or_default();
+            let key = core.key_for(provider.id, &base).unwrap_or_default();
             if provider.needs_key && key.is_empty() {
                 return Err(format!("No API key for {} yet - add it in the settings.", provider.name));
             }
+            let transcriber = OpenAiTranscriber::new(&base, &key, &settings.server.model);
+            let transcriber = if provider.id == "custom" { transcriber.with_catalog_discovery() } else { transcriber };
             Ok(Picked {
-                transcriber: Box::new(OpenAiTranscriber::new(&base, &key, &settings.server.model)),
+                transcriber: Box::new(transcriber),
                 label: format!("{} {}", provider.id, settings.server.model),
                 estimate_key: estimate::key(provider.id, "", &settings.server.model),
             })
         }
+    }
+}
+
+fn exposure_label(remote_speech: bool, remote_cleanup: bool) -> &'static str {
+    match (remote_speech, remote_cleanup) {
+        (true, true) => "Audio and text may have been sent to your configured recognition and cleanup servers.",
+        (true, false) => "Audio may have been sent to your configured recognition server, including before a local fallback.",
+        (false, true) => "Recognition stayed local. Text may have been sent to your configured cleanup server, even if cleanup failed.",
+        (false, false) => "Processed locally on this computer.",
     }
 }

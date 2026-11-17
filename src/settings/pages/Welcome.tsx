@@ -7,8 +7,9 @@ import { useLocal } from "../downloads";
 import { pretty } from "./Hotkeys";
 
 export function WelcomePage(p: PageProps) {
-  const { s, save, go } = p;
-  const { info, progress, download } = useLocal();
+  const { s, save, go, toast } = p;
+  const linux = p.ov.platform === "linux";
+  const { info, progress, errors, download } = useLocal();
 
   // Seeing this page once is enough; next start opens the normal settings.
   useEffect(() => {
@@ -39,22 +40,29 @@ export function WelcomePage(p: PageProps) {
   // working (a server user would otherwise be left without dictation for the download).
   const setupLocal = async () => {
     setWantLocal(true);
-    if (!rt.installed) await download("runtime", rtId, true);
-    if (!model.installed) await download("model", modelId, true);
+    try {
+      if (!linux && !rt.installed) await download("runtime", rtId, true);
+      if (!model.installed) await download("model", modelId, true);
+    } catch (e) {
+      setWantLocal(false);
+      toast(String(e));
+    }
   };
 
   return (
     <>
       <h1>Welcome to Amber</h1>
       <p className="lead">
-        Speak, and the text appears where your cursor is - in any app. Pick where your voice is recognized; you can change everything later.
+        {linux ? "Speak, review your text, then copy and paste into the app you choose. Pick where your voice is recognized; you can change everything later." : "Speak, and the text appears where your cursor is - in any app. Pick where your voice is recognized; you can change everything later."}
       </p>
       <div className="welcome-steps">
         <Section title="1 · Engine">
           <Row
             label={`On this PC: ${model.label} on ${rt.label}`}
             hint={
-              info.hasNvidia
+              linux
+                ? `The CPU runtime is built in. ${model.installed ? "The model is installed." : `Model download: ${size(model.sizeMb)}.`} Local recognition works offline after setup.`
+                : info.hasNvidia
                 ? `Your NVIDIA GPU makes this fast. Download: ${size((rt.installed ? 0 : rt.sizeMb) + (model.installed ? 0 : model.sizeMb))}.`
                 : `Runs on your processor. Download: ${size((rt.installed ? 0 : rt.sizeMb) + (model.installed ? 0 : model.sizeMb))}.`
             }
@@ -69,7 +77,8 @@ export function WelcomePage(p: PageProps) {
               </button>
             )}
           </Row>
-          <Row label="Or a server with your API key" hint="Groq is fast and costs about 4 cents per hour of speech.">
+          {(errors[`runtime:${rtId}`] || errors[`model:${modelId}`]) && <div className="row"><div className="note error" role="alert">{errors[`runtime:${rtId}`] ?? errors[`model:${modelId}`]}</div></div>}
+          <Row label="Or a server with your API key" hint={linux ? "Optional: send audio to Groq, OpenAI or your own server. Provider charges may apply; local recognition needs no key." : "Groq is fast and costs about 4 cents per hour of speech."}>
             <button
               className="btn"
               onClick={async () => {
@@ -91,7 +100,7 @@ export function WelcomePage(p: PageProps) {
         <Section title="3 · Dictate">
           <Row
             label={
-              s.hotkey.dictate ? (
+              linux ? "Record and stop in the recorder window. Review the result before copying." : s.hotkey.dictate ? (
                 <>
                   Press <b>{pretty(s.hotkey.dictate)}</b> - {s.hotkey.mode === "toggle" ? "once to start, again to stop" : s.hotkey.mode === "hold" ? "and hold it while you speak" : "tap to start and stop, or hold while you speak"}.
                 </>
@@ -99,13 +108,19 @@ export function WelcomePage(p: PageProps) {
                 "Set a hotkey to dictate from anywhere."
               )
             }
-            hint="Or click the amber bubble at the edge of your screen."
+            hint={linux ? "No tray or bubble is needed. Copy replaces the clipboard; clipboard managers may retain text. Automatic insertion is not promised." : "Or click the amber bubble at the edge of your screen."}
           >
-            <button className="btn" onClick={() => go("insert")}>
+            <button className="btn" onClick={() => go(linux ? "recorder" : "insert")}>
               Try it
             </button>
           </Row>
         </Section>
+        {linux && <Section title="4 · Desktop integration">
+          <Row label="Check shortcuts and permissions" hint={<>If your desktop cannot register a global shortcut, configure <code>amber-dictation --toggle</code> and <code>amber-dictation --cancel</code> in its keyboard settings or i3 config.</>}>
+            <button className="btn" onClick={() => go("hotkeys")}>Check capabilities</button>
+          </Row>
+          <Row label="Private by default" hint="History is opt-in. Persistent credentials and encrypted history require an available Secret Service wallet. A failed key save may leave a session-only key; check the storage status on the Engine page." />
+        </Section>}
       </div>
     </>
   );

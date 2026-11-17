@@ -1,5 +1,5 @@
-//! The local engine's parts: a whisper.cpp build and a model, both downloaded on demand,
-//! pinned by URL and SHA-256. Nothing unverified ever lands where the app runs it from.
+//! The local engine's parts: built-in CPU inference on Linux, a downloaded whisper.cpp
+//! runtime on Windows, and checksum-pinned model downloads on both platforms.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -24,6 +24,7 @@ pub struct Runtime {
     pub required: &'static [&'static str],
 }
 
+#[cfg(not(target_os = "linux"))]
 pub const RUNTIMES: [Runtime; 2] = [
     Runtime {
         id: "cpu",
@@ -55,6 +56,17 @@ pub const RUNTIMES: [Runtime; 2] = [
         ],
     },
 ];
+
+#[cfg(target_os = "linux")]
+pub const RUNTIMES: [Runtime; 1] = [Runtime {
+    id: "cpu",
+    label: "CPU (built in)",
+    note: "included with Amber - no runtime download needed",
+    url: "",
+    sha256: "",
+    size_mb: 0,
+    required: &[],
+}];
 
 pub struct Model {
     pub id: &'static str,
@@ -248,7 +260,10 @@ pub struct Archive {
 
 /// llama.cpp's prebuilt Windows binaries for the smart cleanup, release b11981 (2026-10-29).
 pub const LLAMA_CPP_BUILD: &str = "b11981";
+#[cfg(not(target_os = "linux"))]
 pub const LLM_SERVER_EXE: &str = "llama-server.exe";
+#[cfg(target_os = "linux")]
+pub const LLM_SERVER_EXE: &str = "llama-b11981/llama-server";
 
 pub struct LlmRuntime {
     pub id: &'static str,
@@ -268,6 +283,7 @@ impl LlmRuntime {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub const LLM_RUNTIMES: [LlmRuntime; 2] = [
     LlmRuntime {
         id: "cpu",
@@ -311,6 +327,19 @@ pub const LLM_RUNTIMES: [LlmRuntime; 2] = [
     },
 ];
 
+#[cfg(target_os = "linux")]
+pub const LLM_RUNTIMES: [LlmRuntime; 1] = [LlmRuntime {
+    id: "cpu",
+    label: "CPU",
+    note: "optional cleanup, slower than speech recognition",
+    archives: &[Archive {
+        url: LLAMA_SERVER_BUILDS[0].url,
+        sha256: LLAMA_SERVER_BUILDS[0].sha256,
+        size_mb: LLAMA_SERVER_BUILDS[0].size_mb,
+    }],
+    required: &[LLM_SERVER_EXE],
+}];
+
 pub struct LlmModel {
     pub id: &'static str,
     pub file: &'static str,
@@ -350,7 +379,8 @@ pub fn model(id: &str) -> Option<&'static Model> {
 
 /// What to suggest: the GPU build with the tuned large model where there is an NVIDIA card;
 /// else the tuned small model on a CPU with room (8+ threads, 8+ GB), the tuned base model on
-/// anything weaker (an old 4-core office PC with 4 GB). Only ever a suggestion.
+/// anything weaker (an old 4-core office PC with 4 GB). Only ever a suggestion; Linux desktop
+/// callers pass false for GPU support, while the standalone server can use Vulkan.
 pub fn recommend(has_nvidia: bool, threads: u32, ram_mb: u64) -> (&'static str, &'static str) {
     if has_nvidia {
         ("cuda", "acft-large-v3-turbo-q8_0")
@@ -514,6 +544,9 @@ impl Layout {
     /// A runtime counts as installed once its marker is there - written last, after every
     /// file was extracted.
     pub fn runtime_installed(&self, rt: &Runtime) -> bool {
+        if cfg!(target_os = "linux") {
+            return rt.id == "cpu" && rt.url.is_empty();
+        }
         let dir = self.runtime_dir(rt);
         fs::read_to_string(dir.join(".installed")).map(|v| v.trim() == rt.sha256).unwrap_or(false)
             && rt.required.iter().all(|f| dir.join(f).is_file())
@@ -563,6 +596,9 @@ pub fn download_verified(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<(), DownloadError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DownloadError::Cancelled);
+    }
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -605,6 +641,9 @@ pub fn download_verified(
         file.sync_all()?;
         drop(file);
         progress(done, total);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DownloadError::Cancelled);
+        }
         if !hex(&hasher.finalize()).eq_ignore_ascii_case(sha256) {
             return Err(DownloadError::Checksum);
         }
@@ -620,12 +659,45 @@ pub fn download_verified(
 /// Unpacks what the app needs from a whisper.cpp release zip - the server and every DLL,
 /// none of the test programs - flat into [dest].
 pub fn install_runtime(zip_path: &Path, dest: &Path, rt: &Runtime) -> Result<(), DownloadError> {
+    if cfg!(target_os = "linux") {
+        return Err(DownloadError::Package("Linux speech recognition is built in; no runtime archive is used.".into()));
+    }
     install_archives(&[zip_path], dest, SERVER_EXE, rt.required, rt.sha256)
 }
 
 /// The same for llama.cpp, whose CUDA build comes in two archives.
+#[cfg(not(target_os = "linux"))]
 pub fn install_llm_runtime(zips: &[&Path], dest: &Path, rt: &LlmRuntime) -> Result<(), DownloadError> {
     install_archives(zips, dest, LLM_SERVER_EXE, rt.required, &rt.marker())
+}
+
+#[cfg(target_os = "linux")]
+pub fn install_llm_runtime(archives: &[&Path], dest: &Path, rt: &LlmRuntime) -> Result<(), DownloadError> {
+    use std::os::unix::fs::PermissionsExt;
+    if rt.id != "cpu" || archives.len() != 1 {
+        return Err(DownloadError::Package("The Linux CPU cleanup engine needs one tar.gz archive.".into()));
+    }
+    let staging = dest.with_extension("new");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    let result = (|| {
+        tar::Archive::new(flate2::read::GzDecoder::new(File::open(archives[0])?)).unpack(&staging)?;
+        for file in rt.required {
+            if !staging.join(file).is_file() {
+                return Err(DownloadError::Package(format!("missing {file}")));
+            }
+        }
+        if fs::metadata(staging.join(LLM_SERVER_EXE))?.permissions().mode() & 0o111 == 0 {
+            return Err(DownloadError::Package("llama-server is not executable".into()));
+        }
+        fs::write(staging.join(".installed"), rt.marker())?;
+        replace_dir(&staging, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
 }
 
 /// Extracts [server_exe] and every DLL from [zips] flat into a sibling folder of [dest],
@@ -765,9 +837,14 @@ mod tests {
     #[test]
     fn catalog_is_consistent() {
         for r in &RUNTIMES {
-            assert_eq!(r.sha256.len(), 64);
-            assert!(r.url.starts_with("https://github.com/ggml-org/whisper.cpp/releases/download/"));
-            assert!(r.url.contains(WHISPER_CPP_BUILD));
+            if cfg!(target_os = "linux") {
+                assert_eq!(r.id, "cpu");
+                assert!(r.url.is_empty() && r.sha256.is_empty() && r.required.is_empty());
+            } else {
+                assert_eq!(r.sha256.len(), 64);
+                assert!(r.url.starts_with("https://github.com/ggml-org/whisper.cpp/releases/download/"));
+                assert!(r.url.contains(WHISPER_CPP_BUILD));
+            }
         }
         for m in &MODELS {
             assert_eq!(m.sha256.len(), 64);
@@ -782,7 +859,8 @@ mod tests {
         for (gpu, threads, ram) in [(true, 20, 32_000), (false, 20, 32_000), (false, 8, 4_000), (false, 4, 16_000)] {
             let (rt, m) = recommend(gpu, threads, ram);
             let m = model(m).unwrap();
-            assert!(runtime(rt).is_some() && m.short_context && !m.replaced);
+            assert_eq!(rt, if gpu { "cuda" } else { "cpu" });
+            assert!(m.short_context && !m.replaced);
             assert_eq!(m.wants_gpu, gpu);
         }
         assert_eq!(recommend(false, 20, 32_000).1, "futo-multilingual-244");
@@ -811,9 +889,12 @@ mod tests {
             assert!(r.required.contains(&LLM_SERVER_EXE));
             assert_eq!(llm_runtime(r.id).map(|x| x.id), Some(r.id));
         }
-        let cuda = llm_runtime("cuda").unwrap();
-        assert!(cuda.required.contains(&"cublas64_12.dll"));
-        assert_eq!(cuda.size_mb(), 641);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let cuda = llm_runtime("cuda").unwrap();
+            assert!(cuda.required.contains(&"cublas64_12.dll"));
+            assert_eq!(cuda.size_mb(), 641);
+        }
         for m in &LLM_MODELS {
             assert_eq!(m.sha256.len(), 64);
             assert!(m.url.ends_with(m.file) && m.url.contains("/resolve/a06e946b"));
@@ -821,6 +902,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn llm_runtime_from_two_archives() {
         let dir = tempfile::tempdir().unwrap();
         let cuda = llm_runtime("cuda").unwrap();
@@ -883,7 +965,7 @@ mod tests {
 
     #[test]
     fn download_reports_http_errors_and_cancel() {
-        let (url, _rx) = serve(vec![(404, "text/plain", b"no".to_vec()), (200, "application/octet-stream", vec![1; 10])]);
+        let (url, _rx) = serve(vec![(404, "text/plain", b"no".to_vec())]);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.bin");
         let cancel = AtomicBool::new(false);
@@ -893,6 +975,22 @@ mod tests {
         assert!(!dest.exists());
     }
 
+    #[test]
+    fn cancelling_a_finished_download_does_not_replace_an_existing_model() {
+        let body = b"new model".to_vec();
+        let hash = hex(&Sha256::digest(&body));
+        let (url, _rx) = serve(vec![(200, "application/octet-stream", body)]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        fs::write(&dest, b"existing model").unwrap();
+        let cancel = AtomicBool::new(false);
+        let result = download_verified(&url, &hash, &dest, &cancel, &mut |_, _| cancel.store(true, Ordering::Relaxed));
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert_eq!(fs::read(&dest).unwrap(), b"existing model");
+        assert!(!dest.with_extension("part").exists());
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let mut w = zip::ZipWriter::new(File::create(path).unwrap());
         for (name, data) in entries {
@@ -903,6 +1001,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn runtime_install_takes_server_and_dlls_only() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("rt.zip");
@@ -930,6 +1029,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn cuda_runtime_without_cublas_is_refused() {
         // whisper.cpp's CUDA 11.8 package shipped ggml-cuda.dll without the cuBLAS it links to:
         // Windows then fails to load the GPU backend and whisper.cpp silently runs on the CPU.
@@ -953,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn runtime_without_server_is_refused_and_leaves_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("rt.zip");
@@ -961,6 +1062,60 @@ mod tests {
         assert!(matches!(install_runtime(&zip_path, &dest, &RUNTIMES[0]), Err(DownloadError::Package(_))));
         assert!(!dest.exists() && !dest.with_extension("new").exists());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_speech_is_built_in_and_never_installs_windows_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout { root: dir.path().join("data") };
+        let cpu = runtime("cpu").unwrap();
+        assert!(layout.runtime_installed(cpu));
+        assert_eq!(cpu.size_mb, 0);
+        assert!(!layout.runtime_dir(cpu).exists());
+        assert!(runtime("cuda").is_none());
+        assert_eq!(recommend(false, 20, 32_000), ("cpu", "futo-multilingual-244"));
+        let error = install_runtime(&dir.path().join("windows.zip"), &layout.runtime_dir(cpu), cpu).unwrap_err();
+        assert!(matches!(error, DownloadError::Package(_)));
+        assert!(!layout.runtime_dir(cpu).exists());
+        let llm = llm_runtime("cpu").unwrap();
+        assert_eq!(llm.archives[0].url, llama_build("linux", "cpu").unwrap().url);
+        assert!(llm.archives[0].url.ends_with(".tar.gz"));
+        assert!(llm_runtime("cuda").is_none());
+        assert_eq!(layout.llm_server_exe(llm), layout.llm_runtime_dir(llm).join(llama_build("linux", "cpu").unwrap().exe));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cleanup_install_is_staged_and_preserves_native_modes_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("llama.tar.gz");
+        let layout = Layout { root: dir.path().join("data") };
+        let runtime = llm_runtime("cpu").unwrap();
+        let dest = layout.llm_runtime_dir(runtime);
+        for (name, mode, valid) in [(LLM_SERVER_EXE, 0o755, true), ("wrong-file", 0o755, false), (LLM_SERVER_EXE, 0o644, false)] {
+            let gz = flate2::write::GzEncoder::new(File::create(&archive).unwrap(), flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(mode);
+            header.set_cksum();
+            tar.append_data(&mut header, name, &b"hello"[..]).unwrap();
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_cksum();
+            tar.append_link(&mut link, "llama-b11981/libexample.so", "llama-server").unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            assert_eq!(install_llm_runtime(&[archive.as_path()], &dest, runtime).is_ok(), valid);
+            assert!(layout.llm_runtime_installed(runtime), "a failed replacement keeps the previous install");
+            assert_eq!(fs::read(layout.llm_server_exe(runtime)).unwrap(), b"hello");
+            assert_ne!(fs::metadata(layout.llm_server_exe(runtime)).unwrap().permissions().mode() & 0o111, 0);
+            assert_eq!(fs::read(dest.join("llama-b11981/libexample.so")).unwrap(), b"hello");
+            assert!(!dest.with_extension("new").exists());
+        }
+    }
+
     #[test]
     fn the_llama_builds_cover_both_systems() {
         for (os, backend) in [("linux", "cpu"), ("linux", "vulkan"), ("windows", "cpu"), ("windows", "vulkan")] {

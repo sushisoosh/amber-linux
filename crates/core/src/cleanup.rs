@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::engine::{status_error, ErrorKind, SttError};
+use crate::engine::{CancellationToken, ErrorKind, SttError};
 use crate::profiles::WritingStyle;
 
 /// A cleanup is worth a short wait, never a long one; the recognized text is ready.
@@ -304,16 +304,18 @@ impl ChatCleaner {
             api_key: api_key.trim().to_string(),
             model: model.to_string(),
             extra,
-            http: Client::builder()
-                .timeout(TIMEOUT)
-                .connect_timeout(Duration::from_secs(5))
-                .user_agent(concat!("AmberPC/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("http client"),
+            http: crate::engine::client(TIMEOUT, base_url.trim()),
         }
     }
 
     pub fn clean(&self, text: &str, ask: &Ask) -> Result<String, SttError> {
+        self.clean_cancellable(text, ask, &CancellationToken::default())
+    }
+
+    /// Cancellation drops the HTTP operation, but cannot retract data already sent. The
+    /// caller records remote exposure before invoking cleanup, including on failure.
+    pub fn clean_cancellable(&self, text: &str, ask: &Ask, cancel: &CancellationToken) -> Result<String, SttError> {
+        cancel.check()?;
         if text.trim().is_empty() {
             return Ok(text.to_string());
         }
@@ -324,13 +326,13 @@ impl ChatCleaner {
             "max_tokens": text.chars().count() / 2 + 256 + REASONING_HEADROOM,
             "messages": messages(text, ask),
         });
-        let reply = self.post(body)?;
+        let reply = self.post(body, cancel)?;
         let choice = reply.pointer("/choices/0").ok_or_else(|| fail("The cleanup answer was empty.", ""))?;
         // A reply cut off at max_tokens has lost the end of the dictation; losing text is
         // worse than not cleaning it.
         let finish = choice.get("finish_reason").and_then(Value::as_str);
         if !matches!(finish, None | Some("stop" | "eos" | "eos_token" | "end_turn" | "stop_sequence")) {
-            return Err(fail("The cleanup was cut off; kept the original.", &format!("finish_reason={finish:?}")));
+            return Err(fail("The cleanup was cut off; kept the original.", "unexpected finish reason"));
         }
         let content = choice.pointer("/message/content").and_then(Value::as_str).unwrap_or("");
         // The answer comes trimmed; a spoken line break at either end goes back on.
@@ -344,6 +346,7 @@ impl ChatCleaner {
                 &format!("rejected: {} (in={} out={})", verdict.reason(), text.chars().count(), cleaned.chars().count()),
             ));
         }
+        cancel.check()?;
         Ok(cleaned)
     }
 }
@@ -366,11 +369,13 @@ impl ChatCleaner {
         // stolen address must not run up the bill of a paid provider.
         let asked = request.get("max_tokens").and_then(Value::as_u64).unwrap_or(FORWARD_TOKENS);
         body["max_tokens"] = json!(asked.min(MAX_FORWARD_TOKENS));
-        self.post(body)
+        self.post(body, &CancellationToken::default())
     }
 
     /// Sends [body] with this side's extra fields; the parsed answer.
-    fn post(&self, mut body: Value) -> Result<Value, SttError> {
+    fn post(&self, mut body: Value, cancel: &CancellationToken) -> Result<Value, SttError> {
+        cancel.check()?;
+        crate::engine::validate_endpoint(&self.url)?;
         if let (Some(Value::Object(extra)), Value::Object(map)) = (&self.extra, &mut body) {
             for (k, v) in extra {
                 map.insert(k.clone(), v.clone());
@@ -380,13 +385,8 @@ impl ChatCleaner {
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
-        let resp = req.send().map_err(crate::engine::network_error)?;
-        let status = resp.status().as_u16();
-        let raw = resp.text().map_err(crate::engine::network_error)?;
-        if !(200..300).contains(&status) {
-            return Err(status_error(status, &raw));
-        }
-        serde_json::from_str(&raw).map_err(|e| fail("The cleanup answer could not be read.", &format!("{e}")))
+        let (status, body) = crate::engine::request(&self.http, req, crate::engine::MAX_RESPONSE_BYTES, cancel)?;
+        crate::engine::response_json(status, &body)
     }
 }
 
@@ -627,6 +627,55 @@ mod tests {
         // And a translation that gets through is thrown away.
         assert!(!plausible("Ich hab kein Wasser.", "I have no water.", WritingStyle::AsSpoken));
         assert!(!plausible("Okay, danke.", "Okay, thanks.", WritingStyle::Casual));
+    }
+
+    #[test]
+    fn cleanup_refuses_redirects_and_oversized_responses() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let (url, _rx) = crate::engine::testserver::serve_raw(vec![format!(
+            "HTTP/1.1 307 Redirect\r\nLocation: http://{}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target.local_addr().unwrap()
+        ).into_bytes()]);
+        let error = ChatCleaner::new(&url, "private-key", "m", None).clean("private transcript", &Ask::default()).unwrap_err();
+        assert_eq!(error.detail, "HTTP 307");
+        assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let (url, _rx) = crate::engine::testserver::serve_raw(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n".to_vec()]);
+        let error = ChatCleaner::new(&url, "", "m", None).clean("text", &Ask::default()).unwrap_err();
+        assert!(error.detail.contains("exceeds"));
+    }
+
+    #[test]
+    fn cleanup_diagnostics_do_not_reflect_server_content() {
+        let (url, _rx) = serve(vec![
+            reply("private transcript", "private credential"),
+            (401, "application/json", br#"{"error":{"message":"private credential"}}"#.to_vec()),
+            (200, "application/json", br#"{"private credential": broken}"#.to_vec()),
+        ]);
+        let cleaner = ChatCleaner::new(&url, "private-key", "m", None);
+        for _ in 0..3 {
+            let error = cleaner.clean("private transcript", &Ask::default()).unwrap_err();
+            assert!(!format!("{error} {error:?}").contains("private"));
+        }
+        let error = ChatCleaner::new("http://192.168.1.1", "private-key", "m", None).clean("private transcript", &Ask::default()).unwrap_err();
+        assert_eq!(error.detail, "endpoint rejected");
+    }
+
+    #[test]
+    fn cleanup_cancellation_aborts_the_in_flight_request() {
+        let (url, ready, release) = crate::engine::testserver::stalled(b"");
+        let token = CancellationToken::default();
+        let worker_token = token.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(ChatCleaner::new(&url, "", "m", None).clean_cancellable("text", &Ask::default(), &worker_token)).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        token.cancel();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        drop(release);
+        worker.join().unwrap();
+        assert_eq!(ChatCleaner::new("https://not-contacted.invalid", "", "m", None)
+            .clean_cancellable("text", &Ask::default(), &token).unwrap_err().kind, ErrorKind::Cancelled);
     }
 
     #[test]
