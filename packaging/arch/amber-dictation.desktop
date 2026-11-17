@@ -5,5 +5,5 @@ Comment=Local-first speech recognition with review and explicit text delivery
 Exec=amber-dictation
 Icon=amber-dictation
 StartupWMClass=amber-dictation
-Categories=Office;Accessibility;
+Categories=Office;
 Terminal=false

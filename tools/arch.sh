@@ -53,7 +53,7 @@ if $prepare_only; then
 fi
 
 # Keep the staging directory and build log/cache available if makepkg fails.
-export PKGDEST="${PKGDEST:-$root/dist/arch}"
+export PKGDEST="${PKGDEST:-$root/target/arch}"
 mkdir -p "$PKGDEST"
 export SOURCE_DATE_EPOCH=$epoch
 (

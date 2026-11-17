@@ -8,8 +8,8 @@ arch=('x86_64')
 license=('LicenseRef-Amber-Proprietary')
 depends=('alsa-lib' 'dbus' 'glibc' 'libgcc' 'libstdc++' 'gtk3' 'webkit2gtk-4.1'
          'libappindicator' 'libx11' 'libxtst' 'bash' 'coreutils')
-makedepends=('rust' 'nodejs' 'npm' 'cmake' 'clang' 'pkgconf' 'desktop-file-utils')
-checkdepends=('python' 'xorg-server-xvfb' 'xorg-xauth' 'i3-wm' 'ttf-dejavu')
+makedepends=('cargo' 'nodejs' 'npm' 'cmake' 'clang' 'pkgconf' 'desktop-file-utils')
+checkdepends=('python' 'xorg-server-xvfb' 'xorg-xauth' 'xorg-xdpyinfo' 'i3-wm' 'ttf-dejavu')
 optdepends=('pipewire-alsa: route the default ALSA microphone through PipeWire'
             'pulseaudio-alsa: alternative ALSA routing through PulseAudio'
             'gnome-keyring: persistent encrypted credentials and history through Secret Service'

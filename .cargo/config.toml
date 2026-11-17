@@ -1,5 +1,7 @@
 # Native inference must not inherit the build machine's instruction set.
 # Release workflows may explicitly opt into a separately labelled CPU variant.
+# After changing these flags in an existing target directory, run
+# `cargo clean -p whisper-rs-sys`: its upstream build script does not track them.
 [env]
 GGML_NATIVE = "OFF"
 GGML_AVX = "OFF"

@@ -22,7 +22,7 @@ jobs:
         run: >-
           pacman -Syu --needed --noconfirm git rust nodejs npm cmake clang pkgconf
           desktop-file-utils alsa-lib dbus gtk3 webkit2gtk-4.1 libappindicator libx11 libxtst
-          python xorg-server-xvfb xorg-xauth i3-wm ttf-dejavu
+          python xorg-server-xvfb xorg-xauth xorg-xdpyinfo i3-wm ttf-dejavu
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -56,12 +56,13 @@ jobs:
           build-essential cmake pkg-config clang libclang-dev
           libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
           libayatana-appindicator3-dev librsvg2-dev libxdo-dev libxtst-dev
-          libssl-dev libdbus-1-dev rpm
+          libssl-dev libdbus-1-dev rpm xvfb i3-wm xauth x11-utils fonts-dejavu-core
       - run: npm ci
       - run: npm run build
       - run: npm run test:ui
       - run: python3 tools/test-arch.py
       - run: cargo test -p amber-core -p amber-inference -p amber-server -p amber-pc --locked
+      - run: python3 tools/test-x11.py
       - name: Build Linux packages
         run: npm run app:build -- --bundles deb,rpm
       - uses: actions/upload-artifact@v4

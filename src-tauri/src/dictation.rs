@@ -270,8 +270,31 @@ pub fn start(app: &AppHandle) {
     start_as(app, false);
 }
 
+#[cfg(target_os = "linux")]
+pub fn start_after_desktop_ready(app: &AppHandle) {
+    let session = app.state::<Core>().dictation.inner.lock().unwrap().session;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let ready = tokio::time::timeout(Duration::from_secs(10), async {
+            while crate::linux_desktop::initialization_pending() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await;
+        if ready.is_err() {
+            crate::notify(&app, "Amber", "Desktop checks are still pending. Use Record once the Recorder diagnostics are ready.");
+            return;
+        }
+        // Do not resurrect a launch-time request after cancellation or another dictation.
+        start_for_session(&app, false, Some(session));
+    });
+}
+
 /// A dictation - with [command] (the command hotkey) a terminal request wherever it goes.
 pub fn start_as(app: &AppHandle, command: bool) {
+    start_for_session(app, command, None);
+}
+
+fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u64>) {
     #[cfg(target_os = "linux")]
     if crate::linux_desktop::session_is_blocked() { return; }
     let core = app.state::<Core>();
@@ -282,6 +305,7 @@ pub fn start_as(app: &AppHandle, command: bool) {
     let settings = core.settings();
     let session = {
         let mut inner = core.dictation.inner.lock().unwrap();
+        if expected_session.is_some_and(|session| session != inner.session) { return; }
         if core.dictation.processing.load(Ordering::Acquire) || matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) {
             return;
         }
@@ -410,7 +434,13 @@ pub fn cancel(app: &AppHandle) {
     let recorder = {
         let mut inner = core.dictation.inner.lock().unwrap();
         inner.cancel_pending_paste();
+        if inner.phase == Phase::Inserting { return; }
         if !matches!(inner.phase, Phase::Recording | Phase::Transcribing) {
+            #[cfg(target_os = "linux")]
+            {
+                inner.cancel.cancel();
+                inner.session += 1;
+            }
             return;
         }
         inner.cancel.cancel();

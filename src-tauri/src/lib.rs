@@ -127,7 +127,7 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     updates::spawn(app);
     #[cfg(target_os = "linux")]
     if settings.onboarded && std::env::args().any(|a| a == "--toggle") {
-        dictation::toggle(app);
+        dictation::start_after_desktop_ready(app);
     }
     Ok(())
 }

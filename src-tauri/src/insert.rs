@@ -469,3 +469,18 @@ pub fn paste_explicit(text: &str, target: Target) -> Result<crate::linux_desktop
 pub fn press_enter(_target: Option<Target>) -> Result<(), String> {
     Err("Automatic Enter is disabled on Linux. Review and submit text manually.".into())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_delivery_and_enter_remain_disabled() {
+        assert!(!auto_insert_available());
+        for method in [amber_core::settings::InsertMethod::Paste, amber_core::settings::InsertMethod::Type] {
+            let settings = InsertSettings { method, ..InsertSettings::default() };
+            assert!(insert("Never deliver automatically", &settings, None).unwrap_err().contains("Automatic insertion is unavailable"));
+        }
+        assert!(press_enter(None).unwrap_err().contains("disabled on Linux"));
+    }
+}

@@ -11,12 +11,15 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 
 
 def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     for tool in ("cargo", "Xvfb", "xauth", "xdpyinfo", "i3", "i3-msg"):
         if shutil.which(tool) is None:
             raise RuntimeError(f"Required executable is missing: {tool}")
@@ -107,6 +110,13 @@ def main():
                         raise RuntimeError(f"Isolated i3 failed to start: {ilog.read()}")
                     time.sleep(0.05)
                 subprocess.run(["i3-msg", "-s", str(ipc), "-t", "get_version"], env=env, check=True, timeout=10)
+                guard = subprocess.run(
+                    [binaries[0], "linux_desktop::x11::tests::clipboard_targets_utf8_limits_and_replacement", "--ignored", "--exact"],
+                    env={key: value for key, value in env.items() if not key.startswith("AMBER_X11_TEST_")},
+                    cwd=repo, capture_output=True, text=True, timeout=10,
+                )
+                if guard.returncode == 0 or "Run python3 tools/test-x11.py" not in guard.stdout + guard.stderr:
+                    raise RuntimeError("Native test did not refuse an unguarded DISPLAY")
                 print(f"Native X11 tests on disposable {display}; no real desktop connection.", flush=True)
                 result = subprocess.run(
                     [binaries[0], "linux_desktop::x11::tests::", "--ignored", "--test-threads=1", "--nocapture"],

@@ -209,6 +209,10 @@ pub fn session_is_blocked() -> bool {
     })
 }
 
+pub fn initialization_pending() -> bool {
+    DESKTOP.get().is_some_and(|desktop| desktop.lifecycle.lock().unwrap().checking)
+}
+
 fn lifecycle_status(app: &AppHandle, lock: &str, sleep: &str) {
     let Some(desktop) = DESKTOP.get() else { return };
     let state = {
@@ -763,6 +767,33 @@ mod x11 {
         String::from_utf8(class.to_vec()).map_err(|e| e.to_string())
     }
 
+    fn paste_program(conn: &RustConnection, target: X11Target, text: &str) -> Result<String, String> {
+        let class = program(conn, target)?;
+        if !amber_core::insertion::allows_explicit_x11_paste(&class, text) {
+            return Err("This target or text requires review and manual paste. Explicit X11 paste only supports single-line text in known native editors, not terminals, browsers or unknown fields.".into());
+        }
+        let normal = atom(conn, "_NET_WM_WINDOW_TYPE_NORMAL")?;
+        let types = property(conn, target.window, "_NET_WM_WINDOW_TYPE", AtomEnum::ATOM)?;
+        if types.bytes_after != 0 || !types.value32().is_some_and(|mut t| t.next() == Some(normal) && t.next().is_none()) {
+            return Err("Dialogs and unknown window types require Copy/manual paste.".into());
+        }
+        // An editor can embed another X11 client, including a terminal. A known outer
+        // class must not override an observable non-editor class along the focus path.
+        let mut focus = target.focus;
+        for _ in 0..64 {
+            if focus == target.window {
+                return Ok(class);
+            }
+            if property(conn, focus, "WM_CLASS", AtomEnum::STRING)?.type_ != u32::from(AtomEnum::NONE)
+                && !amber_core::insertion::allows_explicit_x11_paste(&program(conn, X11Target { window: focus, ..target })?, text)
+            {
+                return Err("The focused child application requires Copy/manual paste.".into());
+            }
+            focus = conn.query_tree(focus).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.parent;
+        }
+        Err("Cannot establish X11 target ancestry".into())
+    }
+
     /// Explicitly requested delivery only. No foreground switching, automatic delivery,
     /// automatic retry, synthetic Enter, clipboard restoration, or root/input helper.
     pub fn paste_explicit(text: &str, target: X11Target) -> Result<Submission, String> {
@@ -773,15 +804,7 @@ mod x11 {
         if snapshot(&conn, target.root)? != target {
             return Err("The target window or input focus changed. Nothing was pasted.".into());
         }
-        let class = program(&conn, target)?;
-        if !amber_core::insertion::allows_explicit_x11_paste(&class, text) {
-            return Err("This target or text requires review and manual paste. Explicit X11 paste only supports single-line text in known native editors, not terminals, browsers or unknown fields.".into());
-        }
-        let normal = atom(&conn, "_NET_WM_WINDOW_TYPE_NORMAL")?;
-        let types = property(&conn, target.window, "_NET_WM_WINDOW_TYPE", AtomEnum::ATOM)?;
-        if !types.value32().is_some_and(|mut t| t.next() == Some(normal) && t.next().is_none()) {
-            return Err("Dialogs and unknown window types require Copy/manual paste.".into());
-        }
+        let class = paste_program(&conn, target, text)?;
         conn.xtest_get_version(2, 2).map_err(|e| e.to_string())?.reply().map_err(|e| format!("XTest unavailable: {e}"))?;
         let setup = conn.setup();
         let mapping = conn
@@ -804,8 +827,9 @@ mod x11 {
         let shift = keycode(0xffe1).ok_or("No unambiguous Shift key; use manual paste")?;
         let insert = keycode(0xff63).ok_or("No layout-independent Insert key; use manual paste")?;
         let modifiers = conn.get_modifier_mapping().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
-        if !modifiers.keycodes[..modifiers.keycodes.len() / 8].contains(&shift) {
-            return Err("Nonstandard Shift modifier mapping; use manual paste".into());
+        let per_modifier = modifiers.keycodes.len() / 8;
+        if !modifiers.keycodes[..per_modifier].contains(&shift) || modifiers.keycodes[per_modifier..].contains(&shift) || modifiers.keycodes.contains(&insert) {
+            return Err("Nonstandard paste modifier mapping; use manual paste".into());
         }
         if conn.query_keymap().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.keys.iter().any(|&k| k != 0) {
             return Err("Release all keys before explicit paste. Nothing was pasted.".into());
@@ -824,8 +848,20 @@ mod x11 {
             if snapshot(&conn, target.root)? != target {
                 return Err("The target changed. The result is on the clipboard, but no paste was sent.".into());
             }
-            if program(&conn, target)? != class || property(&conn, target.window, "_NET_WM_WINDOW_TYPE", AtomEnum::ATOM)?.value != types.value {
+            if paste_program(&conn, target, text)? != class {
                 return Err("The target application or window type changed. No paste was sent.".into());
+            }
+            let current = conn
+                .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
+                .map_err(|e| e.to_string())?
+                .reply()
+                .map_err(|e| e.to_string())?;
+            let current_modifiers = conn.get_modifier_mapping().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
+            if current.keysyms_per_keycode != mapping.keysyms_per_keycode
+                || current.keysyms != mapping.keysyms
+                || current_modifiers.keycodes != modifiers.keycodes
+            {
+                return Err("The keyboard mapping changed. The result is on the clipboard, but no paste was sent.".into());
             }
             if conn.get_selection_owner(selection).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.owner != owner {
                 return Err("The clipboard changed. No paste was sent and the newer clipboard was not overwritten.".into());
@@ -943,7 +979,7 @@ mod x11 {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
         use std::time::Instant;
-        use x11rb::protocol::xproto::{GetPropertyReply, InputFocus, KeyButMask};
+        use x11rb::protocol::xproto::{GetPropertyReply, InputFocus, KeyButMask, MappingStatus};
 
         // Validate the harness before even connecting. An ignored test plus DISPLAY alone
         // must never be enough to send input or replace someone's desktop clipboard.
@@ -964,9 +1000,10 @@ mod x11 {
             let socket = std::os::unix::net::UnixStream::connect(format!("/tmp/.X11-unix/X{number}")).unwrap();
             let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
             let mut size = std::mem::size_of_val(&credentials) as libc::socklen_t;
-            assert_eq!(unsafe {
-                libc::getsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut credentials as *mut libc::ucred).cast(), &mut size)
-            }, 0);
+            assert_eq!(
+                unsafe { libc::getsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut credentials as *mut libc::ucred).cast(), &mut size) },
+                0
+            );
             assert_eq!(credentials.pid as u32, pid);
             drop(socket);
             let executable = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
@@ -997,10 +1034,21 @@ mod x11 {
         fn create(conn: &RustConnection, parent: u32) -> u32 {
             let window = conn.generate_id().unwrap();
             conn.create_window(
-                x11rb::COPY_DEPTH_FROM_PARENT, window, parent, 0, 0, 320, 200, 0,
-                WindowClass::INPUT_OUTPUT, 0,
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                parent,
+                0,
+                0,
+                320,
+                200,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
                 &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
-            ).unwrap().check().unwrap();
+            )
+            .unwrap()
+            .check()
+            .unwrap();
             window
         }
 
@@ -1015,9 +1063,20 @@ mod x11 {
             // Deliberately distinct from the test process, just as an external client is.
             let pid: u32 = std::env::var("AMBER_X11_TEST_SERVER_PID").unwrap().parse().unwrap();
             conn.change_property32(PropMode::REPLACE, window, atom(conn, "_NET_WM_PID").unwrap(), AtomEnum::CARDINAL, &[pid]).unwrap().check().unwrap();
-            conn.change_property32(PropMode::REPLACE, window, atom(conn, "_NET_WM_WINDOW_TYPE").unwrap(), AtomEnum::ATOM,
-                &[atom(conn, "_NET_WM_WINDOW_TYPE_NORMAL").unwrap()]).unwrap().check().unwrap();
-            conn.change_property8(PropMode::REPLACE, window, atom(conn, "_NET_WM_NAME").unwrap(), atom(conn, "UTF8_STRING").unwrap(), b"Amber isolated editor").unwrap().check().unwrap();
+            conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                atom(conn, "_NET_WM_WINDOW_TYPE").unwrap(),
+                AtomEnum::ATOM,
+                &[atom(conn, "_NET_WM_WINDOW_TYPE_NORMAL").unwrap()],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+            conn.change_property8(PropMode::REPLACE, window, atom(conn, "_NET_WM_NAME").unwrap(), atom(conn, "UTF8_STRING").unwrap(), b"Amber isolated editor")
+                .unwrap()
+                .check()
+                .unwrap();
             conn.map_window(window).unwrap().check().unwrap();
             until(|| snapshot(conn, root).is_ok_and(|target| target.window == window));
             snapshot(conn, root).unwrap()
@@ -1082,11 +1141,14 @@ mod x11 {
             conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             let leaf = snapshot(&conn, root).unwrap();
             assert_eq!((leaf.window, leaf.focus), (second.window, child));
+            assert_eq!(remember_target(), Some(leaf));
             assert!(paste_explicit("stale focus", second).unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, second.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(paste_explicit("stale leaf", leaf).unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(snapshot(&conn, root).is_err(), "Unrelated active window and focus must fail closed");
+            conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+            assert!(remember_target().is_none());
             conn.destroy_window(second.window).unwrap().check().unwrap();
             conn.destroy_window(target.window).unwrap().check().unwrap();
             assert!(paste_explicit("destroyed", leaf).is_err());
@@ -1136,23 +1198,64 @@ mod x11 {
             let target = editor(&conn, root);
             let clipboard = atom(&conn, "CLIPBOARD").unwrap();
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            for value in [b"Mousepad\0XTerm\0".as_slice(), b"test\0firefox\0", b"test\0unknown\0"] {
+            for value in [b"Mousepad\0XTerm\0".as_slice(), b"test\0firefox\0", b"test\0unknown\0", b"test\0Mousepad", b"test\0Mousepad\0extra"] {
                 class(&conn, target.window, value);
                 assert!(paste_explicit("not a terminal command", target).is_err());
             }
             class(&conn, target.window, b"test\0Mousepad\0");
+            for pid in [0, std::process::id(), target.pid + 1] {
+                conn.change_property32(PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_PID").unwrap(), AtomEnum::CARDINAL, &[pid])
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                assert!(paste_explicit("unknown, own or stale process", target).is_err());
+            }
+            conn.change_property32(PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_PID").unwrap(), AtomEnum::CARDINAL, &[target.pid])
+                .unwrap()
+                .check()
+                .unwrap();
             for text in ["", "line\nline", "line\rline", "line\u{2028}line", "line\u{2029}line", "\u{1b}[31m"] {
                 assert!(paste_explicit(text, target).is_err(), "Should reject {text:?}");
             }
-            conn.change_property32(PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap(), AtomEnum::ATOM,
-                &[atom(&conn, "_NET_WM_WINDOW_TYPE_DIALOG").unwrap()]).unwrap().check().unwrap();
+            conn.change_property32(
+                PropMode::REPLACE,
+                target.window,
+                atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap(),
+                AtomEnum::ATOM,
+                &[atom(&conn, "_NET_WM_WINDOW_TYPE_DIALOG").unwrap()],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
             assert!(paste_explicit("dialog", target).is_err());
-            conn.change_property32(PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap(), AtomEnum::ATOM,
-                &[atom(&conn, "_NET_WM_WINDOW_TYPE_NORMAL").unwrap()]).unwrap().check().unwrap();
+            conn.change_property32(
+                PropMode::REPLACE,
+                target.window,
+                atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap(),
+                AtomEnum::ATOM,
+                &[atom(&conn, "_NET_WM_WINDOW_TYPE_NORMAL").unwrap()],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+            let child = create(&conn, target.window);
+            class(&conn, child, b"test\0XTerm\0");
+            conn.map_window(child).unwrap().check().unwrap();
+            conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+            assert!(paste_explicit("embedded terminal", snapshot(&conn, root).unwrap()).unwrap_err().contains("child application"));
+            conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             assert!(key_events(&conn).is_empty());
             let shift = keycode(&conn, 0xffe1);
             let caps = keycode(&conn, 0xffe5);
+            let insert = keycode(&conn, 0xff63);
+            let modifiers = conn.get_modifier_mapping().unwrap().reply().unwrap().keycodes;
+            let mut changed = modifiers.clone();
+            let unused = changed.iter().rposition(|&code| code == 0).unwrap();
+            changed[unused] = insert;
+            assert_eq!(conn.set_modifier_mapping(&changed).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
+            assert!(paste_explicit("Insert mapped as a modifier", target).unwrap_err().contains("modifier mapping"));
+            assert_eq!(conn.set_modifier_mapping(&modifiers).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
             key(&conn, root, shift, true);
             assert!(paste_explicit("held key", target).unwrap_err().contains("Release all keys"));
             assert_ne!(conn.query_keymap().unwrap().reply().unwrap().keys[shift as usize / 8] & (1 << (shift % 8)), 0, "Never release a user's held key");
@@ -1166,13 +1269,15 @@ mod x11 {
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             let result = paste_explicit("Explicit native paste", target).unwrap();
             assert!(result.submitted && !result.confirmed);
-            let insert = keycode(&conn, 0xff63);
-            assert_eq!(key_events(&conn), [
-                (KEY_PRESS_EVENT, shift, target.focus, 0),
-                (KEY_PRESS_EVENT, insert, target.focus, KeyButMask::SHIFT.into()),
-                (KEY_RELEASE_EVENT, insert, target.focus, KeyButMask::SHIFT.into()),
-                (KEY_RELEASE_EVENT, shift, target.focus, KeyButMask::SHIFT.into()),
-            ]);
+            assert_eq!(
+                key_events(&conn),
+                [
+                    (KEY_PRESS_EVENT, shift, target.focus, 0),
+                    (KEY_PRESS_EVENT, insert, target.focus, KeyButMask::SHIFT.into()),
+                    (KEY_RELEASE_EVENT, insert, target.focus, KeyButMask::SHIFT.into()),
+                    (KEY_RELEASE_EVENT, shift, target.focus, KeyButMask::SHIFT.into()),
+                ]
+            );
             assert!(conn.query_keymap().unwrap().reply().unwrap().keys.iter().all(|&k| k == 0));
             let utf8 = atom(&conn, "UTF8_STRING").unwrap();
             assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"Explicit native paste");

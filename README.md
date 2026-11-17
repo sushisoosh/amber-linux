@@ -2,7 +2,7 @@
 
 ## Linux Desktop Preview
 
-This worktree also contains a Linux desktop port targeting GNOME and KDE. It is a
+This worktree also contains a Linux desktop port targeting Arch/i3, GNOME and KDE. It is a
 preview until the real-desktop integration matrix has passed, not a claim of
 Windows feature parity. Upstream source, artwork, and redistribution remain subject
 to the repository license and the author's written permission.
@@ -11,11 +11,11 @@ to the repository license and the author's written permission.
   OpenAI-compatible recognition and optional local/server cleanup are supported.
 - The Linux Recorder page keeps results in memory for review and explicit Copy.
   Recognition completion never silently replaces the clipboard or pastes into an
-  unknown field. On X11, `amber --insert-last` can submit a single-line result to a
+  unknown field. On X11, `amber-dictation --insert-last` can submit a single-line result to a
   supported native editor; it is an explicit, unverified paste, not automatic typing.
 - Wayland shortcuts use the desktop portal when available. GNOME 48+ and KDE Plasma
   6 are the primary targets. On older/missing portal backends, configure a desktop
-  shortcut for `amber --toggle`; `amber --cancel` stops/cancels a dictation. That
+  shortcut for `amber-dictation --toggle`; `amber-dictation --cancel` stops/cancels a dictation. That
   fallback is toggle-only. Clipboard access is an explicit foreground action.
 - Credentials and optional history use authenticated encryption with a key in Secret
   Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
@@ -25,7 +25,100 @@ to the repository license and the author's written permission.
   per-app profiles, the Windows updater, and the Windows floating bubble are disabled
   in the Linux desktop. Updates are installed from Linux packages.
 
-Build on Ubuntu 24.04 with Rust (see the workspace MSRV), Node.js 22, and:
+### Arch/i3
+
+Build a native package from this checkout, after transferring the port through your
+own repository. The helper includes current uncommitted source files; it does **not**
+clone the unported upstream repository or require a hardcoded fork URL.
+
+```bash
+sudo pacman -Syu --needed base-devel nodejs npm
+bash tools/arch.sh --install
+amber-dictation
+```
+
+`makepkg` runs as your regular user and asks pacman for missing build/test dependencies.
+An existing rustup installation can provide Cargo; use a current stable toolchain
+(the locked desktop dependencies require Rust 1.90 or newer). Build concurrency
+defaults to two jobs; set `CARGO_BUILD_JOBS` to override it. Packages are kept in
+`target/arch`, and the helper prints its staging directory so a failed build can be
+inspected. The installed command is **`amber-dictation`**, not `amber`, to avoid
+colliding with unrelated Arch/AUR programs.
+
+The source snapshot uses a fresh native build directory. If changing the `GGML_*`
+CPU flags in an existing checkout, first run `cargo clean -p whisper-rs-sys`:
+the upstream build script does not track those environment changes reliably.
+
+To prepare sources on a non-Arch machine instead:
+
+```bash
+bash tools/arch.sh --prepare-only /tmp/amber-arch-source
+```
+
+Transfer that directory to Arch, then run `makepkg --syncdeps --check --install`
+inside it as a regular user. Its generated PKGBUILD pins the archive SHA-256.
+Repository metadata, build outputs, dependency trees and common signing-secret
+files are excluded. Runtime/model redistribution and public publishing still need
+the appropriate permissions; no AUR upload or release publication is automated.
+
+First run: select a microphone, download a speech model, and test the Recorder page.
+CPAL uses ALSA: for a PipeWire desktop, install `pipewire-alsa` if the default input
+is missing. For a PulseAudio desktop, the alternative is `pulseaudio-alsa`. Do not
+replace a working audio stack or install both routes blindly. Persistent encrypted
+credentials/history need an unlocked Secret Service implementation such as GNOME
+Keyring; local recognition and session-only credentials work without one. Bare i3
+does not automatically unlock a keyring.
+
+Optional i3 config entries, using unused keys of your choice:
+
+```i3
+exec --no-startup-id amber-dictation --autostart
+bindsym $mod+F9 exec --no-startup-id amber-dictation --toggle
+bindsym $mod+F10 exec --no-startup-id amber-dictation --cancel
+bindsym $mod+F11 exec --no-startup-id amber-dictation --insert-last
+```
+
+Amber's own X11 shortcut is `Ctrl+Alt+Space` by default. Do not register the same
+combination in both Amber and i3. Bare i3 does not process XDG autostart files:
+use the explicit `exec` line above **or** an XDG launcher such as `dex`, not both.
+A tray host and a notification daemon are optional; the Recorder window and its
+Quit button must remain usable without them. Explicit paste is intentionally
+restricted to supported native editors and single-line text; terminals, browsers
+and other unverified targets use Copy and manual paste.
+
+For locking, install `i3lock` and optionally `xss-lock`. Direct `i3lock` does not
+reliably announce a login1 lock. The packaged wrapper requests Amber cancellation
+(including the microphone test) before running the locker, without preventing
+locking when Amber is absent/unresponsive:
+
+```i3
+bindsym $mod+Shift+l exec --no-startup-id amber-i3-lock --nofork
+exec --no-startup-id xss-lock --transfer-sleep-lock -- amber-i3-lock --nofork
+```
+
+Do not add a second locker alongside an existing one; adapt the existing binding.
+Cancellation is a best-effort request, not proof that an unresponsive process
+released its microphone. Suspend/session monitoring and its availability are shown
+in Recorder diagnostics. Actual audio, keyring, lock and resume behavior still
+require a check on the destination desktop.
+
+Reproducible checks (X11 tests create a disposable authenticated Xvfb/i3 session,
+never use the current desktop):
+
+```bash
+npm run test:ui
+python tools/test-arch.py
+python tools/test-x11.py
+cargo test --workspace --locked
+```
+
+The X11 integration tests use fake client windows to validate focus, clipboard
+transfers and input events. They do not prove text landed in a real editor, identify
+all terminal/password fields, or replace a microphone test on the destination PC.
+
+### Ubuntu Build
+
+Build on Ubuntu 24.04 with current stable Rust, Node.js 22, and:
 
 ```bash
 sudo apt-get install build-essential cmake pkg-config clang libclang-dev \
