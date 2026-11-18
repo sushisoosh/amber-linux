@@ -1,6 +1,6 @@
 //! The smart cleanup: a chat model tidies a dictation - punctuation, false starts, and
 //! self-corrections ("um drei, nee stopp, um vier" -> "um vier"). One OpenAI-style client for
-//! the local llama.cpp server and for Groq, OpenAI or an own server. The prompt and the
+//! the local llama.cpp server and OpenAI-compatible providers. The prompt and the
 //! safety rules come from Amber for Android.
 //!
 //! Any failure keeps the dictation as recognized: a cleanup must never lose text.
@@ -589,6 +589,30 @@ mod tests {
         c.forward(&json!({ "messages": [{ "role": "user", "content": "x" }] })).unwrap();
         let body: Value = serde_json::from_slice(&rx.recv().unwrap().body).unwrap();
         assert_eq!(body["max_tokens"], 2_048);
+    }
+
+    #[test]
+    fn tinfoil_cleanup_models_use_their_own_thinking_controls() {
+        for model in crate::providers::TINFOIL.chat_models {
+            let (url, rx) = serve(vec![reply("Hello world.", "stop")]);
+            let extra = model.extra.map(|value| serde_json::from_str(value).unwrap());
+            let cleaner = ChatCleaner::new(&format!("{url}/v1/"), "tinfoil-test-key", model.id, extra);
+            assert_eq!(cleaner.clean("hello world", &Ask::default()).unwrap(), "Hello world.");
+            let req = rx.recv().unwrap();
+            assert!(req.head.starts_with("POST /v1/chat/completions "));
+            assert!(req.head.to_lowercase().contains("authorization: bearer tinfoil-test-key\r\n"));
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["model"], model.id);
+            assert_eq!(body["temperature"], 0);
+            assert_ne!(body["stream"], true, "the desktop parses JSON, not SSE");
+            let thinking = &body["chat_template_kwargs"];
+            match model.id {
+                "deepseek-v4-1-flash" => assert_eq!(thinking, &json!({"thinking": false})),
+                "gemma4-31b" => assert_eq!(thinking, &json!({"enable_thinking": false})),
+                _ => assert!(thinking.is_null()),
+            }
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]

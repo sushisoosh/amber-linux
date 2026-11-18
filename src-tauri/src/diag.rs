@@ -2,6 +2,7 @@
 //! a small file next to the app data for when something went wrong yesterday.
 
 use std::collections::VecDeque;
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -26,6 +27,24 @@ struct Log {
 
 static LOG: OnceLock<Mutex<Log>> = OnceLock::new();
 
+thread_local! {
+    static ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+pub fn enabled() -> bool { ENABLED.get() }
+
+/// Scope-bound and thread-local: Testing must not mute unrelated production diagnostics.
+/// The marker prevents moving the guard to a thread whose logging it did not change.
+pub struct Silence(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+
+pub fn silence() -> Silence {
+    Silence(ENABLED.replace(false), std::marker::PhantomData)
+}
+
+impl Drop for Silence {
+    fn drop(&mut self) { ENABLED.set(self.0); }
+}
+
 fn log() -> &'static Mutex<Log> {
     LOG.get_or_init(|| Mutex::new(Log { entries: VecDeque::new(), file: None }))
 }
@@ -42,6 +61,7 @@ pub fn init(dir: &Path) {
 }
 
 fn push(level: &'static str, message: String) {
+    if !enabled() { return; }
     let entry = Entry { time: now(), level, message };
     let mut log = log().lock().unwrap();
     if let Some(f) = log.file.as_mut() {
@@ -81,4 +101,42 @@ fn now() -> String {
 fn now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{:02}:{:02}:{:02} UTC", secs / 3600 % 24, secs / 60 % 60, secs % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_suppression_is_nested_thread_local_and_unwind_safe() {
+        const PRIVATE: &str = "testing-private-diagnostic-marker";
+        const PRIVATE_WORKER: &str = "testing-private-worker-marker";
+        const OTHER: &str = "testing-unrelated-production-marker";
+        const AFTER: &str = "testing-restored-production-marker";
+        assert!(enabled());
+        let _ = std::panic::catch_unwind(|| {
+            let _quiet = silence();
+            info(PRIVATE);
+            {
+                let _nested = silence();
+                warn(PRIVATE);
+            }
+            assert!(!enabled());
+            let log = enabled();
+            std::thread::spawn(move || {
+                let _quiet = (!log).then(silence);
+                assert!(!enabled());
+                info(PRIVATE_WORKER);
+            }).join().unwrap();
+            std::thread::spawn(|| { assert!(enabled()); info(OTHER); }).join().unwrap();
+            panic!("exercise guard unwinding");
+        });
+        assert!(enabled());
+        info(AFTER);
+        let entries = entries();
+        assert!(!entries.iter().any(|e| e.message == PRIVATE));
+        assert!(!entries.iter().any(|e| e.message == PRIVATE_WORKER));
+        assert!(entries.iter().any(|e| e.message == OTHER));
+        assert!(entries.iter().any(|e| e.message == AFTER));
+    }
 }

@@ -83,13 +83,13 @@ pub fn init(app: &AppHandle) {
         session: session.into(),
         shortcuts: "Not registered.".into(),
         insertion: if session == "x11" {
-            "Automatic insertion is disabled: editable-field identity is unavailable. Explicit XTest paste is restricted to supported native text editors; all other targets require Copy/manual paste. Submission is not confirmation."
+            "Opted-in completion copies the result even if the original target is missing or changed. Ctrl+V and explicit XTest paste support single-line text in known native editors only, with unchanged window and focus. Other targets require manual paste; insertion cannot be confirmed."
         } else {
-            "Copy/manual paste only. Wayland target identity and permission-based RemoteDesktop/Clipboard insertion are not implemented; no automatic paste is attempted."
+            "Manual paste only. Copy on completion requires Amber to be focused on Wayland; otherwise open the result and use Copy. Target identity and permission-based RemoteDesktop/Clipboard insertion are not implemented; no automatic paste is attempted."
         }.into(),
         lifecycle: "Checking current-session lock and suspend monitoring; recording is temporarily blocked.".into(),
         clipboard: if display.is_some() {
-            "Explicit Copy replaces the clipboard. Previous text, images and files are not restored; clipboard managers may retain copied text. Keep Amber running until paste completes."
+            "Copy or opted-in completion replaces the clipboard, even when automatic paste is unavailable. Previous text, images and files are not restored; clipboard managers may retain copied text. Keep Amber running until paste completes."
         } else {
             "Unavailable: no GTK desktop display."
         }.into(),
@@ -613,8 +613,13 @@ fn new_shortcut(id: &str, description: &str, accelerator: &str) -> NewShortcut {
 /// GTK retains the selection data while Amber runs and transfers it on request, on both
 /// native Wayland and X11. Do not snapshot/restore: that would destroy newer user copies.
 pub fn to_clipboard(text: &str) -> Result<(), String> {
-    let desktop = DESKTOP.get().ok_or("Linux clipboard is not initialized")?;
-    let copy = |text: String| -> Result<(), String> {
+    to_clipboard_guarded(text, || true)
+}
+
+fn to_clipboard_guarded(text: &str, allowed: impl Fn() -> bool + Send + 'static) -> Result<(), String> {
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_cancelled = cancelled.clone();
+    let copy = move |text: String| -> Result<(), String> {
         let display = gtk::gdk::Display::default().ok_or("No desktop clipboard display")?;
         if display.is_closed() {
             return Err("The desktop display has closed".into());
@@ -626,6 +631,10 @@ pub fn to_clipboard(text: &str) -> Result<(), String> {
         }
         let clipboard = gtk::Clipboard::default(&display).ok_or("No desktop clipboard")?;
         let targets = ["UTF8_STRING", "text/plain;charset=utf-8", "text/plain", "TEXT"].map(|name| gtk::TargetEntry::new(name, gtk::TargetFlags::empty(), 0));
+        // Recheck on the GUI thread, not merely before queuing work behind a busy UI.
+        if task_cancelled.load(std::sync::atomic::Ordering::SeqCst) || !allowed() {
+            return Err("Clipboard publication cancelled or consent revoked. The result is still available for review.".into());
+        }
         if !clipboard.set_with_data(&targets, move |_, selection, _| {
             selection.set_text(&text);
         }) {
@@ -637,16 +646,12 @@ pub fn to_clipboard(text: &str) -> Result<(), String> {
     if gtk::is_initialized_main_thread() {
         return copy(text.to_owned());
     }
+    let desktop = DESKTOP.get().ok_or("Linux clipboard is not initialized")?;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let task_cancelled = cancelled.clone();
     let text = text.to_owned();
     desktop
         .app
         .run_on_main_thread(move || {
-            if task_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
             let _ = tx.send(copy(text));
         })
         .map_err(|e| e.to_string())?;
@@ -655,6 +660,43 @@ pub fn to_clipboard(text: &str) -> Result<(), String> {
         Err(_) => {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
             Err("Clipboard response timed out; check the clipboard before retrying.".into())
+        }
+    }
+}
+
+fn completion_allowed(cancel: &amber_core::engine::CancellationToken) -> bool {
+    !cancel.is_cancelled()
+        && !session_is_blocked()
+        && DESKTOP.get().is_none_or(|d| amber_core::insertion::paste_on_completion(&d.app.state::<Core>().settings().insert, true, false))
+}
+
+pub fn deliver(text: &str, target: Option<X11Target>, cancel: &amber_core::engine::CancellationToken) -> Result<crate::insert::Outcome, String> {
+    let allowed = || completion_allowed(cancel);
+    if !allowed() {
+        return Err("Delivery cancelled, consent revoked, or session blocked. The result is still available for review.".into());
+    }
+    // The bounded X11 owner can be verified immediately before XTest. Large selections use
+    // GTK's incremental transfer, just like Copy, but are never injected automatically.
+    let owner = if use_x11_shortcuts() && text.len() <= 64 * 1024 {
+        Some(x11::own_clipboard_guarded(text, &allowed)?)
+    } else {
+        let cancel = cancel.clone();
+        to_clipboard_guarded(text, move || completion_allowed(&cancel))?;
+        None
+    };
+    let Some((target, owner)) = target.zip(owner) else {
+        return Ok(crate::insert::Outcome::OnClipboard(
+            "The text is on the clipboard. Automatic paste is unavailable for this result or target; paste manually where you want it.".into(),
+        ));
+    };
+    match x11::paste_copied(text, target, Some(owner), &allowed) {
+        Ok(_) => Ok(crate::insert::Outcome::Pasted),
+        Err(error) => {
+            // Never retry copying after an uncertain paste or overwrite a newer user copy.
+            if !allowed() || !x11::owns_clipboard(owner)? {
+                return Err(format!("{error} Delivery stopped; the clipboard may have changed. Review the result and destination before using Copy."));
+            }
+            Ok(crate::insert::Outcome::OnClipboard(format!("{error} The text is on the clipboard. Check the destination, then paste manually if needed.")))
         }
     }
 }
@@ -770,7 +812,7 @@ mod x11 {
     fn paste_program(conn: &RustConnection, target: X11Target, text: &str) -> Result<String, String> {
         let class = program(conn, target)?;
         if !amber_core::insertion::allows_explicit_x11_paste(&class, text) {
-            return Err("This target or text requires review and manual paste. Explicit X11 paste only supports single-line text in known native editors, not terminals, browsers or unknown fields.".into());
+            return Err("This target or text requires review and manual paste. X11 paste only supports single-line text in known native editors, not terminals, browsers or unknown fields.".into());
         }
         let normal = atom(conn, "_NET_WM_WINDOW_TYPE_NORMAL")?;
         let types = property(conn, target.window, "_NET_WM_WINDOW_TYPE", AtomEnum::ATOM)?;
@@ -794,10 +836,14 @@ mod x11 {
         Err("Cannot establish X11 target ancestry".into())
     }
 
-    /// Explicitly requested delivery only. No foreground switching, automatic delivery,
-    /// automatic retry, synthetic Enter, clipboard restoration, or root/input helper.
+    /// Explicitly requested or opted-in delivery only. No foreground switching, automatic
+    /// retry, synthetic Enter, clipboard restoration, or root/input helper.
     pub fn paste_explicit(text: &str, target: X11Target) -> Result<Submission, String> {
-        if session_is_blocked() {
+        paste_copied(text, target, None, &|| true)
+    }
+
+    pub(super) fn paste_copied(text: &str, target: X11Target, clipboard: Option<(u32, u32)>, allowed: &dyn Fn() -> bool) -> Result<Submission, String> {
+        if session_is_blocked() || !allowed() {
             return Err("Paste blocked while the session is locked, suspended, or being checked.".into());
         }
         let (conn, _) = connect()?;
@@ -816,33 +862,24 @@ mod x11 {
         if width == 0 {
             return Err("The keyboard mapping is unavailable".into());
         }
-        // Shift+Insert avoids assuming that the current keyboard layout maps a key to V.
-        let keycode = |symbol| {
-            mapping
-                .keysyms
-                .chunks(width)
-                .position(|row| row.contains(&symbol) && row.iter().all(|&s| s == 0 || s == symbol))
-                .map(|i| setup.min_keycode + i as u8)
-        };
-        let shift = keycode(0xffe1).ok_or("No unambiguous Shift key; use manual paste")?;
-        let insert = keycode(0xff63).ok_or("No layout-independent Insert key; use manual paste")?;
         let modifiers = conn.get_modifier_mapping().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
-        let per_modifier = modifiers.keycodes.len() / 8;
-        if !modifiers.keycodes[..per_modifier].contains(&shift) || modifiers.keycodes[per_modifier..].contains(&shift) || modifiers.keycodes.contains(&insert) {
-            return Err("Nonstandard paste modifier mapping; use manual paste".into());
-        }
+        let (control, v) = amber_core::insertion::ctrl_v_keycodes(setup.min_keycode, width, &mapping.keysyms, &modifiers.keycodes)
+            .ok_or("No unambiguous Ctrl+V keyboard/modifier mapping; use manual paste")?;
         if conn.query_keymap().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.keys.iter().any(|&k| k != 0) {
             return Err("Release all keys before explicit paste. Nothing was pasted.".into());
         }
         if u16::from(conn.query_pointer(target.root).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.mask) & 0xff != 0 {
             return Err("Active or locked keyboard modifiers require manual paste. Nothing was pasted.".into());
         }
-        let (owner, selection) = own_clipboard(text)?;
+        let (owner, selection) = match clipboard {
+            Some(owner) => owner,
+            None => own_clipboard_guarded(text, allowed)?,
+        };
         // Freeze other clients only for the final target/ownership checks and four events.
         // No sleeps or clipboard transfer while grabbed. The server releases on disconnect.
         conn.grab_server().map_err(|e| e.to_string())?.check().map_err(|e| e.to_string())?;
         let result = (|| {
-            if session_is_blocked() {
+            if session_is_blocked() || !allowed() {
                 return Err("The session became blocked. No paste was sent.".into());
             }
             if snapshot(&conn, target.root)? != target {
@@ -872,8 +909,11 @@ mod x11 {
             if u16::from(conn.query_pointer(target.root).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.mask) & 0xff != 0 {
                 return Err("Keyboard modifiers changed. The result is on the clipboard, but no paste was sent.".into());
             }
+            if session_is_blocked() || !allowed() {
+                return Err("Delivery cancelled or consent revoked. No paste was sent.".into());
+            }
             let mut failure = None;
-            for (event, key) in [(KEY_PRESS_EVENT, shift), (KEY_PRESS_EVENT, insert), (KEY_RELEASE_EVENT, insert), (KEY_RELEASE_EVENT, shift)] {
+            for (event, key) in [(KEY_PRESS_EVENT, control), (KEY_PRESS_EVENT, v), (KEY_RELEASE_EVENT, v), (KEY_RELEASE_EVENT, control)] {
                 // Always attempt the releases, including after a partial submission failure.
                 if failure.is_some() && event == KEY_PRESS_EVENT {
                     continue;
@@ -900,7 +940,7 @@ mod x11 {
 
     /// Own a bounded UTF-8 selection until replaced. A dedicated X11 connection gives us an
     /// exact owner ID for the final race check; no clipboard manager or helper is required.
-    fn own_clipboard(text: &str) -> Result<(u32, u32), String> {
+    pub(super) fn own_clipboard_guarded(text: &str, allowed: &dyn Fn() -> bool) -> Result<(u32, u32), String> {
         if text.len() > 64 * 1024 {
             return Err("Text is too large for explicit X11 paste. Use Copy/manual paste.".into());
         }
@@ -916,6 +956,9 @@ mod x11 {
         let utf8 = atom(&conn, "UTF8_STRING")?;
         let plain = atom(&conn, "text/plain;charset=utf-8")?;
         let text_atom = atom(&conn, "TEXT")?;
+        if session_is_blocked() || !allowed() {
+            return Err("Clipboard publication cancelled, consent revoked, or session blocked.".into());
+        }
         conn.set_selection_owner(window, selection, x11rb::CURRENT_TIME).map_err(|e| e.to_string())?.check().map_err(|e| e.to_string())?;
         if conn.get_selection_owner(selection).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.owner != window {
             return Err("The clipboard changed before ownership could be established; nothing was pasted.".into());
@@ -973,6 +1016,12 @@ mod x11 {
         Ok((window, selection))
     }
 
+    pub(super) fn owns_clipboard((owner, selection): (u32, u32)) -> Result<bool, String> {
+        let (conn, _) = connect()?;
+        let current = conn.get_selection_owner(selection).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.owner;
+        Ok(current == owner)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -980,6 +1029,10 @@ mod x11 {
         use std::os::unix::fs::MetadataExt;
         use std::time::Instant;
         use x11rb::protocol::xproto::{GetPropertyReply, InputFocus, KeyButMask, MappingStatus};
+
+        fn own_clipboard(text: &str) -> Result<(u32, u32), String> {
+            own_clipboard_guarded(text, &|| true)
+        }
 
         // Validate the harness before even connecting. An ignored test plus DISPLAY alone
         // must never be enough to send input or replace someone's desktop clipboard.
@@ -1087,6 +1140,9 @@ mod x11 {
             conn.convert_selection(requestor, clipboard, target, property, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             let mut notify = None;
             until(|| {
+                if gtk::is_initialized_main_thread() {
+                    while gtk::events_pending() { gtk::main_iteration(); }
+                }
                 while let Some(event) = conn.poll_for_event().unwrap() {
                     if let Event::SelectionNotify(event) = event {
                         assert_eq!((event.requestor, event.target, event.selection), (requestor, target, clipboard));
@@ -1123,6 +1179,63 @@ mod x11 {
             conn.xtest_fake_input(if down { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT }, code, 0, root, 0, 0, 0).unwrap().check().unwrap();
         }
 
+        // Query the server's actual bounding/input shapes without enabling another runtime
+        // protocol dependency. These APIs are only called after isolated() verifies Xvfb.
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug)]
+        struct ShapeRect { x: i16, y: i16, width: u16, height: u16 }
+
+        fn shape_rectangles(window: &gtk::gdk::Window, kind: i32) -> Vec<ShapeRect> {
+            use gtk::glib::translate::ToGlibPtr;
+            use std::ffi::{c_int, c_ulong, c_void};
+            #[link(name = "gdk-3")]
+            extern "C" {
+                fn gdk_x11_window_get_xid(window: *mut gtk::gdk::ffi::GdkWindow) -> c_ulong;
+                fn gdk_x11_display_get_xdisplay(display: *mut gtk::gdk::ffi::GdkDisplay) -> *mut c_void;
+            }
+            #[link(name = "Xext")]
+            extern "C" {
+                fn XShapeGetRectangles(display: *mut c_void, window: c_ulong, kind: c_int, count: *mut c_int, ordering: *mut c_int) -> *mut ShapeRect;
+            }
+            #[link(name = "X11")]
+            extern "C" { fn XFree(data: *mut c_void) -> c_int; }
+            let mut count = 0;
+            let mut ordering = 0;
+            // GDK owns the live X11 display/window; Xlib allocates the returned rectangles.
+            unsafe {
+                let display = gdk_x11_display_get_xdisplay(window.display().to_glib_none().0);
+                let xid = gdk_x11_window_get_xid(window.to_glib_none().0);
+                let data = XShapeGetRectangles(display, xid, kind, &mut count, &mut ordering);
+                let rectangles = if count > 0 { std::slice::from_raw_parts(data, count as usize).to_vec() } else { Vec::new() };
+                if !data.is_null() { XFree(data.cast()); }
+                rectangles
+            }
+        }
+
+        fn assert_indicator_shape(window: &gtk::Window) {
+            let native = window.window().unwrap();
+            until(|| {
+                while gtk::events_pending() { gtk::main_iteration(); }
+                shape_rectangles(&native, 0).len() > 8
+            });
+            let bounding = shape_rectangles(&native, 0);
+            assert!(bounding.len() > 8, "A circle must not regress to a rectangular bounding shape: {}x{}, {bounding:?}", window.allocated_width(), window.allocated_height());
+            assert!(shape_rectangles(&native, 2).is_empty(), "The visible circle must remain click-through");
+            // GDK scales widget coordinates into physical X11 coordinates.
+            let size = window.allocated_width().min(window.allocated_height()) * window.scale_factor();
+            let contains = |x: i32, y: i32| bounding.iter().any(|r| {
+                x >= r.x as i32 && y >= r.y as i32 && x < r.x as i32 + r.width as i32 && y < r.y as i32 + r.height as i32
+            });
+            assert!(contains(size / 2, size / 2));
+            assert!(contains(size / 2, (size as f64 * 0.07) as i32), "Do not clip the progress ring");
+            for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1), (size / 2, 0)] {
+                assert!(!contains(x, y), "Transparent padding must not become a black square: {x}, {y}");
+            }
+            let area: u32 = bounding.iter().map(|r| u32::from(r.width) * u32::from(r.height)).sum();
+            let expected = std::f64::consts::PI * (size as f64 * 0.45).powi(2);
+            assert!((f64::from(area) - expected).abs() < size as f64 * 2.0, "Bounding area must match the round visual silhouette");
+        }
+
         #[test]
         #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
         fn i3_focus_leaf_identity_and_stale_targets() {
@@ -1153,6 +1266,61 @@ mod x11 {
             conn.destroy_window(target.window).unwrap().check().unwrap();
             assert!(paste_explicit("destroyed", leaf).is_err());
             assert!(key_events(&conn).is_empty());
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn recording_indicator_never_activates_or_changes_the_target() {
+            let (conn, root) = isolated();
+            let target = editor(&conn, root);
+            gtk::init().unwrap();
+            let screen = gtk::gdk::Screen::default().unwrap();
+            assert!(!screen.is_composited(), "Exercise bare i3, not an alpha compositor");
+            let indicator = gtk::Window::new(gtk::WindowType::Toplevel);
+            indicator.set_visual(Some(&screen.rgba_visual().expect("Transparent indicator needs an ARGB visual")));
+            indicator.set_decorated(false);
+            indicator.set_default_size(84, 84);
+            assert!(indicator.window().is_none(), "Startup configures the indicator before realization");
+            crate::bubble::configure_indicator(&indicator);
+            assert!(indicator.window().is_none(), "Configuring click-through must not show or realize it");
+            assert!(!indicator.accepts_focus());
+            assert!(!indicator.gets_focus_on_map());
+            for _ in 0..2 {
+                indicator.show();
+                while gtk::events_pending() { gtk::main_iteration(); }
+                conn.get_input_focus().unwrap().reply().unwrap();
+                assert_eq!(remember_target(), Some(target));
+                assert_indicator_shape(&indicator);
+                for size in [112, 68, 84] {
+                    indicator.resize(size, size);
+                    until(|| {
+                        while gtk::events_pending() { gtk::main_iteration(); }
+                        indicator.allocated_width() == size && indicator.allocated_height() == size
+                    });
+                    assert_indicator_shape(&indicator);
+                    assert_eq!(remember_target(), Some(target));
+                }
+                indicator.hide();
+                while gtk::events_pending() { gtk::main_iteration(); }
+                assert_eq!(remember_target(), Some(target));
+                indicator.unrealize();
+            }
+            indicator.close();
+
+            // GTK's Copy path and large completion fallback both serve text without an
+            // eligible target; a revoked queued operation never claims ownership.
+            let clipboard = atom(&conn, "CLIPBOARD").unwrap();
+            conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+            assert!(to_clipboard_guarded("revoked before GUI publication", || false).is_err());
+            assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
+            let text = "large completion\n".repeat(5000);
+            assert!(matches!(deliver(&text, None, &amber_core::engine::CancellationToken::default()), Ok(crate::insert::Outcome::OnClipboard(_))));
+            let utf8 = atom(&conn, "UTF8_STRING").unwrap();
+            assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, text.as_bytes());
+            to_clipboard("Explicit Copy still works").unwrap();
+            assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"Explicit Copy still works");
+            assert!(key_events(&conn).is_empty());
+            conn.destroy_window(target.window).unwrap().check().unwrap();
         }
 
         #[test]
@@ -1246,20 +1414,20 @@ mod x11 {
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             assert!(key_events(&conn).is_empty());
-            let shift = keycode(&conn, 0xffe1);
+            let control = keycode(&conn, 0xffe3);
             let caps = keycode(&conn, 0xffe5);
-            let insert = keycode(&conn, 0xff63);
+            let v = keycode(&conn, 0x76);
             let modifiers = conn.get_modifier_mapping().unwrap().reply().unwrap().keycodes;
             let mut changed = modifiers.clone();
             let unused = changed.iter().rposition(|&code| code == 0).unwrap();
-            changed[unused] = insert;
+            changed[unused] = v;
             assert_eq!(conn.set_modifier_mapping(&changed).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
-            assert!(paste_explicit("Insert mapped as a modifier", target).unwrap_err().contains("modifier mapping"));
+            assert!(paste_explicit("V mapped as a modifier", target).unwrap_err().contains("modifier mapping"));
             assert_eq!(conn.set_modifier_mapping(&modifiers).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
-            key(&conn, root, shift, true);
+            key(&conn, root, control, true);
             assert!(paste_explicit("held key", target).unwrap_err().contains("Release all keys"));
-            assert_ne!(conn.query_keymap().unwrap().reply().unwrap().keys[shift as usize / 8] & (1 << (shift % 8)), 0, "Never release a user's held key");
-            key(&conn, root, shift, false);
+            assert_ne!(conn.query_keymap().unwrap().reply().unwrap().keys[control as usize / 8] & (1 << (control % 8)), 0, "Never release a user's held key");
+            key(&conn, root, control, false);
             key(&conn, root, caps, true);
             key(&conn, root, caps, false);
             assert!(paste_explicit("locked modifier", target).unwrap_err().contains("modifiers"));
@@ -1272,16 +1440,76 @@ mod x11 {
             assert_eq!(
                 key_events(&conn),
                 [
-                    (KEY_PRESS_EVENT, shift, target.focus, 0),
-                    (KEY_PRESS_EVENT, insert, target.focus, KeyButMask::SHIFT.into()),
-                    (KEY_RELEASE_EVENT, insert, target.focus, KeyButMask::SHIFT.into()),
-                    (KEY_RELEASE_EVENT, shift, target.focus, KeyButMask::SHIFT.into()),
+                    (KEY_PRESS_EVENT, control, target.focus, 0),
+                    (KEY_PRESS_EVENT, v, target.focus, KeyButMask::CONTROL.into()),
+                    (KEY_RELEASE_EVENT, v, target.focus, KeyButMask::CONTROL.into()),
+                    (KEY_RELEASE_EVENT, control, target.focus, KeyButMask::CONTROL.into()),
                 ]
             );
             assert!(conn.query_keymap().unwrap().reply().unwrap().keys.iter().all(|&k| k == 0));
             let utf8 = atom(&conn, "UTF8_STRING").unwrap();
             assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"Explicit native paste");
+            assert_eq!(remember_target(), Some(target), "Paste never activates Amber or another window");
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+
+            // The completion path uses the same guard and never chooses a new destination.
+            let captured = crate::insert::remember();
+            let mut settings = amber_core::settings::InsertSettings::default();
+            assert!(crate::insert::insert("not opted in", &settings, captured).is_err());
+            assert!(key_events(&conn).is_empty());
+            assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
+            settings.paste_on_completion = true;
+            assert!(matches!(crate::insert::insert("unknown original target", &settings, None), Ok(crate::insert::Outcome::OnClipboard(_))));
+            assert!(key_events(&conn).is_empty());
+            assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"unknown original target");
+            for value in [b"test\0firefox\0".as_slice(), b"test\0XTerm\0", b"test\0unknown\0"] {
+                class(&conn, target.window, value);
+                assert!(matches!(crate::insert::insert("Browser or terminal fallback", &settings, captured), Ok(crate::insert::Outcome::OnClipboard(_))));
+                assert!(key_events(&conn).is_empty());
+                assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"Browser or terminal fallback");
+                assert_eq!(remember_target(), Some(target));
+            }
+            class(&conn, target.window, b"test\0Mousepad\0");
+            assert!(matches!(crate::insert::insert("First line\nSecond line", &settings, captured), Ok(crate::insert::Outcome::OnClipboard(_))));
+            assert!(key_events(&conn).is_empty());
+            assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"First line\nSecond line");
+            assert!(matches!(crate::insert::insert("Completed dictation", &settings, captured), Ok(crate::insert::Outcome::Pasted)));
+            assert_eq!(key_events(&conn), [
+                (KEY_PRESS_EVENT, control, target.focus, 0),
+                (KEY_PRESS_EVENT, v, target.focus, KeyButMask::CONTROL.into()),
+                (KEY_RELEASE_EVENT, v, target.focus, KeyButMask::CONTROL.into()),
+                (KEY_RELEASE_EVENT, control, target.focus, KeyButMask::CONTROL.into()),
+            ]);
+            assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"Completed dictation");
+            let other = editor(&conn, root);
+            assert!(matches!(crate::insert::insert("stale completion target", &settings, captured), Ok(crate::insert::Outcome::OnClipboard(_))));
+            assert_eq!(remember_target(), Some(other), "Never refocus a stale target");
+            assert!(key_events(&conn).is_empty());
+            assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"stale completion target");
+            conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn completion_revocation_and_newer_clipboard_never_inject_or_recopy() {
+            let (conn, root) = isolated();
+            let target = editor(&conn, root);
+            let clipboard = atom(&conn, "CLIPBOARD").unwrap();
+            conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+            let cancel = amber_core::engine::CancellationToken::default();
+            cancel.cancel();
+            let settings = amber_core::settings::InsertSettings { paste_on_completion: true, ..Default::default() };
+            assert!(crate::insert::deliver("cancelled completion", &settings, crate::insert::remember(), &cancel).is_err());
+            assert!(own_clipboard_guarded("revoked at publication", &|| false).is_err());
+            assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
+            let owner = own_clipboard("published before cancellation").unwrap();
+            assert!(paste_copied("published before cancellation", target, Some(owner), &|| false).is_err());
+            assert!(owns_clipboard(owner).unwrap());
+            conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+            assert!(paste_copied("never overwrite the user's newer copy", target, Some(owner), &|| true).unwrap_err().contains("clipboard changed"));
+            assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
+            assert!(key_events(&conn).is_empty());
+            assert_eq!(remember_target(), Some(target));
         }
     }
 }

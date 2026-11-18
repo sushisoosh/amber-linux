@@ -119,7 +119,7 @@ export function WelcomePage(p: PageProps) {
           <Row label="Check shortcuts and permissions" hint={<>If your desktop cannot register a global shortcut, configure <code>amber-dictation --toggle</code> and <code>amber-dictation --cancel</code> in its keyboard settings or i3 config.</>}>
             <button className="btn" onClick={() => go("hotkeys")}>Check capabilities</button>
           </Row>
-          <Row label="Private by default" hint="History is opt-in. Persistent credentials and encrypted history require an available Secret Service wallet. A failed key save may leave a session-only key; check the storage status on the Engine page." />
+          <Row label="Private by default" hint="History is opt-in. Persistent credentials and encrypted history require an available Secret Service wallet. A failed key save may leave a session-only key; check the storage status on the Credentials page." />
         </Section>}
       </div>
     </>

@@ -197,6 +197,68 @@ pub fn encode_wav(samples: &[f32], rate: u32) -> Vec<u8> {
     out
 }
 
+/// Encode Amber's canonical 16 kHz mono PCM16 WAV without changing the source recording.
+/// Bounded to 15 minutes, with a cancellation check per 20 ms frame; no files or subprocesses.
+pub fn encode_ogg_opus(wav: &[u8], cancel: &crate::engine::CancellationToken) -> Result<Vec<u8>, crate::engine::SttError> {
+    use crate::engine::{ErrorKind, SttError};
+    use ogg::PacketWriteEndInfo::{EndPage, EndStream, NormalPacket};
+    let invalid = |detail: &str| SttError::new(ErrorKind::Server, "Could not compress the recording. Select WAV to send it without compression.", detail);
+    cancel.check()?;
+    let header = encode_wav(&[], TARGET_RATE);
+    if wav.len() < 44 || wav[..4] != header[..4] || wav[8..40] != header[8..40]
+        || u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize != wav.len() - 44 || (wav.len() - 44) % 2 != 0 {
+        return Err(invalid("Opus encoding requires Amber's 16 kHz mono PCM16 WAV"));
+    }
+    let pcm = &wav[44..];
+    let samples = pcm.len() / 2;
+    if samples == 0 || samples as u64 > TARGET_RATE as u64 * MAX_DECODE_SECONDS {
+        return Err(invalid("Opus encoding requires nonempty audio of at most 15 minutes"));
+    }
+    let codec_error = |e: opus::Error| invalid(&format!("Opus encoder: {e}"));
+    let mut encoder = opus::Encoder::new(TARGET_RATE, opus::Channels::Mono, opus::Application::Voip).map_err(codec_error)?;
+    encoder.set_bitrate(opus::Bitrate::Bits(32_000)).map_err(codec_error)?;
+    encoder.set_signal(opus::Signal::Voice).map_err(codec_error)?;
+    encoder.set_complexity(5).map_err(codec_error)?;
+    encoder.set_vbr(true).map_err(codec_error)?;
+    encoder.set_vbr_constraint(true).map_err(codec_error)?;
+    let lookahead = encoder.get_lookahead().map_err(codec_error)? as usize;
+    let pre_skip = u16::try_from(lookahead * 3).map_err(|_| invalid("Opus lookahead is too large"))?;
+    let mut head = b"OpusHead".to_vec();
+    head.extend_from_slice(&[1, 1]); // Version 1, mono, mapping family 0.
+    head.extend_from_slice(&pre_skip.to_le_bytes());
+    head.extend_from_slice(&TARGET_RATE.to_le_bytes());
+    head.extend_from_slice(&[0, 0, 0]); // No gain.
+    let mut out = Vec::new();
+    {
+        let mut writer = ogg::PacketWriter::new(&mut out);
+        let mux_error = |e: std::io::Error| invalid(&format!("Ogg encoder: {e}"));
+        writer.write_packet(head, 1, EndPage, 0).map_err(mux_error)?;
+        writer.write_packet(b"OpusTags\x05\0\0\0Amber\0\0\0\0".to_vec(), 1, EndPage, 0).map_err(mux_error)?;
+        const FRAME: usize = 320;
+        // Flush the encoder delay as well as the partial last frame. Granules always count
+        // 48 kHz samples; the final granule trims the added silence, not the spoken tail.
+        let frames = (samples + lookahead).div_ceil(FRAME);
+        let mut frame = [0i16; FRAME];
+        let mut packet = [0u8; 1275];
+        for i in 0..frames {
+            cancel.check()?;
+            frame.fill(0);
+            let start = (i * FRAME * 2).min(pcm.len());
+            let end = (start + FRAME * 2).min(pcm.len());
+            for (sample, bytes) in frame.iter_mut().zip(pcm[start..end].chunks_exact(2)) {
+                *sample = i16::from_le_bytes([bytes[0], bytes[1]]);
+            }
+            let n = encoder.encode(&frame, &mut packet).map_err(codec_error)?;
+            let last = i + 1 == frames;
+            let granule = if last { samples + lookahead } else { (i + 1) * FRAME } as u64 * 3;
+            let end = if last { EndStream } else if (i + 1) % 50 == 0 { EndPage } else { NormalPacket };
+            writer.write_packet(packet[..n].to_vec(), 1, end, granule).map_err(mux_error)?;
+        }
+    }
+    cancel.check()?;
+    Ok(out)
+}
+
 /// An upload to the phone API as mono samples and their rate: WAV, or Ogg Opus (a phone on
 /// mobile data sends a tenth of the bytes). Told apart by the first bytes, not the filename.
 pub fn decode_upload(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
@@ -208,7 +270,7 @@ pub fn decode_upload(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
 }
 
 /// Ogg Opus (RFC 7845), decoded straight to 16 kHz mono by libopus; the encoder's lead-in
-/// (pre-skip) is dropped and its output gain applied. The length is checked from the packets'
+/// (pre-skip) and final padding are dropped and its output gain applied. Length is checked from the packets'
 /// own headers before anything is decoded - a flood of tiny packets costs no decoding.
 fn decode_ogg_opus(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let broken = |what: &str| format!("broken Ogg Opus: {what}");
@@ -233,13 +295,25 @@ fn decode_ogg_opus(bytes: &[u8]) -> Result<Vec<f32>, String> {
 
     let mut packets = Vec::new();
     let mut length = 0u64;
+    let mut end_granule = None;
     while let Some(packet) = next()? {
+        if end_granule.is_some() { return Err(broken("audio after end of stream")); }
         // Counted at 48 kHz, as the packet headers say.
         length += opus::packet::get_nb_samples(&packet.data, 48_000).map_err(|e| broken(&e.to_string()))? as u64;
-        if length > MAX_DECODE_SECONDS * 48_000 {
+        // One final packet may extend beyond the limit before its end trimming is applied.
+        if length > MAX_DECODE_SECONDS * 48_000 + 5_760 {
             return Err(format!("longer than {} minutes", MAX_DECODE_SECONDS / 60));
         }
+        if packet.last_in_stream() {
+            let end = packet.absgp_page();
+            if end > length || end < skip as u64 * 3 { return Err(broken("invalid end granule")); }
+            end_granule = Some(end);
+        }
         packets.push(packet.data);
+    }
+    let end = end_granule.unwrap_or(length) as usize / 3;
+    if end.saturating_sub(skip) as u64 > MAX_DECODE_SECONDS * TARGET_RATE as u64 {
+        return Err(format!("longer than {} minutes", MAX_DECODE_SECONDS / 60));
     }
     // Decoding to one channel mixes a stereo stream down.
     let mut decoder = opus::Decoder::new(TARGET_RATE, opus::Channels::Mono).map_err(|e| broken(&e.to_string()))?;
@@ -250,6 +324,7 @@ fn decode_ogg_opus(bytes: &[u8]) -> Result<Vec<f32>, String> {
         let n = decoder.decode_float(packet, &mut frame, false).map_err(|e| broken(&e.to_string()))?;
         samples.extend(frame[..n].iter().map(|s| s * gain));
     }
+    samples.truncate(end);
     if samples.len() <= skip {
         return Err(broken("no audio"));
     }
@@ -333,6 +408,91 @@ mod tests {
     use super::*;
 
     const TONE_OGG: &[u8] = include_bytes!("../tests/data/tone-440-880.ogg");
+
+    #[test]
+    fn opus_upload_preserves_exact_duration_and_flushes_the_spoken_tail() {
+        for len in [1, 103, 319, 320, 321, 16_000, 16_321, 32_007] {
+            let samples: Vec<f32> = (0..len).map(|i| 0.4 * (i as f32 * 880.0 * std::f32::consts::TAU / TARGET_RATE as f32).sin()).collect();
+            let wav = encode_wav(&samples, TARGET_RATE);
+            let encoded = encode_ogg_opus(&wav, &crate::engine::CancellationToken::default()).unwrap();
+            let (decoded, rate) = decode_upload(&encoded).unwrap();
+            assert_eq!(rate, TARGET_RATE);
+            assert_eq!(decoded.len(), len, "pre-skip and end trim at {len} samples");
+            let mut reader = ogg::PacketReader::new(std::io::Cursor::new(&encoded));
+            let head = reader.read_packet().unwrap().unwrap();
+            let skip = u16::from_le_bytes([head.data[10], head.data[11]]) as u64;
+            assert!(skip > 0);
+            reader.read_packet().unwrap().unwrap(); // Tags.
+            let mut duration = 0u64;
+            let mut ended = false;
+            while let Some(packet) = reader.read_packet().unwrap() {
+                duration += opus::packet::get_nb_samples(&packet.data, 48_000).unwrap() as u64;
+                if packet.last_in_stream() {
+                    assert_eq!(packet.absgp_page(), len as u64 * 3 + skip);
+                    assert!(duration >= packet.absgp_page());
+                    assert!(duration - packet.absgp_page() < 960);
+                    ended = true;
+                }
+            }
+            assert!(ended);
+            if len > 16_000 {
+                assert!(rms(&decoded[len - 160..]) > 0.15, "spoken tail lost");
+                assert!((frequency(&decoded[1000..len - 1000], rate) - 880.0).abs() < 15.0);
+            }
+        }
+    }
+
+    #[test]
+    fn opus_upload_voice_size_quality_and_encoding_time() {
+        // Reproducible voiced harmonics with syllable-like modulation, not real speech or a
+        // recognition accuracy benchmark. Silence and music alone misrepresent voice bitrate.
+        let samples: Vec<f32> = (0..30 * TARGET_RATE).map(|i| {
+            let t = i as f32 / TARGET_RATE as f32;
+            let phase = std::f32::consts::TAU * (180.0 * t + 3.0 * (t * 2.0).sin());
+            let envelope = 0.65 + 0.35 * (t * 15.0).sin();
+            envelope * (0.3 * phase.sin() + 0.12 * (phase * 2.0).sin() + 0.05 * (phase * 3.0).sin())
+        }).collect();
+        let wav = encode_wav(&samples, TARGET_RATE);
+        let before = wav.clone();
+        let started = std::time::Instant::now();
+        let encoded = encode_ogg_opus(&wav, &crate::engine::CancellationToken::default()).unwrap();
+        let elapsed = started.elapsed();
+        let (decoded, _) = decode_upload(&encoded).unwrap();
+        assert_eq!(wav, before, "local fallback must retain the exact lossless WAV");
+        assert_eq!(decoded.len(), samples.len());
+        assert!(encoded.len() < wav.len() / 4, "{} bytes", encoded.len());
+        let dot: f64 = samples.iter().zip(&decoded).map(|(&a, &b)| a as f64 * b as f64).sum();
+        let correlation = dot / (samples.len() as f64 * rms(&samples) as f64 * rms(&decoded) as f64);
+        // VoIP's high-pass filter changes low-frequency phase; this is a corruption check,
+        // not a perceptual or transcription-quality score for the lossy codec.
+        assert!(correlation > 0.65, "aligned correlation {correlation}");
+        assert!((0.8..1.2).contains(&(rms(&decoded) / rms(&samples))));
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+        println!("30 s generated voice: WAV {} bytes, Opus {} bytes ({:.1} kbps, {:.1}% smaller), encode {} ms, correlation {correlation:.3}",
+            wav.len(), encoded.len(), encoded.len() as f64 * 8.0 / 30_000.0,
+            100.0 * (1.0 - encoded.len() as f64 / wav.len() as f64), elapsed.as_millis());
+    }
+
+    #[test]
+    fn opus_upload_is_bounded_and_cancellable() {
+        use crate::engine::{CancellationToken, ErrorKind};
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        assert_eq!(encode_ogg_opus(b"invalid", &cancel).unwrap_err().kind, ErrorKind::Cancelled);
+        for wav in [encode_wav(&[], TARGET_RATE), encode_wav(&[0.1; 100], 48_000), b"not WAV".to_vec(),
+            encode_wav(&vec![0.1; TARGET_RATE as usize * MAX_DECODE_SECONDS as usize + 1], TARGET_RATE)] {
+            assert!(encode_ogg_opus(&wav, &CancellationToken::default()).is_err());
+        }
+        let wav = encode_wav(&vec![0.1; TARGET_RATE as usize * MAX_DECODE_SECONDS as usize], TARGET_RATE);
+        let cancel = CancellationToken::default();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || encode_ogg_opus(&wav, &worker_cancel));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let stopped = std::time::Instant::now();
+        cancel.cancel();
+        assert_eq!(worker.join().unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        assert!(stopped.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     /// Zero crossings per second, half of which is the frequency of a pure tone.
     fn frequency(samples: &[f32], rate: u32) -> f32 {

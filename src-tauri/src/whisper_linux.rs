@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use amber_core::engine::{CancellationToken, Transcriber};
+use amber_core::engine::{CancellationToken, SttError, TranscribeOptions, Transcriber};
 use amber_core::local;
 use amber_inference::Speech;
 use serde::Serialize;
@@ -32,7 +32,7 @@ pub struct Served {
 pub struct Whisper {
     // Never replace the Speech owner: outstanding engine handles must share its model lock.
     speech: OnceLock<Arc<Speech>>,
-    changes: Mutex<()>,
+    changes: Arc<Mutex<()>>,
     status: Mutex<Option<Status>>,
 }
 
@@ -53,9 +53,17 @@ impl Whisper {
     /// Preloading is blocking and not interruptible while native model construction runs.
     /// Actual transcription uses the dictation's per-run CancellationToken through Transcriber.
     pub fn ensure_model(&self, app: &tauri::AppHandle, requested: Option<&str>) -> Result<Served, String> {
+        self.ensure_with(app, requested, None)
+    }
+
+    pub fn ensure_snapshot(&self, app: &tauri::AppHandle, settings: &amber_core::settings::LocalSettings) -> Result<Served, String> {
+        self.ensure_with(app, Some(&settings.model), Some(settings))
+    }
+
+    fn ensure_with(&self, app: &tauri::AppHandle, requested: Option<&str>, snapshot: Option<&amber_core::settings::LocalSettings>) -> Result<Served, String> {
         let _change = self.changes.lock().unwrap();
         let core = app.state::<crate::state::Core>();
-        let settings = core.settings().local;
+        let settings = snapshot.cloned().unwrap_or_else(|| core.settings().local);
         let layout = &core.paths.layout;
         let model = local::model(requested.unwrap_or(&settings.model)).ok_or("Unknown speech model.")?;
         let own = requested.is_none();
@@ -77,7 +85,10 @@ impl Whisper {
             }
             return Err(error.message);
         }
-        let transcriber = speech.engine(Some(model.id), model.id)?;
+        let mut transcriber = speech.engine(Some(model.id), model.id)?;
+        if snapshot.is_some() {
+            transcriber = Box::new(SnapshotEngine { transcriber, speech: speech.clone(), changes: self.changes.clone(), threads: settings.threads });
+        }
         if own {
             self.set_status(app, Status::of("ready", Some(format!("{} on CPU (built in)", model.label))));
         }
@@ -111,5 +122,28 @@ impl Whisper {
 
     pub fn is_ready(&self, model: &str) -> bool {
         self.speech.get().is_some_and(|speech| speech.is_ready(model))
+    }
+}
+
+/// A test keeps its thread setting as well as its model. Background preload/phone requests
+/// must not change Speech's shared tuning between picking this handle and starting inference.
+struct SnapshotEngine {
+    transcriber: Box<dyn Transcriber>,
+    speech: Arc<Speech>,
+    changes: Arc<Mutex<()>>,
+    threads: u32,
+}
+
+impl Transcriber for SnapshotEngine {
+    fn transcribe(&self, wav: &[u8], options: &TranscribeOptions) -> Result<String, SttError> {
+        self.transcribe_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        cancel.check()?;
+        let _change = self.changes.lock().unwrap();
+        cancel.check()?;
+        self.speech.set_threads(self.threads);
+        self.transcriber.transcribe_cancellable(wav, options, cancel)
     }
 }

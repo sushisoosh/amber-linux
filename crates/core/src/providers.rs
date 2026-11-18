@@ -78,6 +78,25 @@ pub const OPENAI: Provider = Provider {
     needs_key: true,
 };
 
+// Same speech and cleanup defaults as Amber for Android, checked against /v1/models.
+// Direct HTTPS only: the desktop transport does not perform enclave attestation.
+pub const TINFOIL: Provider = Provider {
+    id: "tinfoil",
+    name: "Tinfoil.sh",
+    base_url: "https://inference.tinfoil.sh/v1",
+    models: &[
+        SpeechModel { id: "voxtral-small-24b", label: "Voxtral Small 24B", note: "recommended, as on Android" },
+        SpeechModel { id: "whisper-large-v3-turbo", label: "Whisper large-v3-turbo", note: "alternative speech model" },
+    ],
+    chat_models: &[
+        ChatModel { id: "deepseek-v4-1-flash", label: "DeepSeek V4.1 Flash", note: "recommended, thinking off", extra: Some(r#"{"chat_template_kwargs":{"thinking":false}}"#) },
+        ChatModel { id: "gemma4-31b", label: "Gemma 4 31B", note: "alternative, thinking off", extra: Some(r#"{"chat_template_kwargs":{"enable_thinking":false}}"#) },
+        ChatModel { id: "llama3-3-70b", label: "Llama 3.3 70B", note: "no reasoning", extra: None },
+    ],
+    key_url: "https://dash.tinfoil.sh",
+    needs_key: true,
+};
+
 pub const CUSTOM: Provider = Provider {
     id: "custom",
     name: "Own server",
@@ -88,7 +107,7 @@ pub const CUSTOM: Provider = Provider {
     needs_key: false,
 };
 
-pub const ALL: [&Provider; 3] = [&GROQ, &OPENAI, &CUSTOM];
+pub const ALL: [&Provider; 4] = [&GROQ, &OPENAI, &TINFOIL, &CUSTOM];
 
 pub fn by_id(id: &str) -> Option<&'static Provider> {
     ALL.iter().copied().find(|p| p.id == id)
@@ -169,16 +188,16 @@ impl AmberCatalog {
             version: shown(amber.get("version").and_then(|v| v.as_str()).unwrap_or("")),
             speech: Vec::new(), cleanup: Vec::new(), audio: Vec::new(),
         };
-        if let Some(audio) = amber.get("audio").and_then(|v| v.as_array()) {
+        // Shipped catalogs omitted audio: the documented legacy baseline is WAV. An
+        // explicit but invalid/empty advertisement must not inherit that baseline.
+        if !amber.contains_key("audio") {
+            catalog.audio.push("wav".into());
+        } else if let Some(audio) = amber.get("audio").and_then(|v| v.as_array()) {
             for format in audio.iter().filter_map(|v| v.as_str()).filter(|f| matches!(*f, "wav" | "opus")) {
                 if !catalog.audio.iter().any(|f| f == format) {
                     catalog.audio.push(format.to_string());
                 }
             }
-        }
-        // Older Amber catalogs omit formats; unknown-only lists also mean the WAV baseline.
-        if catalog.audio.is_empty() {
-            catalog.audio.push("wav".into());
         }
         for entry in root.get("data").and_then(|v| v.as_array()).into_iter().flatten() {
             let Some(id) = entry.get("id").and_then(|v| v.as_str()) else { continue };
@@ -267,6 +286,28 @@ mod tests {
     }
 
     #[test]
+    fn tinfoil_defaults_and_settings_round_trip() {
+        let provider = by_id("tinfoil").unwrap();
+        assert!(provider.needs_key);
+        assert_eq!(effective_base_url(provider, "https://old.example/audio/transcriptions"), "https://inference.tinfoil.sh/v1");
+        assert_eq!(provider.default_model(), "voxtral-small-24b");
+        assert_eq!(provider.chat_models[0].id, "deepseek-v4-1-flash");
+        assert_eq!(crate::cleanup::chat_url(provider.base_url), "https://inference.tinfoil.sh/v1/chat/completions");
+
+        let mut settings = crate::settings::Settings::default();
+        settings.server.provider = provider.id.into();
+        settings.server.model.clear();
+        settings.cleanup.provider = provider.id.into();
+        settings.cleanup.model.clear();
+        let saved = serde_json::to_vec(&settings.sanitized()).unwrap();
+        let restored = serde_json::from_slice::<crate::settings::Settings>(&saved).unwrap().sanitized();
+        assert_eq!(restored.server.provider, "tinfoil");
+        assert_eq!(restored.server.model, "voxtral-small-24b");
+        assert_eq!(restored.cleanup.provider, "tinfoil");
+        assert_eq!(restored.cleanup.model, "deepseek-v4-1-flash");
+    }
+
+    #[test]
     fn http_only_on_explicit_loopback() {
         for ok in ["http://127.0.0.1:8000/v1", "http://127.1.2.3/v1", "http://[::1]:9000", "http://[::ffff:127.0.0.1]/v1", "https://api.example.com/v1"] {
             assert!(check_base_url(ok).is_ok(), "{ok}");
@@ -318,8 +359,11 @@ mod tests {
 
     #[test]
     fn amber_audio_advertisement_uses_exact_known_formats() {
-        for audio in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!(["WAV", "audio/wav", 1])] {
-            assert_eq!(AmberCatalog::parse(&serde_json::json!({"amber":{"audio":audio}})).unwrap().audio, ["wav"]);
+        assert_eq!(AmberCatalog::parse(&serde_json::json!({"amber":{}})).unwrap().audio, ["wav"]);
+        for audio in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!({}),
+            serde_json::json!("wav"), serde_json::json!(true), serde_json::json!(1),
+            serde_json::json!(["WAV", "audio/wav", 1]), serde_json::json!(["flac"])] {
+            assert!(AmberCatalog::parse(&serde_json::json!({"amber":{"audio":audio}})).unwrap().audio.is_empty());
         }
         assert_eq!(AmberCatalog::parse(&serde_json::json!({"amber":{"audio":["opus"]}})).unwrap().audio, ["opus"]);
         assert!(AmberCatalog::parse(&serde_json::json!({"data":[]})).is_none());

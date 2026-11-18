@@ -15,6 +15,8 @@ import { AppPage } from "./pages/AppPage";
 import { WelcomePage } from "./pages/Welcome";
 import { PhonePage } from "./pages/Phone";
 import { CleanupPage } from "./pages/Cleanup";
+import { CredentialsPage } from "./pages/Credentials";
+import { TestingPage } from "./pages/Testing";
 import { ProgramsPage } from "./pages/Programs";
 import { HistoryPage } from "./pages/History";
 import { SnippetsPage } from "./pages/Snippets";
@@ -32,12 +34,13 @@ export interface PageProps {
   toast: (message: string, ok?: boolean) => void;
   phase: Phase;
   phaseMessage: string | null;
+  settingsSaving: boolean;
   desktop: ReturnType<typeof useDesktop>;
 }
 
-export type PageId = "recorder" | "welcome" | "engine" | "cleanup" | "programs" | "snippets" | "microphone" | "hotkeys" | "bubble" | "insert" | "phone" | "history" | "statistics" | "app";
+export type PageId = "recorder" | "welcome" | "engine" | "cleanup" | "credentials" | "testing" | "programs" | "snippets" | "microphone" | "hotkeys" | "bubble" | "insert" | "phone" | "history" | "statistics" | "app";
 
-const LINUX_HIDDEN = new Set<PageId>(["programs", "bubble", "insert", "phone"]);
+const LINUX_HIDDEN = new Set<PageId>(["programs", "bubble", "phone"]);
 
 const PAGES: { id: PageId; label: string; value: (o: Overview) => string }[] = [
   { id: "recorder", label: "Recorder", value: () => "" },
@@ -47,12 +50,14 @@ const PAGES: { id: PageId; label: string; value: (o: Overview) => string }[] = [
     label: "Cleanup",
     value: (o) => (o.settings.cleanup.smart ? (o.settings.cleanup.engine === "local" ? "Local" : "Server") : o.settings.cleanup.fillers ? "Fillers" : "Off"),
   },
+  { id: "credentials", label: "Credentials", value: () => "" },
+  { id: "testing", label: "Testing", value: () => "" },
   { id: "programs", label: "Programs", value: (o) => String(o.settings.profiles.length) },
   { id: "snippets", label: "Snippets", value: (o) => String(o.settings.snippets.length) },
   { id: "microphone", label: "Microphone", value: (o) => o.settings.microphone || "Default" },
   { id: "hotkeys", label: "Hotkeys", value: (o) => o.settings.hotkey.dictate || "None" },
   { id: "bubble", label: "Bubble", value: (o) => ({ always: "Shown", whileDictating: "When used", hidden: "Hidden" })[o.settings.bubble.visibility] },
-  { id: "insert", label: "Inserting", value: (o) => (o.settings.insert.method === "paste" ? "Paste" : "Type") },
+  { id: "insert", label: "Delivery", value: (o) => o.platform === "linux" && !o.settings.insert.pasteOnCompletion ? "Review" : o.settings.insert.method === "paste" ? "Ctrl+V" : "Type" },
   { id: "phone", label: "Phone", value: (o) => (o.settings.phone.enabled ? "On" : "Off") },
   { id: "history", label: "History", value: (o) => (o.settings.history ? `${o.settings.historyDays} days` : "Off") },
   { id: "statistics", label: "Statistics", value: (o) => (o.settings.statistics ? "" : "Off") },
@@ -65,7 +70,7 @@ function providerName(o: Overview) {
 
 function initialPage(): PageId {
   const p = new URLSearchParams(location.search).get("page");
-  return (["recorder", "welcome", "engine", "cleanup", "programs", "snippets", "microphone", "hotkeys", "bubble", "insert", "phone", "history", "statistics", "app"] as PageId[]).includes(p as PageId)
+  return (["recorder", "welcome", "engine", "cleanup", "credentials", "testing", "programs", "snippets", "microphone", "hotkeys", "bubble", "insert", "phone", "history", "statistics", "app"] as PageId[]).includes(p as PageId)
     ? (p as PageId)
     : "recorder";
 }
@@ -77,6 +82,7 @@ export function App() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [phaseMessage, setPhaseMessage] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const phaseVersion = useRef(0);
   const linux = ov?.platform === "linux";
   const desktop = useDesktop(linux);
@@ -179,8 +185,10 @@ export function App() {
       });
       saveTail.current = run;
       pending.current.add(run);
+      setSettingsSaving(true);
       await run;
       pending.current.delete(run);
+      setSettingsSaving(pending.current.size > 0);
       await desktop.refresh();
     },
     [desktop.refresh, toast],
@@ -204,7 +212,7 @@ export function App() {
     {loadError && <button className="btn" onClick={() => void refresh().catch((e) => setLoadError(String(e)))}>Retry</button>}
   </main>;
   const currentPage = linux && LINUX_HIDDEN.has(page) ? "recorder" : !linux && page === "recorder" ? "engine" : page;
-  const props: PageProps = { ov, s: ov.settings, save, refresh, go: setPage, toast, phase, phaseMessage, desktop };
+  const props: PageProps = { ov, s: ov.settings, save, refresh, go: setPage, toast, phase, phaseMessage, settingsSaving, desktop };
 
   return (
     <>
@@ -226,10 +234,12 @@ export function App() {
         <div className="status" role="status">{phaseLabel(phase)}</div>
       </nav>
       <main className={linux ? "linux-settings" : undefined}>
-        {linux && <Recorder {...props} compact={currentPage !== "recorder"} />}
+        {linux && currentPage !== "testing" && <Recorder {...props} compact={currentPage !== "recorder"} />}
         {currentPage === "welcome" && <WelcomePage {...props} />}
         {currentPage === "engine" && <EnginePage {...props} />}
         {currentPage === "cleanup" && <CleanupPage {...props} />}
+        {currentPage === "credentials" && <CredentialsPage {...props} />}
+        {currentPage === "testing" && <TestingPage {...props} />}
         {currentPage === "programs" && <ProgramsPage {...props} />}
         {currentPage === "snippets" && <SnippetsPage {...props} />}
         {currentPage === "microphone" && <MicrophonePage {...props} />}

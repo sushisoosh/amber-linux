@@ -18,6 +18,7 @@ mod phone;
 mod process;
 mod secrets;
 mod state;
+mod testing;
 mod tray;
 mod tunnel;
 mod updates;
@@ -43,6 +44,11 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         app.exit(0);
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    let background_control = amber_core::autostart::background_control(&std::env::args().collect::<Vec<_>>());
+    // Capture before creating any UI, including on a cold desktop-shortcut launch.
+    #[cfg(target_os = "linux")]
+    let launch_target = if background_control { insert::remember() } else { None };
     let config = app.path().app_config_dir()?;
     let data = app.path().app_local_data_dir()?;
     #[cfg(target_os = "linux")]
@@ -66,6 +72,7 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     amber_core::engine::log_languages_to(diag::info);
     diag::info(format!("Amber {} starting", env!("CARGO_PKG_VERSION")));
     app.manage(Core::new(paths));
+    testing::load_at_start(app)?;
 
     let core = app.state::<Core>();
     let settings = core.settings();
@@ -73,6 +80,10 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     bubble::create(app)?;
     #[cfg(target_os = "linux")]
     linux_desktop::init(app);
+    #[cfg(target_os = "linux")]
+    if let Err(e) = bubble::create(app) {
+        diag::warn(format!("Recording indicator unavailable: {e}"));
+    }
     if let Err(e) = tray::create(app) {
         #[cfg(not(target_os = "linux"))]
         return Err(e.into());
@@ -104,9 +115,13 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     // An explicitly configured login start stays in the background after onboarding.
     let autostarted = std::env::args().any(|a| a == amber_core::autostart::ARG);
-    if !settings.onboarded {
+    #[cfg(not(target_os = "linux"))]
+    let background_control = false;
+    if background_control && !settings.onboarded {
+        notify(app, "Amber", "Open Amber from your application launcher to complete setup before dictating.");
+    } else if !background_control && !settings.onboarded {
         bubble::open_settings(app, Some("welcome"));
-    } else if !autostarted {
+    } else if !background_control && !autostarted {
         bubble::open_settings(app, amber_core::autostart::settings_page(&std::env::args().collect::<Vec<_>>()).as_deref());
     }
     #[cfg(not(target_os = "linux"))]
@@ -127,7 +142,7 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     updates::spawn(app);
     #[cfg(target_os = "linux")]
     if settings.onboarded && std::env::args().any(|a| a == "--toggle") {
-        dictation::start_after_desktop_ready(app);
+        dictation::start_after_desktop_ready(app, launch_target);
     }
     Ok(())
 }
@@ -178,6 +193,15 @@ pub fn run() {
             commands::get_last_result,
             commands::clear_last_result,
             commands::cancel_dictation,
+            commands::get_testing_state,
+            commands::start_test_recording,
+            commands::replay_test_recording,
+            commands::stop_test_recording,
+            commands::cancel_test_recording,
+            commands::clear_test_results,
+            commands::save_test_table,
+            commands::delete_test_table,
+            commands::reload_test_tables,
             commands::quit_app,
             commands::save_settings,
             commands::set_api_key,

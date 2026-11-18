@@ -16,13 +16,16 @@ const MODE_HINT: Record<HotkeyMode, string> = {
   hold: "Dictates while you hold the keys (push to talk).",
 };
 
-export function HotkeysPage({ s, save, ov, desktop }: PageProps) {
+export function HotkeysPage({ s, save, ov, desktop, go }: PageProps) {
   const linux = ov.platform === "linux";
   return (
     <>
       <h1>Hotkeys</h1>
       <p className="lead">{linux ? "Global shortcuts depend on your desktop and its permissions. The recorder window always provides Record, Stop, and Cancel controls. Use Ctrl, Alt or Super, or a function key." : "Work in every app, also when Amber's windows are closed. Use Ctrl, Alt or Win (Shift alone is not enough) so normal typing is not caught - or a function key."}</p>
       <Section title="Dictation">
+        <Row label="Keep working in the active window" hint="Starting or stopping with the hotkey does not open or focus Amber. Choose how completed text is delivered separately.">
+          <button className="btn" onClick={() => go("insert")}>Delivery options</button>
+        </Row>
         <Row label="Hotkey" hint={linux ? "On Wayland this is a preferred binding. The portal permission dialog or desktop settings may assign a different shortcut; check the status below." : undefined}>
           <HotkeyInput value={s.hotkey.dictate} linux={linux} onChange={(v) => save((x) => (x.hotkey.dictate = v))} />
         </Row>

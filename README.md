@@ -9,14 +9,18 @@ to the repository license and the author's written permission.
 
 - Local CPU Whisper inference is built in; only model weights need downloading.
   OpenAI-compatible recognition and optional local/server cleanup are supported.
-- The Linux Recorder page keeps results in memory for review and explicit Copy.
-  Recognition completion never silently replaces the clipboard or pastes into an
-  unknown field. On X11, `amber-dictation --insert-last` can submit a single-line result to a
-  supported native editor; it is an explicit, unverified paste, not automatic typing.
+- Dictation shortcuts leave Amber in the background. The Linux Recorder page keeps results
+  in memory for review and explicit Copy by default. Under **Delivery**, enable **Copy and
+  paste completed dictation (Ctrl+V)** to copy completed text and paste automatically on
+  supported X11 targets. The target must remain unchanged for automatic paste; unsupported
+  or changed targets receive clipboard text for manual paste, without refocusing a window.
+  On X11, `amber-dictation --insert-last` can also submit a single-line
+  result to a supported native editor; a submitted paste is not proof the editor accepted it.
+  Browsers, terminals, dialogs, unknown targets, and multiline text still require manual paste.
 - Wayland shortcuts use the desktop portal when available. GNOME 48+ and KDE Plasma
   6 are the primary targets. On older/missing portal backends, configure a desktop
   shortcut for `amber-dictation --toggle`; `amber-dictation --cancel` stops/cancels a dictation. That
-  fallback is toggle-only. Clipboard access is an explicit foreground action.
+  fallback is toggle-only. On Wayland, clipboard access requires Amber to be focused.
 - Credentials and optional history use authenticated encryption with a key in Secret
   Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
   causes plaintext persistence. Credential-save errors leave keys available only
@@ -33,7 +37,7 @@ clone the unported upstream repository or require a hardcoded fork URL.
 
 ```bash
 sudo pacman -Syu --needed base-devel nodejs npm
-bash tools/arch.sh --install
+bash tools/arch.sh --force --install
 amber-dictation
 ```
 
@@ -44,6 +48,9 @@ defaults to two jobs; set `CARGO_BUILD_JOBS` to override it. Packages are kept i
 `target/arch`, and the helper prints its staging directory so a failed build can be
 inspected. The installed command is **`amber-dictation`**, not `amber`, to avoid
 colliding with unrelated Arch/AUR programs.
+
+`--force` rebuilds the current source even if `target/arch` already contains this version.
+Without it, `makepkg --install` can reinstall an older build instead of compiling your changes.
 
 The source snapshot uses a fresh native build directory. If changing the `GGML_*`
 CPU flags in an existing checkout, first run `cargo clean -p whisper-rs-sys`:
@@ -146,7 +153,7 @@ Dictation into **any** window - Amber's Android dictation, on the PC. Speak, and
 appears where your cursor is: in Notepad, the browser, Discord, VS Code, Word.
 
 Local-first: your voice is recognized on this PC by whisper.cpp (CPU or NVIDIA GPU), or -
-your choice - by a server with your own API key (Groq, OpenAI, or your own
+your choice - by a server with your own API key (Groq, OpenAI, Tinfoil.sh, or your own
 OpenAI-compatible server).
 
 ## Installing
@@ -191,7 +198,19 @@ Say "neue Zeile", "neuer Absatz", "Komma", "Fragezeichen", "Punkt" (at a sentenc
 | Local, NVIDIA GPU | nowhere | CUDA 12.4 build with cuBLAS, 653 MB |
 | Groq | Groq | Whisper large-v3(-turbo), about $0.04 per hour of speech |
 | OpenAI | OpenAI | GPT-4o (mini) Transcribe, Whisper |
+| Tinfoil.sh | Tinfoil | Voxtral Small 24B (default), Whisper large-v3-turbo; HTTPS without client enclave verification |
 | Own server | your server | anything with `POST /v1/audio/transcriptions`; plain `http://` only inside your network |
+
+For Tinfoil on either desktop platform, save an inference API key from
+[its dashboard](https://dash.tinfoil.sh) on the **Credentials** page. Keys can be managed
+without changing your engine or cleanup selections, including local speech recognition
+with Tinfoil cleanup. Select **Tinfoil.sh** on the Engine page to use it for speech. The preset uses
+`https://inference.tinfoil.sh/v1`, not a model-page URL or the full transcription endpoint.
+Select Tinfoil.sh separately under Cleanup to reuse that key with DeepSeek V4.1 Flash
+(default), Gemma 4 31B, or Llama 3.3 70B. DeepSeek and Gemma have thinking disabled.
+Unlike Android, the desktop client does not verify enclave attestation. The connection
+test only fetches the public model catalog; a successful test does not validate the key
+or prove that inference works.
 
 The local models are the ones Amber for Android uses: **FUTO Base** and **FUTO Small**
 (keyboard.futo.org) and **ACFT Large v3 Turbo q8_0** (DeadBranches on Hugging Face, from
@@ -216,6 +235,58 @@ the downloaded local model with a notice - never the other way round.
 API keys are encrypted with Windows DPAPI for your account (`secrets.bin`), never written
 to the settings file or the log.
 
+### Audio Uploads
+
+Under **Engine > Server > Audio upload**, choose **Ogg Opus (lossy, ~32 kbps)** to reduce
+the audio sent for recognition. Encoding runs locally using the bundled codec, without
+temporary files or an extra encoder installation. WAV remains the lossless default;
+local recognition and local fallback always receive the original WAV. Compression can
+change recognition quality and adds encoding time, so it is not guaranteed to reduce
+total latency on every connection.
+
+Groq and OpenAI document Ogg input. Tinfoil's published Voxtral server source accepts
+Ogg Opus, although its model documentation lists MP3/WAV and live authenticated Opus
+inference has not been verified here. Other servers may reject it. Custom Amber servers
+are checked against their advertised formats before uploading; older Amber catalogs without
+an audio list retain their documented WAV baseline. If WAV is selected instead of Opus,
+that decision is shown in the test result. Amber never retries a rejected paid request
+automatically with a different format.
+
+## Testing
+
+The **Testing** page records comparisons without pasting, typing, changing the clipboard,
+or adding transcripts to ordinary history/statistics. The comparison table aligns model
+identifiers, compression and smart-cleanup checkmarks, encoding/recognition/cleanup times,
+the combined stage time, and result previews. Times are milliseconds; recognition includes
+encoding, so the total does not add encoding twice. The Opus checkmark describes the actual
+prepared upload, not just the requested setting. Missing stages are not shown as zero-time
+successes. **Details** expands a row to show its captured settings, raw and cleaned text,
+individual attempts, file sizes, and failures. File sizes exclude multipart overhead and
+are not confirmation that all bytes were sent.
+
+Record once, change Engine, Audio upload or Cleanup, and use **Replay** on a row (or
+**Run again with current settings** in its details). Every replay starts from the same original prepared lossless
+WAV, never from a compressed upload, and creates a separate comparison with the same
+recording number. It does not open the microphone. Recognition wall time includes encoding,
+model loading and retries; Testing processes complete recordings instead of live chunking.
+
+The current table holds up to 20 results. **Clear table** removes only these unsaved rows.
+Give the table an optional name and choose **Save table & start new** to keep its transcripts,
+configuration and timings across restarts and start an empty table. Up to 10 saved tables
+appear in separate sections below; they can be collapsed or explicitly deleted. Saving and
+deleting use encrypted local storage (`testing-tables.bin`), not plaintext. Linux requires an
+unlocked Secret Service wallet; Windows uses account-bound DPAPI encryption. A failed save
+leaves the current table intact. Unlock the wallet and **Reload saved tables** to recover
+from storage errors. Saved tables are not silently overwritten when the limit is reached.
+
+Audio stays in memory only, shared across current and saved rows under a 64 MiB budget.
+Replaying a saved row adds a new current row without changing that saved table. Removing
+the last comparison that uses a recording releases it; the audio budget can also evict
+the least recently used recording while leaving its text and timings intact. After Amber
+exits, unsaved rows and all audio are gone. Saved tables remain, but their Replay buttons
+are unavailable without the original audio. Selecting a server still sends audio or text
+to that provider, including when replaying; Testing is not a privacy bypass.
+
 ## Cleanup
 
 Between recognition and inserting (*Settings → Cleanup*):
@@ -227,7 +298,7 @@ Between recognition and inserting (*Settings → Cleanup*):
 - **Smart cleanup** (optional): a language model resolves self-corrections ("um drei, nee
   stopp, um vier" → "um vier"), false starts and punctuation. Locally with llama.cpp
   `b11981` and Qwen3 4B Instruct 2507 (Apache 2.0; CUDA 641 MB + model 2.4 GB, ~3 GB of
-  graphics memory), or through Groq, OpenAI or an own server with the Engine page's key.
+  graphics memory), or through Groq, OpenAI, Tinfoil.sh or an own server with a key managed in Credentials.
   The prompt puts hard rules first - the dictation's language (named when one is chosen or
   clear from its words), every negation, number, name and condition kept, never an answer -
   then what to fix, self-corrections ("um drei, nee, um vier" → "um vier"), the style with

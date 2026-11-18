@@ -6,6 +6,11 @@ pub const APPROVED_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explo
 pub const VALUE_NAME: &str = "Amber";
 pub const ARG: &str = "--autostart";
 
+/// Desktop shortcut invocations must never open or activate the settings window.
+pub fn background_control(args: &[String]) -> bool {
+    args.iter().any(|a| matches!(a.as_str(), "--toggle" | "--cancel" | "--insert-last"))
+}
+
 /// The settings page a start asks for: `amber.exe --settings phone` (or `--settings=phone`)
 /// opens the settings there - a second start hands it to the running Amber. A page name is
 /// lowercase letters only; the settings ignore one they do not know.
@@ -34,6 +39,15 @@ pub fn disabled_in_task_manager(approved: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_controls_do_not_request_a_foreground_window() {
+        for action in ["--toggle", "--cancel", "--insert-last"] {
+            assert!(background_control(&["amber".into(), action.into()]));
+        }
+        assert!(!background_control(&["amber".into()]));
+        assert!(!background_control(&["amber".into(), "--settings=recorder".into()]));
+    }
 
     #[test]
     fn a_start_can_ask_for_a_settings_page() {

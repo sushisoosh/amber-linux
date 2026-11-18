@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Overview } from "../../shared/types";
 import type { PageProps } from "../App";
 import { Row, Section, Segmented, Switch } from "../ui";
 import { DownloadItem, StatusLabel, useLocal } from "../downloads";
+import { CredentialLink } from "./Credentials";
 
 const LANGUAGES: [string, string][] = [
   ["de", "German"],
@@ -30,7 +30,7 @@ export function EnginePage(p: PageProps) {
         </button>
         <button className={`card ${s.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.engine = "server"))}>
           <div className="title">Server with API key</div>
-          <div className="hint">Groq, OpenAI or your own server. Your recording is sent there.</div>
+          <div className="hint">Groq, OpenAI, Tinfoil.sh or your own server. Your recording is sent there.</div>
         </button>
       </div>
       {s.engine === "local" ? <LocalEngine {...p} /> : <ServerEngine {...p} />}
@@ -181,66 +181,22 @@ function LocalEngine({ s, save, toast, ov }: PageProps) {
   );
 }
 
-function ServerEngine({ s, save, ov, refresh, toast, desktop }: PageProps) {
-  const linux = ov.platform === "linux";
+function ServerEngine({ s, save, ov, go }: PageProps) {
   const provider = ov.providers.find((p) => p.id === s.server.provider) ?? ov.providers[0];
-  const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(s.server.baseUrl);
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
   const [testing, setTesting] = useState(false);
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [savingKey, setSavingKey] = useState(false);
-  const [customKeyStatus, setCustomKeyStatus] = useState<boolean | null>(null);
   useEffect(() => setBaseUrl(s.server.baseUrl), [s.server.baseUrl]);
-  useEffect(() => { setTest(null); setKeyError(null); setKey(""); }, [provider.id, baseUrl]);
+  useEffect(() => setTest(null), [provider.id, baseUrl]);
 
   const custom = provider.id === "custom";
-  const hasKey = linux && custom ? customKeyStatus === true : provider.hasKey;
-
-  useEffect(() => {
-    if (!linux || !custom) return;
-    let disposed = false;
-    setCustomKeyStatus(null);
-    void invoke<boolean>("has_api_key", { provider: "custom", baseUrl: baseUrl.trim() }).then((available) => {
-      if (!disposed) setCustomKeyStatus(available);
-    }).catch((e) => {
-      if (!disposed) setKeyError(`Could not check this server's key: ${e}`);
-    });
-    return () => { disposed = true; };
-  }, [linux, custom, baseUrl]);
-
-  const saveKey = async (value: string | null) => {
-    setKeyError(null);
-    setSavingKey(true);
-    try {
-      if (custom) {
-        await save((x) => (x.server.baseUrl = baseUrl.trim()));
-        const current = (await invoke<Overview>("get_overview")).settings.server;
-        if (current.provider !== provider.id || current.baseUrl !== baseUrl.trim()) {
-          throw new Error("The server address was not saved. The key was not changed.");
-        }
-      }
-      await invoke("set_api_key", { provider: provider.id, key: value, ...(custom ? { baseUrl: baseUrl.trim() } : {}) });
-      setKey("");
-      toast(value ? "Key saved." : "Key removed.", true);
-    } catch (e) {
-      if (linux) setKeyError(`Key storage could not be confirmed. A changed key may still be active for this session only. ${e}`);
-      toast(String(e));
-    } finally {
-      await Promise.all([
-        refresh(), desktop.refresh(),
-        linux && custom ? invoke<boolean>("has_api_key", { provider: "custom", baseUrl: baseUrl.trim() }).then(setCustomKeyStatus) : Promise.resolve(),
-      ]).catch((e) => toast(`Could not refresh key status: ${e}`));
-      setSavingKey(false);
-    }
-  };
 
   const runTest = async () => {
     setTesting(true);
     setTest(null);
     try {
-      const ms = await invoke<number>("test_server", { provider: provider.id, baseUrl, key: key || null });
-      setTest({ ok: true, text: `Connected - ${ms} ms.${key ? " Save the key to use it." : ""}` });
+      const ms = await invoke<number>("test_server", { provider: provider.id, baseUrl, key: null });
+      setTest({ ok: true, text: `Model catalog reachable - ${ms} ms. This does not verify inference or keys for public catalogs.` });
     } catch (e) {
       setTest({ ok: false, text: String(e) });
     }
@@ -254,7 +210,6 @@ function ServerEngine({ s, save, ov, refresh, toast, desktop }: PageProps) {
           value={provider.id}
           options={ov.providers.map((p) => [p.id, p.name] as [string, string])}
           onChange={(id) => {
-            if (savingKey) return;
             void save((x) => {
               x.server.provider = id;
               x.server.model = ov.providers.find((p) => p.id === id)?.models[0]?.id ?? x.server.model;
@@ -262,13 +217,13 @@ function ServerEngine({ s, save, ov, refresh, toast, desktop }: PageProps) {
           }}
         />
       </Row>
+      {provider.id === "tinfoil" && <Row label="Tinfoil connection" hint="Uses https://inference.tinfoil.sh/v1 for audio. HTTPS only: unlike Amber for Android, this desktop client does not verify Tinfoil's enclave attestation. The same saved key is available for cleanup." />}
       {custom && (
         <Row label="Address" hint="An OpenAI-compatible HTTPS base URL. Plain HTTP is allowed only on a literal loopback address, such as http://127.0.0.1:8000/v1.">
           <input
             type="text"
             style={{ width: 300 }}
             value={baseUrl}
-            disabled={savingKey}
             placeholder="https://…/v1"
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={() => baseUrl !== s.server.baseUrl && save((x) => (x.server.baseUrl = baseUrl.trim()))}
@@ -293,46 +248,27 @@ function ServerEngine({ s, save, ov, refresh, toast, desktop }: PageProps) {
           />
         )}
       </Row>
-      <Row
-        label="API key"
-        hint={
-          <>
-            {hasKey ? linux ? "A key is available for this session. See credential storage status below for persistence." : "A key is saved (encrypted for your Windows account)." : provider.needsKey ? linux ? "No key available yet." : "No key saved yet." : "Optional for your own server."}{" "}
-            {linux && custom && "Keys are scoped to the server's scheme, host and port. "}
-            {provider.keyUrl && (
-              <a className="link" onClick={() => invoke("open_url", { url: provider.keyUrl })}>
-                Get a key
-              </a>
-            )}
-          </>
-        }
-      >
-        <input type="password" style={{ width: 220 }} value={key} disabled={savingKey} placeholder={hasKey ? "••••••••" : "Paste key"} onChange={(e) => setKey(e.target.value)} />
-        <button className="btn primary" disabled={savingKey || !key.trim()} onClick={() => saveKey(key)}>
-          {savingKey ? "Saving..." : "Save"}
-        </button>
-        {hasKey && (
-          <button className="btn danger" disabled={savingKey} onClick={() => saveKey(null)}>
-            Remove
-          </button>
-        )}
+      <CredentialLink provider={provider} go={go} />
+      <Row label="Audio upload" hint="WAV is lossless. Ogg Opus uses lossy voice compression at about 32 kbps: smaller uploads, but recognition may change. Only server recognition is compressed; local recognition, fallback and retained test recordings keep the original WAV. No automatic retry with another format.">
+        <select aria-label="Audio upload" value={s.server.uploadFormat} onChange={(e) => save((x) => (x.server.uploadFormat = e.target.value as "wav" | "opus"))}>
+          <option value="wav">WAV (lossless, default)</option>
+          <option value="opus">Ogg Opus (lossy, ~32 kbps)</option>
+        </select>
       </Row>
-      {linux && <>
-        {keyError && <div className="row"><div className="note error" role="alert">{keyError}</div></div>}
-        <Row label="Credential storage" hint={desktop.storage?.credentials ?? desktop.error ?? "Checking secure storage..."}>
-          <button className="btn" disabled={desktop.loading || savingKey} onClick={() => void Promise.all([
-            refresh(), desktop.refresh(),
-            custom ? invoke<boolean>("has_api_key", { provider: "custom", baseUrl: baseUrl.trim() }).then(setCustomKeyStatus) : Promise.resolve(),
-          ]).catch((e) => toast(String(e)))}>Refresh</button>
-        </Row>
-      </>}
+      {s.server.uploadFormat === "opus" && <Row label="Format compatibility" hint={custom
+        ? "Amber servers must advertise Opus; otherwise their supported WAV format is used. Older Amber catalogs without an audio list imply WAV. Other OpenAI-compatible servers receive the requested Ogg Opus format without a guarantee of support. If rejected, select WAV yourself; Amber will not retry a paid request."
+        : provider.id === "tinfoil"
+          ? s.server.model === "voxtral-small-24b"
+            ? "Tinfoil's published Voxtral server source accepts Ogg Opus. Live authenticated inference has not been verified here; its model page lists MP3/WAV. A public model catalog does not confirm format support or validate your key."
+            : "Ogg Opus support for this Tinfoil model is unverified; the reviewed server source applies to Voxtral. Select WAV for compatibility. Amber will not retry automatically with WAV."
+          : "The provider's transcription API documents Ogg input. Live authenticated inference with this encoder has not been verified here. A reachable catalog does not confirm format support."} />}
       <Row
         label="Fall back to this PC"
         hint="When the server cannot be reached (offline, down), the recording is recognized by the model set under “On this PC” instead of being lost - if it is downloaded. Never the other way round."
       >
         <Switch on={s.server.localFallback} onChange={(v) => save((x) => (x.server.localFallback = v))} />
       </Row>
-      <Row label="Connection" hint={test ? <span className={`note ${test.ok ? "ok" : "error"}`}>{test.text}</span> : "Checks the address and the key without sending audio."}>
+      <Row label="Connection" hint={test ? <span className={`note ${test.ok ? "ok" : "error"}`}>{test.text}</span> : "Fetches the model catalog without sending audio. Public catalogs, including Tinfoil's, do not validate the API key."}>
         <button className="btn" disabled={testing} onClick={runTest}>
           {testing ? "Testing…" : "Test connection"}
         </button>

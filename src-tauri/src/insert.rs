@@ -2,8 +2,8 @@
 //! started is remembered; if another program is in front by the time the text is ready, the
 //! text goes on the clipboard instead of into the wrong place. Otherwise it is pasted
 //! (clipboard + Ctrl+V) or typed (Unicode keystrokes).
-//! Linux uses explicit Copy or restricted, user-requested X11 paste; it never auto-pastes
-//! when the original editable field cannot be verified.
+//! Linux defaults to review/Copy. Opted-in completion copies even without a usable target;
+//! Ctrl+V remains restricted to known native X11 editors and unchanged observable targets.
 
 #[cfg(not(target_os = "linux"))]
 use amber_core::settings::InsertMethod;
@@ -22,8 +22,7 @@ pub struct Target {
 pub enum Outcome {
     Pasted,
     Typed,
-    /// Windows would swallow the keystrokes (an elevated window); the text is on the
-    /// clipboard instead.
+    /// Automatic paste is unavailable or unsafe; the text is on the clipboard instead.
     OnClipboard(String),
 }
 
@@ -447,19 +446,28 @@ pub fn remember() -> Option<Target> {
     crate::linux_desktop::remember_target().map(|x11| Target { x11 })
 }
 
-/// X11 window identity is not editable-field identity, even in the same browser window.
 #[cfg(target_os = "linux")]
-pub fn auto_insert_available() -> bool {
-    false
+pub fn insert(text: &str, settings: &InsertSettings, target: Option<Target>) -> Result<Outcome, String> {
+    deliver(text, settings, target, &amber_core::engine::CancellationToken::default())
 }
 
+/// Production completion must pass its session token, including when no target was captured.
+/// Copy consent is independent of paste eligibility; cancellation is checked at publication.
 #[cfg(target_os = "linux")]
-pub fn insert(_text: &str, _settings: &InsertSettings, _target: Option<Target>) -> Result<Outcome, String> {
-    Err("Automatic insertion is unavailable: the original editable field cannot be verified. Review the result, then Copy and paste manually.".into())
+pub fn deliver(
+    text: &str,
+    settings: &InsertSettings,
+    target: Option<Target>,
+    cancel: &amber_core::engine::CancellationToken,
+) -> Result<Outcome, String> {
+    if !amber_core::insertion::paste_on_completion(settings, true, false) {
+        return Err("Copy and paste on completion is off. Review the result, then Copy and paste manually.".into());
+    }
+    crate::linux_desktop::deliver(text, target.map(|t| t.x11), cancel)
 }
 
-/// Only for an explicit user action, with a target captured at that action, not at recording
-/// start. Success means submitted, never confirmed. Clipboard replacement is intentional.
+/// Shared guarded delivery for explicit paste and opted-in completion. The caller captures
+/// the target before any UI. Success means submitted, never confirmed; no focus switching.
 #[cfg(target_os = "linux")]
 pub fn paste_explicit(text: &str, target: Target) -> Result<crate::linux_desktop::Submission, String> {
     crate::linux_desktop::paste_explicit(text, target.x11)
@@ -475,12 +483,15 @@ mod linux_tests {
     use super::*;
 
     #[test]
-    fn automatic_delivery_and_enter_remain_disabled() {
-        assert!(!auto_insert_available());
+    fn delivery_needs_opt_in_and_never_presses_enter() {
         for method in [amber_core::settings::InsertMethod::Paste, amber_core::settings::InsertMethod::Type] {
             let settings = InsertSettings { method, ..InsertSettings::default() };
-            assert!(insert("Never deliver automatically", &settings, None).unwrap_err().contains("Automatic insertion is unavailable"));
+            assert!(insert("Never deliver without consent", &settings, None).unwrap_err().contains("off"));
         }
+        let settings = InsertSettings { paste_on_completion: true, ..InsertSettings::default() };
+        let cancel = amber_core::engine::CancellationToken::default();
+        cancel.cancel();
+        assert!(deliver("Never publish cancelled text", &settings, None, &cancel).unwrap_err().contains("cancelled"));
         assert!(press_enter(None).unwrap_err().contains("disabled on Linux"));
     }
 }

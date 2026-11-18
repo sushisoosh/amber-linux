@@ -8,11 +8,12 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const directory = await mkdtemp(join(tmpdir(), "amber-ui-tests-"));
 try {
-  const output = join(directory, "linux-ui.test.cjs");
+  const suites = ["linux-ui", "testing-ui"];
   await build({
     absWorkingDir: root,
-    entryPoints: ["src/settings/linux-ui.test.tsx"],
-    outfile: output,
+    entryPoints: suites.map((suite) => `src/settings/${suite}.test.tsx`),
+    outdir: directory,
+    outExtension: { ".js": ".cjs" },
     bundle: true,
     platform: "node",
     format: "cjs",
@@ -21,7 +22,7 @@ try {
     tsconfig: "tsconfig.json",
     sourcemap: "inline",
   });
-  const result = spawnSync(process.execPath, ["--enable-source-maps", "--test", output], { cwd: root, stdio: "inherit" });
+  const result = spawnSync(process.execPath, ["--enable-source-maps", "--test", ...suites.map((suite) => join(directory, `${suite}.test.cjs`))], { cwd: root, stdio: "inherit" });
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
 } finally {

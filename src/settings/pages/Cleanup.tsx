@@ -3,11 +3,12 @@
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { ChatProvider, CleanupPreview, Overview, WritingStyle } from "../../shared/types";
+import type { ChatProvider, CleanupPreview, WritingStyle } from "../../shared/types";
 import type { PageProps } from "../App";
 import { DownloadItem, StatusLabel, useLocal } from "../downloads";
 import { Row, Section, Segmented, Switch } from "../ui";
 import { STYLES } from "./Programs";
+import { CredentialLink } from "./Credentials";
 
 const EXAMPLE = "Ähm, lass uns morgen um drei Uhr treffen, nee stopp, um vier Uhr, äh, im Café weil es da ruhig ist.";
 
@@ -18,7 +19,7 @@ export function CleanupPage(p: PageProps) {
   return (
     <>
       <h1>Cleanup</h1>
-      <p className="lead">{linux ? "Optional processing before you review the result. Rules run on this PC; smart cleanup uses the selected local model or sends recognized text to your chosen server." : "What happens to your words before they are inserted. Hesitation sounds go out by rule; a language model can also untangle what you corrected while speaking."}</p>
+      <p className="lead">{linux ? "Optional processing before you review or paste the result. Rules run on this PC; smart cleanup uses the selected local model or sends recognized text to your chosen server." : "What happens to your words before they are inserted. Hesitation sounds go out by rule; a language model can also untangle what you corrected while speaking."}</p>
       <Section>
         <Row label="Remove filler words" hint="äh, ähm, öhm, hm … - by fixed rules, on this PC, instantly. Real words like “um” stay.">
           <Switch on={c.fillers} onChange={(v) => save((x) => (x.cleanup.fillers = v))} />
@@ -31,7 +32,7 @@ export function CleanupPage(p: PageProps) {
         </Row>
         <Row
           label="Smart cleanup"
-           hint={linux ? "A language model can resolve self-corrections, false starts and punctuation. If it fails or changes too much, the recognized text is retained for review." : "A language model resolves self-corrections (“at three, no wait, at four” → “at four”), false starts and punctuation. If it fails or changes too much, the text goes in as recognized."}
+           hint={linux ? "A language model can resolve self-corrections, false starts and punctuation. If it fails or changes too much, the recognized text is retained." : "A language model resolves self-corrections (“at three, no wait, at four” → “at four”), false starts and punctuation. If it fails or changes too much, the text goes in as recognized."}
         >
           <Switch on={c.smart} onChange={(v) => save((x) => (x.cleanup.smart = v))} />
         </Row>
@@ -45,7 +46,7 @@ export function CleanupPage(p: PageProps) {
             </button>
             <button className={`card ${c.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.cleanup.engine = "server"))}>
               <div className="title">Server with API key</div>
-              <div className="hint">Groq, OpenAI or your own server. The text is sent there.</div>
+              <div className="hint">Groq, OpenAI, Tinfoil.sh or your own server. The text is sent there.</div>
             </button>
           </div>
           {c.engine === "local" ? <LocalModel {...p} /> : <ServerModel {...p} />}
@@ -102,59 +103,15 @@ function LocalModel({ s, save, toast, ov }: PageProps) {
   );
 }
 
-function ServerModel({ s, save, go, ov, refresh, desktop, toast }: PageProps) {
-  const linux = ov.platform === "linux";
+function ServerModel({ s, save, go, ov, toast }: PageProps) {
   const [providers, setProviders] = useState<ChatProvider[]>([]);
   const [baseUrl, setBaseUrl] = useState(s.cleanup.baseUrl);
-  const [key, setKey] = useState("");
-  const [hasCustomKey, setHasCustomKey] = useState<boolean | null>(null);
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [savingKey, setSavingKey] = useState(false);
-  const effectiveBase = baseUrl.trim() || s.server.baseUrl;
   useEffect(() => setBaseUrl(s.cleanup.baseUrl), [s.cleanup.baseUrl]);
   useEffect(() => {
-    void invoke<ChatProvider[]>("chat_providers").then(setProviders);
+    void invoke<ChatProvider[]>("chat_providers").then(setProviders).catch((e) => toast(`Could not load cleanup providers: ${e}`));
   }, []);
-  useEffect(() => {
-    if (!linux || s.cleanup.provider !== "custom") return;
-    let disposed = false;
-    setKey("");
-    setHasCustomKey(null);
-    setKeyError(null);
-    void invoke<boolean>("has_api_key", { provider: "custom", baseUrl: effectiveBase }).then((available) => {
-      if (!disposed) setHasCustomKey(available);
-    }).catch((e) => {
-      if (!disposed) setKeyError(`Could not check this server's key: ${e}`);
-    });
-    return () => { disposed = true; };
-  }, [linux, s.cleanup.provider, effectiveBase]);
   const c = s.cleanup;
   const provider = providers.find((x) => x.id === c.provider);
-
-  const saveCustomKey = async (value: string | null) => {
-    setSavingKey(true);
-    setKeyError(null);
-    try {
-      // Blur also saves the address; verify its committed value before binding a credential.
-      await save((x) => (x.cleanup.baseUrl = baseUrl.trim()));
-      const current = (await invoke<Overview>("get_overview")).settings;
-      if (current.cleanup.provider !== "custom" || current.cleanup.baseUrl !== baseUrl.trim() || (current.cleanup.baseUrl || current.server.baseUrl) !== effectiveBase) {
-        throw new Error("The cleanup address was not saved. The key was not changed.");
-      }
-      await invoke("set_api_key", { provider: "custom", baseUrl: effectiveBase, key: value });
-      setKey("");
-      toast(value ? "Key saved for this server's origin." : "Key removed for this server's origin.", true);
-    } catch (e) {
-      setKeyError(`Key update was not confirmed. If credential storage failed, the changed key may be active for this session only. ${e}`);
-    } finally {
-      await Promise.all([
-        refresh(),
-        desktop.refresh(),
-        invoke<boolean>("has_api_key", { provider: "custom", baseUrl: effectiveBase }).then(setHasCustomKey),
-      ]).catch((e) => setKeyError((error) => error ?? `Could not refresh key status: ${e}`));
-      setSavingKey(false);
-    }
-  };
 
   if (!provider) return null;
   return (
@@ -164,7 +121,6 @@ function ServerModel({ s, save, go, ov, refresh, desktop, toast }: PageProps) {
           value={provider.id}
           options={providers.map((x) => [x.id, x.name] as [string, string])}
           onChange={(id) => {
-            if (savingKey) return;
             void save((x) => {
               x.cleanup.provider = id;
               x.cleanup.model = providers.find((q) => q.id === id)?.models[0]?.id ?? "";
@@ -172,13 +128,13 @@ function ServerModel({ s, save, go, ov, refresh, desktop, toast }: PageProps) {
           }}
         />
       </Row>
+      {provider.id === "tinfoil" && <Row label="Tinfoil connection" hint="Uses https://inference.tinfoil.sh/v1 for cleanup text. HTTPS only: unlike Amber for Android, this desktop client does not verify Tinfoil's enclave attestation. DeepSeek and Gemma run with thinking disabled." />}
       {provider.id === "custom" && (
         <Row label="Address" hint="Empty: the speech engine's own-server address. Use HTTPS, or HTTP only on a literal loopback address.">
           <input
             type="text"
             style={{ width: 300 }}
             value={baseUrl}
-            disabled={savingKey}
             placeholder={s.server.baseUrl || "https://…/v1"}
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={() => baseUrl !== c.baseUrl && save((x) => (x.cleanup.baseUrl = baseUrl.trim()))}
@@ -198,22 +154,7 @@ function ServerModel({ s, save, go, ov, refresh, desktop, toast }: PageProps) {
           <input type="text" defaultValue={c.model} placeholder="llama3.2" onBlur={(e) => e.target.value !== c.model && save((x) => (x.cleanup.model = e.target.value.trim()))} />
         )}
       </Row>
-      {linux && provider.id === "custom" ? <>
-        <Row label="API key for this server" hint={<>Keys are scoped to scheme, host and port. A key from another server is never reused. {hasCustomKey === null ? "Key availability is not yet confirmed." : hasCustomKey ? "A key is available for this origin in the current session." : "No key is available for this origin; unauthenticated servers can leave it empty."}</>}>
-          <input type="password" style={{ width: 220 }} aria-label="Custom cleanup server API key" autoComplete="off" value={key} disabled={savingKey} placeholder={hasCustomKey ? "Key available" : "Paste key"} onChange={(e) => setKey(e.target.value)} />
-          <button className="btn primary" disabled={savingKey || !key.trim() || !effectiveBase} onClick={() => void saveCustomKey(key)}>{savingKey ? "Saving..." : "Save key"}</button>
-          {hasCustomKey && <button className="btn danger" disabled={savingKey} onClick={() => void saveCustomKey(null)}>Remove</button>}
-        </Row>
-        {keyError && <div className="row"><div className="note error" role="alert">{keyError}</div></div>}
-        <Row label="Credential storage" hint={desktop.storage?.credentials ?? desktop.error ?? "Checking secure storage..."} />
-      </> : <Row
-        label="API key"
-        hint={provider.hasKey ? `Uses the ${provider.name} key ${ov.platform === "linux" ? "available" : "saved"} on the Engine page.` : provider.id === "custom" ? "Optional for your own server." : `No ${provider.name} key yet.`}
-      >
-        <button className="btn" onClick={() => go("engine")}>
-          {provider.hasKey ? "Change" : "Add key"}
-        </button>
-      </Row>}
+      <CredentialLink provider={ov.providers.find((p) => p.id === provider.id) ?? provider} go={go} />
     </Section>
   );
 }

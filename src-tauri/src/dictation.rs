@@ -61,6 +61,8 @@ struct Inner {
     session: u64,
     recorder: Option<Recorder>,
     target: Option<Target>,
+    /// Consent at recording start, not a setting enabled while recognition was running.
+    paste_on_completion: bool,
     /// The target's program ("discord.exe"), for its profile.
     program: Option<String>,
     /// The target window's title, for terminal mode.
@@ -86,6 +88,7 @@ impl Inner {
 pub struct Dictation {
     inner: Mutex<Inner>,
     processing: AtomicBool,
+    testing: AtomicBool,
 }
 
 impl Default for Dictation {
@@ -96,6 +99,7 @@ impl Default for Dictation {
                 session: 0,
                 recorder: None,
                 target: None,
+                paste_on_completion: false,
                 program: None,
                 title: String::new(),
                 command: false,
@@ -107,6 +111,7 @@ impl Default for Dictation {
                 pending_paste: None,
             }),
             processing: AtomicBool::new(false),
+            testing: AtomicBool::new(false),
         }
     }
 }
@@ -118,7 +123,28 @@ impl Dictation {
 
     /// Recording or working on the result.
     pub fn is_active(&self) -> bool {
-        matches!(self.inner.lock().unwrap().phase, Phase::Recording | Phase::Transcribing | Phase::Inserting)
+        self.processing.load(Ordering::Acquire) || matches!(self.inner.lock().unwrap().phase, Phase::Recording | Phase::Transcribing | Phase::Inserting)
+    }
+
+    /// Share the ordinary worker gate, but never acquire a target or delivery consent.
+    fn reserve_test(&self) -> Result<bool, String> {
+        let mut inner = self.inner.lock().unwrap();
+        if matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting)
+            || self.processing.swap(true, Ordering::AcqRel) {
+            return Err("A recording is already running or finishing. Stop or cancel it first.".into());
+        }
+        inner.cancel_pending_paste();
+        inner.session += 1;
+        // The old settle timer belongs to the previous session and will no longer run.
+        let settled = matches!(inner.phase, Phase::Done | Phase::Error);
+        if settled { inner.phase = Phase::Idle; }
+        self.testing.store(true, Ordering::Release);
+        Ok(settled)
+    }
+
+    pub(crate) fn release_test(&self) {
+        self.testing.store(false, Ordering::Release);
+        self.processing.store(false, Ordering::Release);
     }
 
     pub fn phase(&self) -> Phase {
@@ -128,6 +154,13 @@ impl Dictation {
     pub fn result(&self) -> Option<DictationResult> {
         self.inner.lock().unwrap().result.clone()
     }
+}
+
+pub(crate) fn reserve_test(app: &AppHandle) -> Result<(), String> {
+    if app.state::<Core>().dictation.reserve_test()? {
+        announce(app, Phase::Idle, None);
+    }
+    Ok(())
 }
 
 pub fn clear_result(app: &AppHandle) {
@@ -169,7 +202,7 @@ pub fn insert_last_result(app: &AppHandle) {
     };
     let (result, session, cancel) = {
         let mut inner = core.dictation.inner.lock().unwrap();
-        if matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) || inner.pending_paste.is_some() {
+        if matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) || inner.pending_paste.is_some() || core.dictation.processing.load(Ordering::Acquire) {
             return;
         }
         let Some(result) = inner.result.clone() else {
@@ -271,7 +304,7 @@ pub fn start(app: &AppHandle) {
 }
 
 #[cfg(target_os = "linux")]
-pub fn start_after_desktop_ready(app: &AppHandle) {
+pub fn start_after_desktop_ready(app: &AppHandle, target: Option<Target>) {
     let session = app.state::<Core>().dictation.inner.lock().unwrap().session;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -285,16 +318,16 @@ pub fn start_after_desktop_ready(app: &AppHandle) {
             return;
         }
         // Do not resurrect a launch-time request after cancellation or another dictation.
-        start_for_session(&app, false, Some(session));
+        start_for_session(&app, false, Some(session), target);
     });
 }
 
 /// A dictation - with [command] (the command hotkey) a terminal request wherever it goes.
 pub fn start_as(app: &AppHandle, command: bool) {
-    start_for_session(app, command, None);
+    start_for_session(app, command, None, insert::remember());
 }
 
-fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u64>) {
+fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u64>, target: Option<Target>) {
     #[cfg(target_os = "linux")]
     if crate::linux_desktop::session_is_blocked() { return; }
     let core = app.state::<Core>();
@@ -315,7 +348,9 @@ fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u6
         inner.session += 1;
         inner.cancel = CancellationToken::default();
         inner.phase = Phase::Recording;
-        inner.target = insert::remember();
+        // An unobservable launch target stays unknown; never retarget after showing UI.
+        inner.target = target;
+        inner.paste_on_completion = amber_core::insertion::paste_on_completion(&settings.insert, true, false);
         inner.program = inner.target.and_then(|t| t.program());
         inner.title = inner.target.map(|t| t.title()).unwrap_or_default();
         inner.command = command;
@@ -325,14 +360,13 @@ fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u6
     };
     // The bubble answers at once; the microphone opens in the background.
     announce(app, Phase::Recording, None);
-    #[cfg(target_os = "linux")]
-    crate::bubble::open_settings(app, Some("recorder"));
 
     let app = app.clone();
     std::thread::spawn(move || {
         let core = app.state::<Core>();
         // The microphone meter in the settings would hold the device open twice.
-        drop(core.mic_test.lock().unwrap().take());
+        let meter = core.mic_test.lock().unwrap().take();
+        drop(meter);
 
         let level_app = app.clone();
         let opened = Recorder::start(&settings.microphone, move |level| {
@@ -402,7 +436,10 @@ pub fn stop(app: &AppHandle) {
         };
         inner.phase = Phase::Transcribing;
         core.dictation.processing.store(true, Ordering::Release);
-        let asked = Asked { title: std::mem::take(&mut inner.title), command: inner.command };
+        let asked = Asked {
+            title: std::mem::take(&mut inner.title), command: inner.command,
+            paste_on_completion: inner.paste_on_completion,
+        };
         (recorder, inner.target.take(), inner.program.take(), inner.session, inner.started.take(), inner.chunks.take(), asked, inner.cancel.clone())
     };
     announce(app, Phase::Transcribing, None);
@@ -428,6 +465,9 @@ pub fn stop(app: &AppHandle) {
 /// Throws the recording away (the press turned into a drag).
 pub fn cancel(app: &AppHandle) {
     let core = app.state::<Core>();
+    if core.dictation.testing.load(Ordering::Acquire) {
+        crate::testing::cancel(app);
+    }
     if let Some(meter) = core.mic_test.lock().unwrap().take() {
         std::thread::spawn(move || drop(meter));
     }
@@ -470,6 +510,7 @@ pub fn toggle(app: &AppHandle) {
 struct Asked {
     title: String,
     command: bool,
+    paste_on_completion: bool,
 }
 
 /// Terminal mode: [spoken] as a request for a shell command - by the command hotkey, a spoken
@@ -545,7 +586,10 @@ fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, pr
     }
     announce(app, Phase::Inserting, None);
     // Typed, not pasted: no clipboard, no trailing space - and never a line break or Enter.
-    let how = amber_core::settings::InsertSettings { method: amber_core::settings::InsertMethod::Type, restore_clipboard: true, trailing_space: false };
+    let how = amber_core::settings::InsertSettings {
+        method: amber_core::settings::InsertMethod::Type, trailing_space: false,
+        ..amber_core::settings::InsertSettings::default()
+    };
     let outcome = insert::insert(&typed, &how, target);
     let inserted = matches!(outcome, Ok(Outcome::Pasted | Outcome::Typed));
     core.memory.remember(&core.settings(), &format!("{request} → {typed}"), program.unwrap_or(""), "terminal", inserted, spoken_ms, 0);
@@ -678,7 +722,7 @@ fn run(
     #[cfg(target_os = "linux")]
     {
         let exposure = exposure_label(settings.engine == EngineKind::Server, remote_cleanup);
-        let result = DictationResult {
+        let mut result = DictationResult {
             text: text::compose(&cleaned, settings.insert.trailing_space),
             message: if interrupted {
                 "The microphone stopped unexpectedly, so this result may be incomplete. Review and copy; the clipboard has not been changed."
@@ -688,9 +732,24 @@ fn run(
             engine: engine.clone(),
             exposure: exposure.into(),
         };
+        if amber_core::insertion::paste_on_completion(&core.settings().insert, asked.paste_on_completion, interrupted) {
+            {
+                let mut inner = core.dictation.inner.lock().unwrap();
+                if inner.session != session || cancel.is_cancelled() { return; }
+                inner.phase = Phase::Inserting;
+            }
+            announce(app, Phase::Inserting, None);
+            result.message = match insert::deliver(&result.text, &core.settings().insert, target, cancel) {
+                Ok(Outcome::OnClipboard(message)) => message,
+                Ok(_) => "Ctrl+V submitted to the original target. Check the destination before pasting again; insertion cannot be verified. The clipboard was replaced.".into(),
+                Err(e) => format!("Paste was not confirmed: {e} The result is still available here. Check the destination before copying or trying again."),
+            };
+        }
+        let message = result.message.clone();
         if keep_result(app, session, result) {
             core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
                 prepared.spoken_ms, stopped.elapsed().as_millis() as u64);
+            crate::notify(app, "Amber", &message);
         }
         let _ = (recognize_ms, target);
     }
@@ -938,6 +997,7 @@ pub struct Picked {
     pub transcriber: Box<dyn Transcriber>,
     label: String,
     estimate_key: String,
+    metadata: amber_core::testing::Engine,
 }
 
 /// Fixed cost per request on top of the audio: a round trip, a context switch.
@@ -955,32 +1015,62 @@ fn recognize(
     learn: bool,
     cancel: &CancellationToken,
 ) -> Result<(String, String, u128), String> {
+    recognize_with_report(app, settings, wav, options, spoken_ms, learn, cancel, None)
+}
+
+pub(crate) fn recognize_for_test(app: &AppHandle, settings: &Settings, wav: &[u8], result: &mut amber_core::testing::Result, cancel: &CancellationToken) -> Result<String, String> {
+    let started = Instant::now();
+    let options = TranscribeOptions::new(&settings.language, &settings.vocabulary);
+    let recognized = recognize_with_report(app, settings, wav, &options, result.prepared_audio_ms, false, cancel, Some(result));
+    result.recognition_ms = Some(started.elapsed().as_millis() as u64);
+    recognized.map(|(raw, _, _)| raw)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recognize_with_report(
+    app: &AppHandle, settings: &Settings, wav: &[u8], options: &TranscribeOptions,
+    spoken_ms: u64, learn: bool, cancel: &CancellationToken, mut report: Option<&mut amber_core::testing::Result>,
+) -> Result<(String, String, u128), String> {
+    let _quiet = report.is_some().then(crate::diag::silence);
     cancel.check().map_err(|e| e.message)?;
     let core = app.state::<Core>();
-    let mut picked = transcriber(app, settings)?;
+    let pick = || if report.is_some() && settings.engine == EngineKind::Local {
+        local_snapshot(app, settings)
+    } else { transcriber(app, settings) };
+    let mut picked = pick()?;
     let mut t0 = Instant::now();
-    let mut result = picked.transcriber.transcribe_cancellable(wav, options, cancel);
+    let (mut result, upload) = picked.transcriber.transcribe_with_upload(wav, options, cancel);
+    if let Some(report) = report.as_deref_mut() {
+        report.attempted(picked.metadata.clone(), t0.elapsed().as_millis() as u64, result.as_ref().err().map(|e| e.message.clone()));
+        if let Some(attempt) = report.attempts.last_mut() { attempt.upload = upload; }
+    }
     cancel.check().map_err(|e| e.message)?;
 
     if let Err(e) = &result {
         // Not when the engine was switched to a server meanwhile - that stopped the local one.
-        if settings.engine == EngineKind::Local && e.kind == ErrorKind::Unreachable && core.settings().engine == EngineKind::Local {
+        if settings.engine == EngineKind::Local && e.kind == ErrorKind::Unreachable && (report.is_some() || core.settings().engine == EngineKind::Local) {
             // Restarted for another model, or crashed.
             crate::diag::warn("local engine went away during the request, trying again");
-            picked = transcriber(app, settings)?;
+            picked = if report.is_some() { local_snapshot(app, settings)? } else { transcriber(app, settings)? };
             t0 = Instant::now();
             result = picked.transcriber.transcribe_cancellable(wav, options, cancel);
+            if let Some(report) = report.as_deref_mut() {
+                report.attempted(picked.metadata.clone(), t0.elapsed().as_millis() as u64, result.as_ref().err().map(|e| e.message.clone()));
+            }
         } else if settings.engine == EngineKind::Server && e.kind.service_unavailable() && settings.server.local_fallback && local_ready(&core, settings) {
             crate::diag::warn(format!("server unavailable ({}), recognizing on this PC", e.detail));
             let server_error = e.message.clone();
-            let local_result = local(app).and_then(|p| {
+            let local_result = (if report.is_some() { local_snapshot(app, settings) } else { local(app) }).and_then(|p| {
                 let t = Instant::now();
                 let r = p.transcriber.transcribe_cancellable(wav, options, cancel).map_err(|e| e.message);
+                if let Some(report) = report.as_deref_mut() {
+                    report.attempted(p.metadata.clone(), t.elapsed().as_millis() as u64, r.as_ref().err().cloned());
+                }
                 Ok((p, t, r))
             });
             match local_result {
                 Ok((p, t, Ok(raw))) => {
-                    crate::notify(app, "Amber", "The server could not be reached - recognized on this PC instead.");
+                    if report.is_none() { crate::notify(app, "Amber", "The server could not be reached - recognized on this PC instead."); }
                     unload_after_fallback(app);
                     picked = p;
                     t0 = t;
@@ -1016,7 +1106,9 @@ fn unload_after_fallback(app: &AppHandle) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let this = LAST.fetch_add(1, Ordering::SeqCst) + 1;
     let app = app.clone();
+    let log = crate::diag::enabled();
     std::thread::spawn(move || {
+        let _quiet = (!log).then(crate::diag::silence);
         std::thread::sleep(Duration::from_secs(600));
         let core = app.state::<Core>();
         if LAST.load(Ordering::SeqCst) == this && core.settings().engine == EngineKind::Server && !core.dictation.is_active() {
@@ -1041,16 +1133,25 @@ fn local(app: &AppHandle) -> Result<Picked, String> {
 /// The local engine with [model] instead of the configured one (the phone's choice).
 fn local_model(app: &AppHandle, model: Option<&str>) -> Result<Picked, String> {
     let served = app.state::<Core>().whisper.ensure_model(app, model)?;
+    Ok(picked_local(served))
+}
+
+fn local_snapshot(app: &AppHandle, settings: &Settings) -> Result<Picked, String> {
+    Ok(picked_local(app.state::<Core>().whisper.ensure_snapshot(app, &settings.local)?))
+}
+
+fn picked_local(served: crate::whisper::Served) -> Picked {
     #[cfg(not(target_os = "linux"))]
     let slack = local::model(&served.model).filter(|m| m.short_context).map(|m| m.context_slack);
-    Ok(Picked {
+    Picked {
         #[cfg(not(target_os = "linux"))]
-        transcriber: Box::new(WhisperServerTranscriber::new(&served.url, slack)),
+        transcriber: served.snapshot_transcriber.unwrap_or_else(|| Box::new(WhisperServerTranscriber::new(&served.url, slack))),
         #[cfg(target_os = "linux")]
         transcriber: served.transcriber,
         label: format!("local {}/{}", served.runtime, served.model),
         estimate_key: estimate::key("local", &served.runtime, &served.model),
-    })
+        metadata: amber_core::testing::Engine::local(&served.runtime, &served.model),
+    }
 }
 
 /// The engine for a phone request naming [model]: a downloaded local model, the cloud model
@@ -1081,14 +1182,16 @@ pub fn transcriber(app: &AppHandle, settings: &Settings) -> Result<Picked, Strin
             providers::check_base_url(&base)?;
             let key = core.key_for(provider.id, &base).unwrap_or_default();
             if provider.needs_key && key.is_empty() {
-                return Err(format!("No API key for {} yet - add it in the settings.", provider.name));
+                return Err(format!("No API key for {} yet - add it on the Credentials page.", provider.name));
             }
-            let transcriber = OpenAiTranscriber::new(&base, &key, &settings.server.model);
+            let transcriber = OpenAiTranscriber::new(&base, &key, &settings.server.model)
+                .with_upload_format(settings.server.upload_format);
             let transcriber = if provider.id == "custom" { transcriber.with_catalog_discovery() } else { transcriber };
             Ok(Picked {
                 transcriber: Box::new(transcriber),
                 label: format!("{} {}", provider.id, settings.server.model),
                 estimate_key: estimate::key(provider.id, "", &settings.server.model),
+                metadata: amber_core::testing::Engine::server(provider.id, &base, &settings.server.model),
             })
         }
     }
@@ -1100,5 +1203,72 @@ fn exposure_label(remote_speech: bool, remote_cleanup: bool) -> &'static str {
         (true, false) => "Audio may have been sent to your configured recognition server, including before a local fallback.",
         (false, true) => "Recognition stayed local. Text may have been sent to your configured cleanup server, even if cleanup failed.",
         (false, false) => "Processed locally on this computer.",
+    }
+}
+
+// Compile and exercise the helper-backed snapshot lock on Linux without starting a helper,
+// touching a desktop, or changing the real platform backend selected by lib.rs.
+#[cfg(all(test, target_os = "linux"))]
+#[allow(dead_code)]
+#[path = "whisper.rs"]
+mod windows_whisper_tests;
+
+#[cfg(test)]
+mod testing_tests {
+    use super::*;
+
+    #[test]
+    fn testing_reserves_worker_without_target_or_delivery_and_cancels_pending_paste() {
+        let dictation = Dictation::default();
+        let pending = CancellationToken::default();
+        dictation.inner.lock().unwrap().pending_paste = Some(pending.clone());
+        assert!(dictation.reserve_test().is_ok());
+        assert!(dictation.is_active());
+        assert!(pending.is_cancelled());
+        assert!(dictation.reserve_test().is_err());
+        let inner = dictation.inner.lock().unwrap();
+        assert!(inner.target.is_none());
+        assert!(!inner.paste_on_completion);
+        assert!(inner.result.is_none());
+        assert_eq!(inner.phase, Phase::Idle);
+        drop(inner);
+        dictation.release_test();
+        assert!(!dictation.is_active());
+        assert!(dictation.reserve_test().is_ok());
+    }
+
+    #[test]
+    fn testing_cannot_overlap_an_ordinary_recording_inference_or_insertion() {
+        for phase in [Phase::Recording, Phase::Transcribing, Phase::Inserting] {
+            let dictation = Dictation::default();
+            dictation.inner.lock().unwrap().phase = phase;
+            assert!(dictation.reserve_test().is_err());
+            assert!(!dictation.processing.load(Ordering::Acquire));
+            assert!(!dictation.testing.load(Ordering::Acquire));
+        }
+        let dictation = Dictation::default();
+        dictation.processing.store(true, Ordering::Release);
+        assert!(dictation.reserve_test().is_err());
+        assert!(dictation.processing.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn testing_settles_transient_phases_but_preserves_a_ready_result() {
+        for phase in [Phase::Done, Phase::Error, Phase::Ready, Phase::Idle] {
+            let dictation = Dictation::default();
+            {
+                let mut inner = dictation.inner.lock().unwrap();
+                inner.phase = phase;
+                inner.session = 7;
+                inner.result = Some(DictationResult { text: "Retained ordinary result".into(), message: String::new(), engine: "local".into(), exposure: String::new() });
+            }
+            let transient = matches!(phase, Phase::Done | Phase::Error);
+            assert_eq!(dictation.reserve_test().unwrap(), transient, "announce only a real transition");
+            assert_eq!(dictation.phase(), if transient { Phase::Idle } else { phase });
+            assert_eq!(dictation.inner.lock().unwrap().session, 8);
+            assert_eq!(dictation.result().unwrap().text, "Retained ordinary result");
+            dictation.release_test();
+            assert_eq!(dictation.phase(), if transient { Phase::Idle } else { phase });
+        }
     }
 }

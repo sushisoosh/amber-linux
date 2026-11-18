@@ -35,7 +35,7 @@ struct Running {
 
 impl Running {
     fn endpoint(&self) -> Endpoint {
-        Endpoint { url: format!("http://127.0.0.1:{}", self.port), key: self.api_key.clone() }
+        Endpoint { url: format!("http://127.0.0.1:{}", self.port), key: self.api_key.clone(), runtime: self.key.runtime.clone(), model: self.key.model.clone() }
     }
 }
 
@@ -43,6 +43,8 @@ impl Running {
 pub struct Endpoint {
     pub url: String,
     pub key: String,
+    pub runtime: String,
+    pub model: String,
 }
 
 #[derive(Default)]
@@ -104,7 +106,9 @@ impl Llm {
             return;
         }
         let app = app.clone();
+        let log = crate::diag::enabled();
         std::thread::spawn(move || {
+            let _quiet = (!log).then(crate::diag::silence);
             let llm = &app.state::<Core>().llm;
             let _ = llm.ensure(&app);
             llm.loading.store(false, Ordering::SeqCst);
@@ -122,12 +126,21 @@ impl Llm {
     /// Like [ensure], with [model] instead of the configured one - what the phone chose, also
     /// while the PC itself cleans up in the cloud.
     pub fn ensure_model(&self, app: &AppHandle, model: Option<&str>) -> Result<Endpoint, String> {
+        self.ensure_with(app, model, None)
+    }
+
+    fn ensure_with(&self, app: &AppHandle, model: Option<&str>, snapshot: Option<&Settings>) -> Result<Endpoint, String> {
+        let mut running = self.running.lock().unwrap();
+        self.ensure_locked(app, model, snapshot, &mut running)
+    }
+
+    /// Caller can retain the model lock through a test request, not just model setup.
+    fn ensure_locked(&self, app: &AppHandle, model: Option<&str>, snapshot: Option<&Settings>, running: &mut Option<Running>) -> Result<Endpoint, String> {
         // The Cleanup page and the retry pause are about the PC's own model, not a phone's.
         let own = model.is_none();
-        let mut running = self.running.lock().unwrap();
         let core = app.state::<Core>();
         let layout = &core.paths.layout;
-        let settings = core.settings();
+        let settings = snapshot.cloned().unwrap_or_else(|| core.settings());
         if model.is_none() && !wants_local(&settings) {
             // Switched off (or to a server) while this waited for the lock.
             if let Some(mut r) = running.take() {
@@ -314,7 +327,7 @@ pub fn cleaner(app: &AppHandle, s: &Settings, wait: bool) -> Result<ChatCleaner,
             // its scheme, host and effective port match the credential's saved origin.
             let key = app.state::<Core>().key_for(provider.id, &base).unwrap_or_default();
             if provider.needs_key && key.is_empty() {
-                return Err(format!("No API key for {} - add it on the Engine page.", provider.name));
+                return Err(format!("No API key for {} - add it on the Credentials page.", provider.name));
             }
             if c.model.trim().is_empty() {
                 return Err("No chat model chosen for the cleanup.".into());
@@ -383,10 +396,43 @@ pub fn tidy(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Pr
 /// The third result conservatively records a configured remote cleanup attempt, even on
 /// failure/cancellation. It must not be inferred from whether the returned text changed.
 pub fn tidy_cancellable(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken) -> (String, Option<String>, bool) {
-    tidy_with_cleaner(s, recognized, profile, snippets, cancel, || cleaner(app, s, false))
+    tidy_with_cleaner(s, recognized, profile, snippets, cancel, true, || cleaner(app, s, false).map(|c| (c, ())))
 }
 
-fn tidy_with_cleaner(s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken, make_cleaner: impl FnOnce() -> Result<ChatCleaner, String>) -> (String, Option<String>, bool) {
+/// Tests use the same rules and smart cleanup, without app profiles or snippet expansion.
+/// Unlike live dictation, wait for a cold local model and include its load in the timing.
+pub fn tidy_for_test(app: &AppHandle, s: &Settings, result: &mut amber_core::testing::Result, cancel: &CancellationToken) {
+    use amber_core::testing::Engine;
+    let started = Instant::now();
+    let recognized = amber_core::text::clean(&result.raw);
+    let empty = by_rule(s, &recognized).is_empty();
+    let core = app.state::<Core>();
+    let (text, error, remote) = tidy_with_cleaner(s, &recognized, None, false, cancel, false, || {
+        let c = &s.cleanup;
+        let (cleaner, engine, lease) = match c.engine {
+            EngineKind::Local => {
+                let mut running = core.llm.running.lock().unwrap();
+                cancel.check().map_err(|e| e.message)?;
+                let endpoint = core.llm.ensure_locked(app, Some(&c.local_model), Some(s), &mut running)?;
+                let engine = Engine::local(&endpoint.runtime, &endpoint.model);
+                (ChatCleaner::new(&endpoint.url, &endpoint.key, &endpoint.model, None), engine, Some(running))
+            }
+            EngineKind::Server => {
+                let cleaner = cleaner(app, s, true)?;
+                let provider = providers::by_id(&c.provider).ok_or("Unknown cleanup provider.")?;
+                let custom = if c.base_url.trim().is_empty() { &s.server.base_url } else { &c.base_url };
+                (cleaner, Engine::server(provider.id, &providers::effective_base_url(provider, custom), &c.model), None)
+            }
+        };
+        result.cleanup_engine = Some(engine);
+        Ok((cleaner, lease))
+    });
+    result.cleaned(text, error, remote, started.elapsed().as_millis() as u64, empty);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken, log: bool, make_cleaner: impl FnOnce() -> Result<(ChatCleaner, L), String>) -> (String, Option<String>, bool) {
+    let _quiet = (!log).then(crate::diag::silence);
     if let Err(e) = cancel.check() {
         return (recognized.to_string(), Some(e.message), false);
     }
@@ -410,9 +456,12 @@ fn tidy_with_cleaner(s: &Settings, recognized: &str, profile: Option<&Profile>, 
         language: languages.fixed(),
     };
     let mut remote_attempted = false;
-    // Never waits for a model that is still loading. Mark remote exposure before the call,
+    // Ordinary dictation skips loading models; tests can wait and retain a model lease.
+    // Mark remote exposure before the call,
     // not after success: a failed or cancelled HTTP request may already have sent the text.
-    let result = cancel.check().map_err(|e| e.message).and_then(|_| make_cleaner()).and_then(|c| {
+    let result = cancel.check().map_err(|e| e.message).and_then(|_| make_cleaner()).and_then(|(c, _lease)| {
+        // A local test owns its model through the request and cancellation checks. Ordinary
+        // cleanup passes (), preserving its existing non-pinning behavior.
         cancel.check().map_err(|e| e.message)?;
         remote_attempted = s.cleanup.engine == EngineKind::Server;
         let cleaned = c.clean_cancellable(&text, &ask, cancel).map_err(|e| e.message)?;
@@ -479,18 +528,18 @@ mod tests {
     fn skipped_cleanup_and_precancellation_do_not_expose_text() {
         let mut s = settings(EngineKind::Server);
         let cancel = CancellationToken::default();
-        let no_client = || -> Result<ChatCleaner, String> { panic!("must not construct a cleaner") };
+        let no_client = || -> Result<(ChatCleaner, ()), String> { panic!("must not construct a cleaner") };
         s.cleanup.smart = false;
-        let (_, why, remote) = tidy_with_cleaner(&s, "Hello.", None, true, &cancel, no_client);
+        let (_, why, remote) = tidy_with_cleaner(&s, "Hello.", None, true, &cancel, true, no_client);
         assert!(why.is_none() && !remote);
         s.cleanup.smart = true;
-        let (_, why, remote) = tidy_with_cleaner(&s, "", None, true, &cancel, no_client);
+        let (_, why, remote) = tidy_with_cleaner(&s, "", None, true, &cancel, true, no_client);
         assert!(why.is_none() && !remote);
         s.snippets.push(amber_core::snippets::Snippet { trigger: "signature".into(), text: "Saved text".into() });
-        let result = tidy_with_cleaner(&s, "Signature.", None, true, &cancel, no_client);
+        let result = tidy_with_cleaner(&s, "Signature.", None, true, &cancel, true, no_client);
         assert_eq!(result, ("Saved text".into(), None, false));
         cancel.cancel();
-        let (text, why, remote) = tidy_with_cleaner(&s, "Signature.", None, true, &cancel, no_client);
+        let (text, why, remote) = tidy_with_cleaner(&s, "Signature.", None, true, &cancel, true, no_client);
         assert_eq!(text, "Signature.");
         assert!(why.is_some() && !remote);
     }
@@ -499,7 +548,7 @@ mod tests {
     fn missing_configuration_keeps_rules_without_remote_exposure() {
         let s = settings(EngineKind::Server);
         let text = "Please send the report tomorrow.";
-        let result = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), || Err("No chat model chosen.".into()));
+        let result = tidy_with_cleaner::<()>(&s, text, None, false, &CancellationToken::default(), true, || Err("No chat model chosen.".into()));
         assert_eq!(result, (by_rule(&s, text), Some("No chat model chosen.".into()), false));
     }
 
@@ -511,13 +560,17 @@ mod tests {
         let trigger = "private snippet trigger test";
         let body = "private snippet body test";
         s.snippets.push(amber_core::snippets::Snippet { trigger: trigger.into(), text: body.into() });
-        let result = tidy_with_cleaner(&s, trigger, None, true, &CancellationToken::default(), || panic!("snippet must not use a model"));
+        let result = tidy_with_cleaner::<()>(&s, trigger, None, true, &CancellationToken::default(), true, || panic!("snippet must not use a model"));
         assert_eq!(result, (body.into(), None, false));
         assert!(!crate::diag::entries().iter().any(|entry| entry.message.contains(trigger) || entry.message.contains(body)));
     }
 
     /// A single loopback HTTP response, never a paid provider or a model download.
     fn reply(status: u16, body: String, cancel: Option<CancellationToken>) -> (ChatCleaner, std::thread::JoinHandle<()>) {
+        reply_with(status, body, move || { if let Some(cancel) = cancel { cancel.cancel(); } })
+    }
+
+    fn reply_with(status: u16, body: String, before_reply: impl FnOnce() + Send + 'static) -> (ChatCleaner, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -544,7 +597,7 @@ mod tests {
             assert!(length > 0 && length < 100_000);
             reader.read_exact(&mut vec![0; length]).unwrap();
             drop(reader);
-            if let Some(cancel) = cancel { cancel.cancel(); }
+            before_reply();
             let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         });
         (ChatCleaner::new(&base, "test-key", "test-model", None), server)
@@ -555,7 +608,7 @@ mod tests {
         let s = settings(EngineKind::Server);
         let text = "Please send the report tomorrow.";
         let (cleaner, server) = reply(503, r#"{"error":{"message":"private echoed transcript"}}"#.into(), None);
-        let (out, why, remote) = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), || Ok(cleaner));
+        let (out, why, remote) = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), true, || Ok((cleaner, ())));
         server.join().unwrap();
         assert_eq!(out, by_rule(&s, text));
         assert!(why.is_some() && remote);
@@ -569,7 +622,7 @@ mod tests {
             let text = "Please send the report tomorrow.";
             let body = serde_json::json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}).to_string();
             let (cleaner, server) = reply(200, body, None);
-            let result = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), || Ok(cleaner));
+            let result = tidy_with_cleaner(&s, text, None, false, &CancellationToken::default(), true, || Ok((cleaner, ())));
             server.join().unwrap();
             assert_eq!(result, (text.into(), None, engine == EngineKind::Server));
         }
@@ -581,9 +634,61 @@ mod tests {
         let text = "Please send the report tomorrow.";
         let cancel = CancellationToken::default();
         let (cleaner, server) = reply(200, "{}".into(), Some(cancel.clone()));
-        let (out, why, remote) = tidy_with_cleaner(&s, text, None, false, &cancel, || Ok(cleaner));
+        let (out, why, remote) = tidy_with_cleaner(&s, text, None, false, &cancel, true, || Ok((cleaner, ())));
         server.join().unwrap();
         assert_eq!(out, by_rule(&s, text));
         assert!(why.is_some() && remote && cancel.is_cancelled());
+    }
+
+    #[test]
+    fn local_test_lease_pins_model_until_request_success_failure_or_cancellation() {
+        for (status, cancelled) in [(200, false), (503, false), (200, true)] {
+            let llm = std::sync::Arc::new(Llm::default());
+            let during_request = llm.clone();
+            let (send, recv) = std::sync::mpsc::channel();
+            let cancel = CancellationToken::default();
+            let flag = cancel.clone();
+            let text = "Please send the report tomorrow.";
+            let body = serde_json::json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}).to_string();
+            let (cleaner, server) = reply_with(status, body, move || {
+                // Settings replacement and stop both need this exact model lock.
+                send.send(during_request.running.try_lock().is_err()).unwrap();
+                if cancelled { flag.cancel(); }
+            });
+            let (out, why, remote) = tidy_with_cleaner(&settings(EngineKind::Local), text, None, false, &cancel, false, || {
+                let lease = llm.running.lock().unwrap();
+                Ok((cleaner, lease))
+            });
+            server.join().unwrap();
+            assert!(recv.recv().unwrap(), "model must stay pinned while HTTP is in flight");
+            assert!(llm.running.try_lock().is_ok(), "every exit must release the model lease");
+            assert_eq!(out, text);
+            assert_eq!(why.is_some(), status != 200 || cancelled);
+            assert!(!remote);
+        }
+    }
+
+    #[test]
+    fn test_cleanup_suppresses_counts_failures_and_factory_logs_but_production_still_logs() {
+        let mut s = settings(EngineKind::Server);
+        s.log_text = true;
+        let text = format!("{}.", "a".repeat(731));
+        let body = serde_json::json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}).to_string();
+        let (cleaner, server) = reply(200, body, None);
+        let result = tidy_with_cleaner(&s, &text, None, false, &CancellationToken::default(), false, || {
+            crate::diag::info("private-test-cleaner-factory");
+            Ok((cleaner, ()))
+        });
+        server.join().unwrap();
+        assert!(result.1.is_none());
+        let reason = "private-test-cleanup-failure";
+        let result = tidy_with_cleaner::<()>(&s, "Hello.", None, false, &CancellationToken::default(), false, || Err(reason.into()));
+        assert_eq!(result.1.as_deref(), Some(reason));
+        let entries = crate::diag::entries();
+        assert!(!entries.iter().any(|e| e.message.contains("private-test-cleaner-factory") || e.message.contains(reason) || e.message.contains("cleanup: 732 ->")));
+        assert!(!entries.iter().any(|e| e.message.contains(&text)));
+        let production = "ordinary-cleanup-failure-log-test";
+        let _ = tidy_with_cleaner::<()>(&s, "Hello.", None, false, &CancellationToken::default(), true, || Err(production.into()));
+        assert!(crate::diag::entries().iter().any(|e| e.message.contains(production)));
     }
 }

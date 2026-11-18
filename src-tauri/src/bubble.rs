@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
+#[cfg(not(target_os = "linux"))]
 use amber_core::settings::BubbleVisibility;
 #[cfg(windows)]
 use amber_core::settings::Edge;
@@ -23,6 +24,7 @@ const PAD: u32 = 14;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Out of the way for the program in front (full screen, or on the "hidden in" list).
+#[cfg(not(target_os = "linux"))]
 static SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static DRAGGING: AtomicBool = AtomicBool::new(false);
 
@@ -54,11 +56,17 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
+        .focusable(false)
         .visible(false)
         .build()?;
     #[cfg(windows)]
     if let Ok(hwnd) = window.hwnd() {
         win::make_unfocusable(hwnd.0 as isize);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+        configure_indicator(window.gtk_window()?.upcast_ref());
     }
     // Moved onto a monitor with another scale, the window is resized after the move; placing
     // it again keeps it from hanging over the right edge.
@@ -74,6 +82,60 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     sync_visibility(app, false);
     watch_foreground(app);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn configure_indicator(window: &gtk::Window) {
+    use gtk::prelude::*;
+    window.set_focus_on_map(false);
+    window.set_accept_focus(false);
+    window.set_type_hint(gtk::gdk::WindowTypeHint::Notification);
+    // GTK retains the empty input shape until realization. Tao's cursor-ignore request
+    // unwraps the GDK window, which does not exist yet for this initially hidden indicator.
+    window.input_shape_combine_region(Some(&gtk::cairo::Region::create()));
+    // Alpha alone is a black rectangle on bare X11. GTK stores this visual bounding shape
+    // before realization, independently of the empty input shape. Composited desktops keep
+    // the original alpha/sparks; no compositor or desktop configuration is changed.
+    shape_indicator(window, window.default_size().0, window.default_size().1);
+    window.connect_size_allocate(|window, size| shape_indicator(window, size.width(), size.height()));
+    window.connect_realize(|window| {
+        // GTK can discard the input shape on unrealize; retain click-through on remapping.
+        window.input_shape_combine_region(Some(&gtk::cairo::Region::create()));
+        shape_indicator(window, window.allocated_width(), window.allocated_height());
+    });
+    if let Some(screen) = gtk::prelude::WidgetExt::screen(window) {
+        let weak = window.downgrade();
+        screen.connect_composited_changed(move |_| {
+            if let Some(window) = weak.upgrade() {
+                shape_indicator(&window, window.allocated_width(), window.allocated_height());
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shape_indicator(window: &gtk::Window, width: i32, height: i32) {
+    use gtk::prelude::*;
+    let display = gtk::prelude::WidgetExt::display(window);
+    if !display.type_().name().contains("X11") {
+        return;
+    }
+    if gtk::prelude::WidgetExt::screen(window).is_some_and(|screen| screen.is_composited()) {
+        window.shape_combine_region(None);
+        return;
+    }
+    let size = width.min(height).max(1);
+    let shape = (|| -> Result<_, gtk::cairo::Error> {
+        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, size, size)?;
+        let context = gtk::cairo::Context::new(&surface)?;
+        // fire.ts: disc = 0.35 * size, ring = disc * 1.2, spark head <= disc * 0.075.
+        context.arc(size as f64 / 2.0, size as f64 / 2.0, size as f64 * 0.45, 0.0, std::f64::consts::TAU);
+        context.fill()?;
+        Ok(surface.create_region())
+    })();
+    if let Ok(Some(region)) = shape {
+        window.shape_combine_region(Some(&region));
+    }
 }
 
 /// Keeps the bubble away from full-screen programs and from the programs it is hidden in -
@@ -120,11 +182,14 @@ pub fn apply(app: &AppHandle) {
 /// Shows or hides the bubble for the current setting and whether a dictation runs.
 pub fn sync_visibility(app: &AppHandle, dictating: bool) {
     let Some(w) = app.get_webview_window(BUBBLE) else { return };
+    #[cfg(not(target_os = "linux"))]
     let show = match app.state::<Core>().settings().bubble.visibility {
         BubbleVisibility::Always => true,
         BubbleVisibility::WhileDictating => dictating,
         BubbleVisibility::Hidden => false,
     } && !SUPPRESSED.load(Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    let show = dictating && app.state::<Core>().dictation.is_active();
     #[cfg(windows)]
     if let Ok(hwnd) = w.hwnd() {
         win::show(hwnd.0 as isize, show);
@@ -142,7 +207,17 @@ pub fn place(app: &AppHandle) {
         let b = app.state::<Core>().settings().bubble;
         win::place(hwnd.0 as isize, &b.monitor, b.edge, b.y);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    if let Some(w) = app.get_webview_window(BUBBLE) {
+        if let (Ok(Some(monitor)), Ok(size)) = (w.primary_monitor(), w.outer_size()) {
+            let area = monitor.work_area();
+            let _ = w.set_position(tauri::PhysicalPosition::new(
+                area.position.x + area.size.width as i32 - size.width as i32 - 16,
+                area.position.y + area.size.height as i32 - size.height as i32 - 16,
+            ));
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = app;
 }
 

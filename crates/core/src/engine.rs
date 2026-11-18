@@ -5,6 +5,20 @@ use std::time::Duration;
 use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
 
 use reqwest::{multipart, Client};
+use crate::settings::UploadFormat;
+
+/// Per-call file payload metadata, including failed attempts. Not a count of socket bytes:
+/// an interrupted request may have sent only part of the file; multipart overhead is excluded.
+/// Zero upload bytes means no audio request was attempted; `note` explains the decision.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadStats {
+    pub format: String,
+    pub input_bytes: u64,
+    pub upload_bytes: u64,
+    pub encoding_ms: u64,
+    pub note: Option<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscribeOptions {
@@ -156,6 +170,12 @@ pub trait Transcriber: Send + Sync {
         result
     }
 
+    /// Metadata belongs to this call, including failures, never to a shared "last upload".
+    /// Local backends do not upload a compressed copy and need no metadata.
+    fn transcribe_with_upload(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> (Result<String, SttError>, Option<UploadStats>) {
+        (self.transcribe_cancellable(wav, options, cancel), None)
+    }
+
     fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
         cancel.check()?;
         let result = self.transcribe_detecting(wav, options);
@@ -268,7 +288,7 @@ pub(crate) fn response_json(status: u16, body: &[u8]) -> Result<serde_json::Valu
     serde_json::from_slice(body).map_err(|e| json_error(&e, body.len()))
 }
 
-/// Groq, OpenAI or an own server: `POST {base}/audio/transcriptions`.
+/// OpenAI-compatible providers: `POST {base}/audio/transcriptions`.
 pub struct OpenAiTranscriber {
     base_url: String,
     api_key: String,
@@ -276,6 +296,7 @@ pub struct OpenAiTranscriber {
     http: Client,
     discover: bool,
     catalog: OnceLock<Option<crate::providers::AmberCatalog>>,
+    upload_format: UploadFormat,
 }
 
 impl OpenAiTranscriber {
@@ -287,7 +308,13 @@ impl OpenAiTranscriber {
             http: client(Duration::from_secs(90), base_url.trim()),
             discover: false,
             catalog: OnceLock::new(),
+            upload_format: UploadFormat::Wav,
         }
+    }
+
+    pub fn with_upload_format(mut self, format: UploadFormat) -> Self {
+        self.upload_format = format;
+        self
     }
 
     /// Enable only for custom endpoints. No paid requests or alternate destinations are
@@ -328,11 +355,15 @@ impl OpenAiTranscriber {
         request(&self.http, req, MAX_CATALOG_BYTES, cancel)
     }
 
-    /// `GET {base}/models` answers without spending anything: is the address right and the
-    /// key accepted?
+    /// `GET {base}/models` checks reachability without sending audio or paying for inference.
+    /// Public catalogs (including Tinfoil's) do not establish whether the key is valid.
     pub fn check(&self) -> Result<(), SttError> {
         let (status, body) = self.models(&CancellationToken::default())?;
-        response_json(status, &body).map(|_| ())
+        let root = response_json(status, &body)?;
+        if !root.get("data").is_some_and(|v| v.is_array()) {
+            return Err(SttError::new(ErrorKind::BadResponse, "The server did not send a model catalog.", "not a model list"));
+        }
+        Ok(())
     }
 }
 
@@ -350,23 +381,90 @@ impl Transcriber for OpenAiTranscriber {
     }
 
     fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        self.transcribe_upload(wav, options, cancel).0
+    }
+
+    fn transcribe_with_upload(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> (Result<String, SttError>, Option<UploadStats>) {
+        let (result, upload) = self.transcribe_upload(wav, options, cancel);
+        (result.map(|(text, _)| text), Some(upload))
+    }
+}
+
+impl OpenAiTranscriber {
+    fn transcribe_upload(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> (Result<(String, Option<String>), SttError>, UploadStats) {
+        let mut upload = UploadStats {
+            format: self.upload_format.as_str().into(), input_bytes: wav.len() as u64,
+            upload_bytes: 0, encoding_ms: 0, note: Some("No audio upload was attempted.".into()),
+        };
+        let result = self.upload_request(wav, options, cancel, &mut upload);
+        (result, upload)
+    }
+
+    fn upload_request(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken, upload: &mut UploadStats) -> Result<(String, Option<String>), SttError> {
         cancel.check()?;
         validate_endpoint(&self.base_url)?;
         let catalog = if self.discover { self.discover_catalog(cancel)? } else { None };
-        if catalog.as_ref().is_some_and(|c| !c.audio.iter().any(|f| f == "wav")) {
-            return Err(SttError::new(ErrorKind::BadResponse, "This Amber server does not advertise WAV uploads.", "WAV unavailable; no upload attempted"));
+        let mut format = self.upload_format;
+        let mut format_note = None;
+        if let Some(catalog) = &catalog {
+            if !catalog.audio.iter().any(|f| f == format.as_str()) {
+                if format == UploadFormat::Opus && catalog.audio.iter().any(|f| f == "wav") {
+                    format = UploadFormat::Wav;
+                    format_note = Some("Opus was requested, but this Amber server does not advertise Opus support. Selected lossless WAV before uploading; no retry.".into());
+                } else {
+                    let message = format!("This Amber server does not advertise {} uploads. No audio was uploaded.", format.as_str().to_uppercase());
+                    upload.note = Some(message.clone());
+                    return Err(SttError::new(ErrorKind::BadResponse, message, "requested audio format unavailable; no upload attempted"));
+                }
+            }
+        } else if format == UploadFormat::Opus {
+            // Current Groq/OpenAI transcription references list Ogg. Tinfoil's published
+            // Voxtral image uses tinfoilsh/vllm-openai-audio v0.0.11, accepting Ogg/Opus.
+            // Public /models is not evidence of authenticated format support.
+            // https://console.groq.com/docs/speech-to-text
+            // https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create
+            // https://github.com/tinfoilsh/vllm-openai-audio/blob/v0.0.11/audio_proxy.py
+            format_note = Some(if self.base_url == crate::providers::TINFOIL.base_url {
+                if self.model == "voxtral-small-24b" {
+                    "Tinfoil's published Voxtral server source accepts Ogg Opus; live authenticated support is unverified. No format retry."
+                } else {
+                    "Ogg Opus support for this Tinfoil model is unverified; the reviewed proxy source applies to Voxtral. No format retry."
+                }
+            } else if [crate::providers::GROQ.base_url, crate::providers::OPENAI.base_url].contains(&self.base_url.as_str()) {
+                "The provider documents Ogg input; live inference with this encoder is unverified. No format retry."
+            } else {
+                "This endpoint has no Amber format advertisement. Explicitly requested Ogg Opus may be incompatible; no format retry."
+            }.into());
         }
+        upload.format = format.as_str().into();
+        let (part, file_bytes) = if format == UploadFormat::Opus {
+            let started = std::time::Instant::now();
+            let encoded = crate::audio::encode_ogg_opus(wav, cancel);
+            upload.encoding_ms = started.elapsed().as_millis() as u64;
+            let encoded = encoded.map_err(|e| {
+                upload.note = Some("Opus encoding did not complete. No audio upload or WAV retry was attempted.".into());
+                e
+            })?;
+            let bytes = encoded.len() as u64;
+            (multipart::Part::bytes(encoded).file_name("dictation.ogg").mime_str("audio/ogg").expect("static mime"), bytes)
+        } else { (wav_part(wav), wav.len() as u64) };
         let model = if self.model.trim().is_empty() {
             catalog.as_ref().and_then(|c| c.default_speech_model()).unwrap_or(&self.model)
         } else { &self.model };
         let mut form = multipart::Form::new()
-            .part("file", wav_part(wav))
+            .part("file", part)
             .text("model", model.to_string())
             .text("response_format", "json")
             .text("temperature", "0");
-        // Amber detects among the entire list. Ordinary services keep the existing single
-        // language/short-dictation policy rather than receiving an unsupported comma list.
-        let language = if catalog.is_some() { options.language.clone() } else { cloud_language(options, wav_ms(wav)) };
+        // Amber detects among the entire list. Voxtral uses Android's auto-detection policy;
+        // the short-dictation workaround is for Whisper, not Voxtral.
+        let language = if catalog.is_some() {
+            options.language.clone()
+        } else if model == "voxtral-small-24b" {
+            options.fixed().map(str::to_string)
+        } else {
+            cloud_language(options, wav_ms(wav))
+        };
         if let Some(lang) = language {
             form = form.text("language", lang.to_string());
         }
@@ -378,7 +476,16 @@ impl Transcriber for OpenAiTranscriber {
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
+        cancel.check()?;
+        // The payload length, not multipart or transport bytes. Keep it even if HTTP fails.
+        upload.upload_bytes = file_bytes;
+        upload.note = format_note;
         let (status, body) = request(&self.http, req, MAX_RESPONSE_BYTES, cancel)?;
+        if format == UploadFormat::Opus && matches!(status, 400 | 415 | 422) {
+            return Err(SttError::new(ErrorKind::Server,
+                format!("The server rejected the Ogg Opus request (HTTP {status}). Select WAV if this endpoint does not support it. No format retry was made."),
+                format!("HTTP {status}")));
+        }
         let root = response_json(status, &body)?;
         let text = parse_text_value(&root, body.len())?;
         let language = root.get("language").and_then(|v| v.as_str()).map(str::to_string);
@@ -646,7 +753,21 @@ pub(crate) mod testserver {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 { return; }
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            // Do not race the client's request with an unsolicited partial response.
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let mut stream = reader.into_inner();
             let _ = stream.write_all(prefix);
             let _ = ready_tx.send(());
             let _ = release_rx.recv();
@@ -662,6 +783,187 @@ mod tests {
 
     fn json(status: u16, body: &str) -> (u16, &'static str, Vec<u8>) {
         (status, "application/json", body.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn opus_upload_has_matching_multipart_metadata_and_voxtral_fields() {
+        let (url, rx) = serve(vec![json(200, r#"{"text":"Hello."}"#)]);
+        let wav = crate::audio::encode_wav(&vec![0.1; 32_007], 16_000);
+        let original = wav.clone();
+        let (result, upload) = OpenAiTranscriber::new(&format!("{url}/v1"), "test-key", "voxtral-small-24b")
+            .with_upload_format(UploadFormat::Opus)
+            .transcribe_with_upload(&wav, &TranscribeOptions::new("de,en", "Amber"), &CancellationToken::default());
+        assert_eq!(result.unwrap(), "Hello.");
+        let upload = upload.unwrap();
+        assert_eq!(upload.format, "opus");
+        assert_eq!(upload.input_bytes, wav.len() as u64);
+        assert!(upload.upload_bytes < upload.input_bytes / 4);
+        assert!(upload.note.as_deref().unwrap().contains("may be incompatible"));
+        assert_eq!(wav, original);
+        let req = rx.recv().unwrap();
+        assert!(req.head.starts_with("POST /v1/audio/transcriptions "));
+        assert!(req.head.to_lowercase().contains("authorization: bearer test-key\r\n"));
+        let body = String::from_utf8_lossy(&req.body);
+        for field in ["filename=\"dictation.ogg\"", "Content-Type: audio/ogg", "name=\"model\"\r\n\r\nvoxtral-small-24b",
+            "name=\"response_format\"\r\n\r\njson", "name=\"prompt\"\r\n\r\nAmber"] {
+            assert!(body.contains(field), "missing {field}");
+        }
+        assert!(!body.contains("name=\"language\"") && !body.contains("amber_cleanup"));
+        let start = req.body.windows(4).position(|w| w == b"OggS").unwrap();
+        let file = &req.body[start..start + upload.upload_bytes as usize];
+        assert_eq!(crate::audio::decode_upload(file).unwrap().0.len(), 32_007);
+        let serialized = serde_json::to_value(upload).unwrap();
+        assert_eq!(serialized["inputBytes"], wav.len());
+        assert!(serialized["encodingMs"].is_u64());
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no catalog probe or extra POST");
+    }
+
+    #[test]
+    fn amber_upload_format_negotiation_happens_before_a_single_post() {
+        for (amber, requested, actual) in [
+            (r#"{"audio":["wav","opus"]}"#, UploadFormat::Wav, "wav"),
+            (r#"{"audio":["wav","opus"]}"#, UploadFormat::Opus, "opus"),
+            (r#"{"audio":["opus"]}"#, UploadFormat::Opus, "opus"),
+            (r#"{"audio":["wav"]}"#, UploadFormat::Opus, "wav"),
+            (r#"{}"#, UploadFormat::Wav, "wav"),
+            (r#"{}"#, UploadFormat::Opus, "wav"),
+        ] {
+            let (url, rx) = serve(vec![json(200, &format!(r#"{{"amber":{amber},"data":[]}}"#)), json(200, r#"{"text":"x"}"#)]);
+            let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+            let engine = OpenAiTranscriber::new(&url, "", "m").with_catalog_discovery();
+            let engine = if requested == UploadFormat::Opus { engine.with_upload_format(requested) } else { engine };
+            let (result, upload) = engine.transcribe_with_upload(&wav, &TranscribeOptions::new("de,en", ""), &CancellationToken::default());
+            assert!(result.is_ok());
+            let upload = upload.unwrap();
+            assert_eq!(upload.format, actual);
+            assert!(rx.recv().unwrap().head.starts_with("GET /models "));
+            let req = rx.recv().unwrap();
+            assert!(req.head.starts_with("POST /audio/transcriptions "));
+            let body = String::from_utf8_lossy(&req.body);
+            assert!(body.contains("name=\"language\"\r\n\r\nde,en"));
+            assert!(body.contains("name=\"amber_cleanup\"\r\n\r\nclient"));
+            if actual == "wav" {
+                assert_eq!(upload.upload_bytes, wav.len() as u64);
+                assert_eq!(upload.encoding_ms, 0);
+                assert!(req.body.windows(wav.len()).any(|w| w == wav));
+                assert!(body.contains("filename=\"dictation.wav\"") && body.contains("Content-Type: audio/wav"));
+            } else { assert!(body.contains("filename=\"dictation.ogg\"")); }
+            if requested == UploadFormat::Opus && actual == "wav" {
+                assert!(upload.note.unwrap().contains("before uploading"));
+            } else { assert!(upload.note.is_none()); }
+            assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        }
+    }
+
+    #[test]
+    fn amber_explicit_invalid_or_unsupported_formats_never_imply_support() {
+        for amber in [r#"{"audio":[]}"#, r#"{"audio":["flac"]}"#, r#"{"audio":null}"#,
+            r#"{"audio":"wav"}"#, r#"{"audio":{}}"#, r#"{"audio":true}"#, r#"{"audio":1}"#,
+            r#"{"audio":["WAV","audio/wav",1]}"#] {
+            for format in [UploadFormat::Wav, UploadFormat::Opus] {
+                let (url, rx) = serve(vec![json(200, &format!(r#"{{"amber":{amber},"data":[]}}"#))]);
+                let (result, upload) = OpenAiTranscriber::new(&url, "", "m").with_catalog_discovery().with_upload_format(format)
+                    .transcribe_with_upload(b"unencoded", &TranscribeOptions::default(), &CancellationToken::default());
+                assert_eq!(result.unwrap_err().kind, ErrorKind::BadResponse);
+                let upload = upload.unwrap();
+                assert_eq!(upload.format, format.as_str());
+                assert_eq!(upload.upload_bytes, 0);
+                assert_eq!(upload.encoding_ms, 0);
+                assert!(upload.note.unwrap().contains("No audio was uploaded"));
+                assert!(rx.recv().unwrap().head.starts_with("GET "));
+                assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn opus_rejection_keeps_attempt_metadata_without_a_wav_retry() {
+        for status in [400, 415, 422, 401, 500] {
+            let (url, rx) = serve(vec![json(status, "untrusted response")]);
+            let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+            let (result, upload) = OpenAiTranscriber::new(&url, "", "voxtral-small-24b").with_upload_format(UploadFormat::Opus)
+                .transcribe_with_upload(&wav, &TranscribeOptions::default(), &CancellationToken::default());
+            let error = result.unwrap_err();
+            assert_eq!(error.detail, format!("HTTP {status}"));
+            if matches!(status, 400 | 415 | 422) {
+                assert!(error.message.contains("Select WAV"));
+                assert!(!error.kind.service_unavailable());
+            }
+            let upload = upload.unwrap();
+            assert_eq!(upload.format, "opus");
+            assert!(upload.upload_bytes > 0);
+            assert!(String::from_utf8_lossy(&rx.recv().unwrap().body).contains("dictation.ogg"));
+            assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "only one paid request");
+        }
+    }
+
+    #[test]
+    fn upload_stats_are_per_call_not_shared_between_concurrent_recordings() {
+        let (url, rx) = serve(vec![json(200, r#"{"text":"x"}"#), json(200, r#"{"text":"x"}"#)]);
+        let transcriber = Arc::new(OpenAiTranscriber::new(&url, "", "m").with_upload_format(UploadFormat::Opus));
+        let workers: Vec<_> = [16_000, 64_123].into_iter().map(|len| {
+            let transcriber = transcriber.clone();
+            std::thread::spawn(move || {
+                let wav = crate::audio::encode_wav(&vec![0.1; len], 16_000);
+                let (result, upload) = transcriber.transcribe_with_upload(&wav, &TranscribeOptions::default(), &CancellationToken::default());
+                result.unwrap();
+                let upload = upload.unwrap();
+                assert_eq!(upload.input_bytes, wav.len() as u64);
+                (len, upload.upload_bytes)
+            })
+        }).collect();
+        let expected: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        for _ in 0..2 {
+            let req = rx.recv().unwrap();
+            let start = req.body.windows(4).position(|w| w == b"OggS").unwrap();
+            assert!(expected.iter().any(|&(len, size)| req.body.get(start..start + size as usize)
+                .is_some_and(|file| crate::audio::decode_upload(file).is_ok_and(|(s, _)| s.len() == len))));
+        }
+    }
+
+    #[test]
+    fn wav_upload_stats_and_preupload_failures_are_honest() {
+        let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+        let (url, rx) = serve(vec![json(200, r#"{"text":"x"}"#)]);
+        let (result, upload) = OpenAiTranscriber::new(&url, "", "m")
+            .transcribe_with_upload(&wav, &TranscribeOptions::default(), &CancellationToken::default());
+        result.unwrap();
+        let upload = upload.unwrap();
+        assert_eq!(upload.format, "wav");
+        assert_eq!(upload.input_bytes, wav.len() as u64);
+        assert_eq!(upload.upload_bytes, upload.input_bytes);
+        assert_eq!(upload.encoding_ms, 0);
+        assert!(upload.note.is_none());
+        assert!(rx.recv().unwrap().body.windows(wav.len()).any(|w| w == wav));
+        for cancelled in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let cancel = CancellationToken::default();
+            if cancelled { cancel.cancel(); }
+            let (result, upload) = OpenAiTranscriber::new(&format!("http://{}", listener.local_addr().unwrap()), "", "m")
+                .with_upload_format(UploadFormat::Opus).transcribe_with_upload(b"invalid WAV", &TranscribeOptions::default(), &cancel);
+            assert!(result.is_err());
+            if cancelled { assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled); }
+            let upload = upload.unwrap();
+            assert_eq!(upload.upload_bytes, 0);
+            assert!(upload.note.unwrap().contains("No audio upload"));
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn local_transcribers_keep_original_wav_and_have_no_upload_stats() {
+        struct Local(Vec<u8>);
+        impl Transcriber for Local {
+            fn transcribe(&self, wav: &[u8], _: &TranscribeOptions) -> Result<String, SttError> {
+                assert_eq!(wav, self.0);
+                Ok("local".into())
+            }
+        }
+        let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+        let (result, upload) = Local(wav.clone()).transcribe_with_upload(&wav, &TranscribeOptions::default(), &CancellationToken::default());
+        assert_eq!(result.unwrap(), "local");
+        assert!(upload.is_none());
     }
 
     #[test]
@@ -690,6 +992,46 @@ mod tests {
         assert!(!body.contains("name=\"language\""));
         assert!(!body.contains("name=\"prompt\""));
         assert!(!req.head.to_lowercase().contains("authorization"));
+    }
+
+    #[test]
+    fn tinfoil_voxtral_uses_wav_json_and_only_a_single_explicit_language() {
+        let model = crate::providers::TINFOIL.default_model();
+        let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+        for (language, expected) in [("de,en", None), ("auto", None), ("de-DE", Some("de"))] {
+            let (url, rx) = serve(vec![json(200, r#"{"text":"Hello world."}"#)]);
+            let result = OpenAiTranscriber::new(&format!("{url}/v1/"), "tinfoil-test-key", model)
+                .transcribe_detecting(&wav, &TranscribeOptions::new(language, "Amber")).unwrap();
+            assert_eq!(result, ("Hello world.".into(), None));
+            let req = rx.recv().unwrap();
+            assert!(req.head.starts_with("POST /v1/audio/transcriptions "));
+            assert!(req.head.to_lowercase().contains("authorization: bearer tinfoil-test-key\r\n"));
+            assert!(req.head.to_lowercase().contains("content-type: multipart/form-data; boundary="));
+            assert!(req.body.windows(wav.len()).any(|bytes| bytes == wav));
+            let body = String::from_utf8_lossy(&req.body);
+            for field in ["name=\"model\"\r\n\r\nvoxtral-small-24b", "name=\"response_format\"\r\n\r\njson",
+                          "filename=\"dictation.wav\"", "Content-Type: audio/wav", "name=\"prompt\"\r\n\r\nAmber"] {
+                assert!(body.contains(field), "missing {field}");
+            }
+            match expected {
+                Some(code) => assert!(body.contains(&format!("name=\"language\"\r\n\r\n{code}\r\n"))),
+                None => assert!(!body.contains("name=\"language\"")),
+            }
+            assert!(!body.contains("amber_cleanup"));
+            assert!(rx.try_recv().is_err(), "no catalog probe or duplicate upload");
+        }
+    }
+
+    #[test]
+    fn connection_check_requires_a_catalog_but_not_inference() {
+        for key in ["", "invalid-test-key"] {
+            let (url, rx) = serve(vec![json(200, r#"{"object":"list","data":[{"id":"voxtral-small-24b"}]}"#)]);
+            OpenAiTranscriber::new(&format!("{url}/v1"), key, "").check().unwrap();
+            assert!(rx.recv().unwrap().head.starts_with("GET /v1/models "));
+            assert!(rx.try_recv().is_err());
+        }
+        let (url, _rx) = serve(vec![json(200, r#"{"status":"ok"}"#)]);
+        assert_eq!(OpenAiTranscriber::new(&url, "", "").check().unwrap_err().kind, ErrorKind::BadResponse);
     }
 
     #[test]
@@ -961,7 +1303,7 @@ mod tests {
     #[test]
     fn amber_uses_catalog_default_only_for_an_empty_selection() {
         let (url, rx) = serve(vec![
-            json(200, r#"{"amber":{},"data":[{"id":"first","amber":{"kind":"speech"}},{"id":"recommended","amber":{"kind":"speech","default":true}}]}"#),
+            json(200, r#"{"amber":{"audio":["wav"]},"data":[{"id":"first","amber":{"kind":"speech"}},{"id":"recommended","amber":{"kind":"speech","default":true}}]}"#),
             json(200, r#"{"text":"x"}"#),
         ]);
         OpenAiTranscriber::new(&url, "", "").with_catalog_discovery().transcribe(b"wav", &TranscribeOptions::default()).unwrap();

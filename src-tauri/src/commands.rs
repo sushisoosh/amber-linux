@@ -119,6 +119,51 @@ pub fn cancel_dictation(app: AppHandle) {
 }
 
 #[tauri::command]
+pub fn get_testing_state(core: State<Core>) -> amber_core::testing::Session {
+    core.testing.snapshot()
+}
+
+#[tauri::command]
+pub fn start_test_recording(app: AppHandle) -> Result<(), String> {
+    crate::testing::start(&app)
+}
+
+#[tauri::command]
+pub fn replay_test_recording(app: AppHandle, id: u64) -> Result<(), String> {
+    crate::testing::replay(&app, id)
+}
+
+#[tauri::command]
+pub fn stop_test_recording(app: AppHandle, id: u64) -> Result<(), String> {
+    crate::testing::stop(&app, id)
+}
+
+#[tauri::command]
+pub fn cancel_test_recording(app: AppHandle, id: u64) {
+    crate::testing::cancel_session(&app, Some(id));
+}
+
+#[tauri::command]
+pub fn clear_test_results(app: AppHandle, id: Option<u64>) -> Result<(), String> {
+    crate::testing::clear(&app, id)
+}
+
+#[tauri::command]
+pub async fn save_test_table(app: AppHandle, name: String) -> Result<(), String> {
+    crate::testing::change_tables(app, amber_core::testing::TableChange::Save { name, at: crate::memory::now_ms() }).await
+}
+
+#[tauri::command]
+pub async fn delete_test_table(app: AppHandle, id: u64) -> Result<(), String> {
+    crate::testing::change_tables(app, amber_core::testing::TableChange::Delete(id)).await
+}
+
+#[tauri::command]
+pub async fn reload_test_tables(app: AppHandle) -> Result<(), String> {
+    crate::testing::change_tables(app, amber_core::testing::TableChange::Reload).await
+}
+
+#[tauri::command]
 pub fn quit_app(app: AppHandle) {
     crate::dictation::cancel(&app);
     app.exit(0);
@@ -288,7 +333,8 @@ pub async fn list_microphones() -> Microphones {
 #[tauri::command]
 pub async fn mic_test(app: AppHandle, device: Option<String>) -> Result<(), String> {
     let core = app.state::<Core>();
-    drop(core.mic_test.lock().unwrap().take());
+    let meter = core.mic_test.lock().unwrap().take();
+    drop(meter);
     let Some(device) = device else { return Ok(()) };
     if core.dictation.is_active() {
         return Err("A dictation is running.".into());
@@ -301,16 +347,22 @@ pub async fn mic_test(app: AppHandle, device: Option<String>) -> Result<(), Stri
     })
     .await
     .map_err(|e| e.to_string())??;
+    // A dictation/test may have reserved the worker while the driver was opening.
+    if core.dictation.is_active() {
+        tauri::async_runtime::spawn_blocking(move || drop(recorder));
+        return Err("A recording is running. The microphone test was stopped.".into());
+    }
     let started = Instant::now();
     *core.mic_test.lock().unwrap() = Some((recorder, started));
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let core = app.state::<Core>();
-        let mut slot = core.mic_test.lock().unwrap();
-        // Only this test's recorder, not one started later.
-        if slot.as_ref().is_some_and(|(_, s)| *s == started) {
-            drop(slot.take());
-        }
+        let meter = {
+            let mut slot = core.mic_test.lock().unwrap();
+            // Only this test's recorder, not one started later.
+            if slot.as_ref().is_some_and(|(_, s)| *s == started) { slot.take() } else { None }
+        };
+        drop(meter);
     });
     Ok(())
 }

@@ -115,6 +115,8 @@ pub struct ServerSettings {
     /// Only used for "custom"; known providers have a fixed address.
     pub base_url: String,
     pub model: String,
+    /// Only outgoing recognition audio; local engines and retained recordings stay lossless.
+    pub upload_format: UploadFormat,
     /// A server that cannot be reached hands the recording to a downloaded local model -
     /// never the other way round, so the voice only ever stays more private.
     pub local_fallback: bool,
@@ -122,7 +124,21 @@ pub struct ServerSettings {
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        ServerSettings { provider: "groq".into(), base_url: String::new(), model: "whisper-large-v3-turbo".into(), local_fallback: true }
+        ServerSettings { provider: "groq".into(), base_url: String::new(), model: "whisper-large-v3-turbo".into(), upload_format: UploadFormat::Wav, local_fallback: true }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadFormat {
+    #[default]
+    Wav,
+    Opus,
+}
+
+impl UploadFormat {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Wav => "wav", Self::Opus => "opus" }
     }
 }
 
@@ -204,6 +220,8 @@ pub enum InsertMethod {
 #[serde(default, rename_all = "camelCase")]
 pub struct InsertSettings {
     pub method: InsertMethod,
+    /// Linux opt-in. Older Linux versions ignored `method`, so it is not consent to paste.
+    pub paste_on_completion: bool,
     /// After pasting, put back the text that was on the clipboard before.
     pub restore_clipboard: bool,
     /// A space after the text, so the next dictation does not stick to it.
@@ -212,7 +230,7 @@ pub struct InsertSettings {
 
 impl Default for InsertSettings {
     fn default() -> Self {
-        InsertSettings { method: InsertMethod::Paste, restore_clipboard: true, trailing_space: true }
+        InsertSettings { method: InsertMethod::Paste, paste_on_completion: false, restore_clipboard: true, trailing_space: true }
     }
 }
 
@@ -334,7 +352,8 @@ pub struct DiscordSettings {
 pub const BUBBLE_SIZES: std::ops::RangeInclusive<u32> = 40..=96;
 
 impl Settings {
-    /// Linux desktop v1 deliberately excludes unattended input, listeners and command execution.
+    /// Linux excludes unsupported integrations, listeners and command execution.
+    /// Guarded paste remains a separate opt-in in the existing insertion settings.
     pub fn for_linux(mut self, first_start: bool) -> Self {
         if first_start {
             self.autostart = false;
@@ -512,6 +531,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upload_compression_is_opt_in_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"server":{"provider":"tinfoil","model":"voxtral-small-24b"}}"#).unwrap();
+        assert_eq!(old.server.upload_format, UploadFormat::Wav);
+        let mut settings = old;
+        settings.server.upload_format = UploadFormat::Opus;
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["server"]["uploadFormat"], "opus");
+        let restored: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.sanitized().server.upload_format, UploadFormat::Opus);
+    }
+
+    #[test]
     fn linux_missing_partial_and_corrupt_settings_never_imply_privacy_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -551,6 +582,21 @@ mod tests {
         opted_in.statistics = true;
         let opted_in = opted_in.for_linux(false);
         assert!(opted_in.history && opted_in.autostart && opted_in.statistics);
+    }
+
+    #[test]
+    fn linux_paste_requires_explicit_consent_even_with_legacy_paste_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(!Settings::load_linux(&path).0.insert.paste_on_completion);
+        std::fs::write(&path, r#"{"insert":{"method":"paste"}}"#).unwrap();
+        let (mut s, error) = Settings::load_linux(&path);
+        assert!(error.is_none());
+        assert!(!s.insert.paste_on_completion);
+        s.insert.paste_on_completion = true;
+        s.save(&path).unwrap();
+        assert!(Settings::load_linux(&path).0.insert.paste_on_completion);
+        assert_eq!(Settings::default().insert.method, InsertMethod::Paste);
     }
 
     #[test]

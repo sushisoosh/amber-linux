@@ -12,6 +12,20 @@ use cpal::{FromSample, Sample, SizedSample};
 /// A recording stops growing here; the dictation ends it at the same limit.
 pub const MAX_SECONDS: usize = 600;
 
+// Held by the actual capture thread, including a driver still opening after a timeout.
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+struct CaptureLease;
+impl CaptureLease {
+    fn acquire() -> Result<Self, String> {
+        CAPTURING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "The microphone is already in use by a recording or microphone test. Wait for it to finish.".to_string())?;
+        Ok(Self)
+    }
+}
+impl Drop for CaptureLease {
+    fn drop(&mut self) { CAPTURING.store(false, Ordering::Release); }
+}
+
 pub struct Recorder {
     stop: mpsc::Sender<()>,
     thread: Option<JoinHandle<()>>,
@@ -46,6 +60,8 @@ impl Recorder {
     /// Opens [device] (empty = default) and starts recording. [on_level] gets 0..1 about 30
     /// times a second.
     pub fn start(device: &str, on_level: impl Fn(f32) + Send + 'static) -> Result<Recorder, String> {
+        let lease = CaptureLease::acquire()?;
+        let log = crate::diag::enabled();
         let samples = Arc::new(Mutex::new(Vec::with_capacity(48_000 * 30)));
         let failed = Arc::new(AtomicBool::new(false));
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -57,6 +73,8 @@ impl Recorder {
         let thread = std::thread::Builder::new()
             .name("amber-capture".into())
             .spawn(move || {
+                let _lease = lease;
+                let _quiet = (!log).then(crate::diag::silence);
                 let stream = match open(&wanted, buf, fail, on_level) {
                     Ok((stream, rate, name, fell_back)) => {
                         let _ = ready_tx.send(Ok((rate, name, fell_back)));
@@ -170,6 +188,7 @@ where
     let level_every = (rate / 30).max(1) as usize;
     let mut window: Vec<f32> = Vec::with_capacity(level_every);
     let mut mono: Vec<f32> = Vec::new();
+    let log = crate::diag::enabled();
     device
         .build_input_stream(
             config,
@@ -192,7 +211,7 @@ where
             },
             move |err| {
                 failed.store(true, Ordering::Relaxed);
-                crate::diag::warn(format!("microphone stream error: {err}"));
+                if log { crate::diag::warn(format!("microphone stream error: {err}")); }
             },
             None,
         )
@@ -211,5 +230,20 @@ fn denied_hint(e: &str) -> String {
         }
     } else {
         format!("The microphone could not be opened: {e}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_is_exclusive_until_its_owner_really_exits() {
+        let lease = CaptureLease::acquire().unwrap();
+        assert!(CaptureLease::acquire().is_err());
+        // Fails before touching any real audio device, including another mic test.
+        assert!(Recorder::start("", |_| {}).is_err());
+        drop(lease);
+        assert!(CaptureLease::acquire().is_ok());
     }
 }

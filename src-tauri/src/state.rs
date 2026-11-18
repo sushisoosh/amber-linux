@@ -28,6 +28,7 @@ pub struct Core {
     keys: Mutex<HashMap<String, String>>,
     credential_changes: Mutex<()>,
     pub dictation: Dictation,
+    pub testing: crate::testing::Testing,
     pub whisper: Whisper,
     pub hotkey_gesture: Mutex<Gesture>,
     pub pointer_gesture: Mutex<Gesture>,
@@ -59,6 +60,11 @@ impl Core {
         if let Some(problem) = problem {
             crate::diag::warn(problem);
         }
+        // Register all stores before loading any of them: an archive alone must prevent
+        // replacement of a missing shared wallet key, even with ordinary history disabled.
+        crate::secrets::register(&paths.secrets);
+        crate::secrets::register(&paths.layout.root.join("history.bin"));
+        let testing = crate::testing::Testing::new(paths.layout.root.join("testing-tables.bin"));
         let keys = crate::secrets::load(&paths.secrets);
         let mode = settings.hotkey.mode;
         let paths_root = paths.layout.root.clone();
@@ -70,6 +76,7 @@ impl Core {
             keys: Mutex::new(keys),
             credential_changes: Mutex::new(()),
             dictation: Dictation::default(),
+            testing,
             whisper: Whisper::default(),
             hotkey_gesture: Mutex::new(Gesture::new(mode)),
             // The bubble always offers both: a click toggles, a long press talks.

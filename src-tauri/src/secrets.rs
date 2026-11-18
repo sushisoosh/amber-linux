@@ -11,6 +11,7 @@ mod linux;
 
 pub(crate) const KEYS: &[u8] = b"api-keys";
 pub(crate) const HISTORY: &[u8] = b"history";
+pub(crate) const TESTING_TABLES: &[u8] = b"testing-tables";
 
 pub fn load(path: &Path) -> HashMap<String, String> {
     match load_checked(path) {
@@ -40,8 +41,8 @@ pub fn save(path: &Path, keys: &HashMap<String, String>) -> Result<(), String> {
     write_encrypted(path, &plain, KEYS)
 }
 
-/// Register both history and credentials during startup, even when history is disabled.
-/// A missing wallet key must not be replaced while either encrypted file still exists.
+/// Register every encrypted file before any wallet operation, including disabled stores.
+/// A missing wallet key must not be replaced while any encrypted file still exists.
 pub(crate) fn register(path: &Path) {
     #[cfg(target_os = "linux")]
     linux::register(path);
@@ -115,6 +116,30 @@ pub(crate) fn read_encrypted(path: &Path, purpose: &[u8]) -> Result<Option<Vec<u
     }
 }
 
+/// Testing archives have an 8 MiB plaintext bound; cap ciphertext before decryption too.
+/// Linux's shared private reader already enforces this 64 MiB envelope bound.
+pub(crate) fn read_encrypted_bounded(path: &Path, purpose: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    #[cfg(target_os = "linux")]
+    return linux::read(path, purpose);
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::Read;
+        let _ = purpose;
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Cannot read encrypted storage: {e}")),
+        };
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() > LIMIT { return Err("Encrypted storage exceeds its safety limit or is not a regular file".into()); }
+        let mut blob = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut blob).map_err(|e| e.to_string())?;
+        if blob.len() as u64 > LIMIT { return Err("Encrypted storage exceeds the 64 MiB safety limit".into()); }
+        unprotect(&blob).map(Some)
+    }
+}
+
 pub(crate) fn write_encrypted(path: &Path, data: &[u8], purpose: &[u8]) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     return linux::write(path, data, purpose);
@@ -139,15 +164,45 @@ pub(crate) fn remove_encrypted(path: &Path) -> Result<(), String> {
 pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     return linux::write_private(path, data);
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    #[cfg(windows)]
+    return write_private_with(path, data, replace_private);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    write_private_with(path, data, |tmp, path| std::fs::rename(tmp, path).map_err(|e| e.to_string()))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn write_private_with(path: &Path, data: &[u8], replace: impl FnOnce(&Path, &Path) -> Result<(), String>) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
+    let tmp = path.with_extension("tmp");
+    let prepared = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()
+    })();
+    // The encrypted temporary file is flushed and closed before durable replacement.
+    let result = prepared.map_err(|e: std::io::Error| e.to_string()).and_then(|_| replace(&tmp, path));
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
+}
+
+#[cfg(windows)]
+fn replace_private(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+
+    let mut from: Vec<u16> = from.as_os_str().encode_wide().collect();
+    let mut to: Vec<u16> = to.as_os_str().encode_wide().collect();
+    if from.contains(&0) || to.contains(&0) { return Err("Private storage path contains a null character".into()); }
+    from.push(0);
+    to.push(0);
+    // Same-directory replacement, not a copy/delete or deferred move. ReplaceFileW's
+    // similarly named WRITE_THROUGH flag is unsupported; MoveFileExW supports this flag.
+    unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }
+        .map_err(|e| format!("Private storage replacement failed or durability could not be confirmed: {e}"))
 }
 
 #[cfg(windows)]
@@ -190,4 +245,58 @@ pub(crate) fn protect(_data: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(not(any(windows, target_os = "linux")))]
 pub(crate) fn unprotect(_data: &[u8]) -> Result<Vec<u8>, String> {
     Err("Secure storage is not supported on this platform".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("amber-replacement-test-{}-{at}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn replacement_failure_is_reported_and_keeps_old_ciphertext() {
+        let dir = temp_dir();
+        let path = dir.join("mock.bin");
+        std::fs::write(&path, b"old mock ciphertext").unwrap();
+        let error = write_private_with(&path, b"new mock ciphertext", |from, to| {
+            assert_eq!(from.parent(), to.parent());
+            assert_eq!(std::fs::read(from).unwrap(), b"new mock ciphertext");
+            assert_eq!(std::fs::read(to).unwrap(), b"old mock ciphertext");
+            Err("Mock durable replacement failed".into())
+        }).unwrap_err();
+        assert_eq!(error, "Mock durable replacement failed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old mock ciphertext");
+        assert!(!path.with_extension("tmp").exists());
+        write_private_with(&path, b"confirmed mock ciphertext", |from, to| {
+            std::fs::rename(from, to).map_err(|e| e.to_string())
+        }).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"confirmed mock ciphertext");
+        assert!(!path.with_extension("tmp").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replacement_uncertainty_and_preparation_failure_never_report_success() {
+        let dir = temp_dir();
+        let path = dir.join("mock.bin");
+        std::fs::write(&path, b"old mock ciphertext").unwrap();
+        let error = write_private_with(&path, b"unconfirmed mock ciphertext", |from, to| {
+            std::fs::rename(from, to).unwrap();
+            Err("Mock durability could not be confirmed".into())
+        }).unwrap_err();
+        assert_eq!(error, "Mock durability could not be confirmed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"unconfirmed mock ciphertext");
+        assert!(!path.with_extension("tmp").exists());
+        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        assert!(write_private_with(&path, b"must not replace", |_, _| panic!("preparation failed before replacement")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unconfirmed mock ciphertext");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

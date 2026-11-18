@@ -7,11 +7,13 @@ import { Row, Section, Segmented, Switch } from "../ui";
 import { pretty } from "./Hotkeys";
 
 const METHODS: [InsertMethod, string][] = [
-  ["paste", "Paste"],
+  ["paste", "Paste (Ctrl+V)"],
   ["type", "Type"],
 ];
 
-export function InsertPage({ s, save, phase }: PageProps) {
+export function InsertPage({ s, save, phase, ov, desktop }: PageProps) {
+  const linux = ov.platform === "linux";
+  const x11 = desktop.status?.session.toLowerCase() === "x11";
   const [last, setLast] = useState<string | null>(null);
   useEffect(() => {
     const un = listen<DictationEvent>("dictation-state", (e) => {
@@ -23,11 +25,22 @@ export function InsertPage({ s, save, phase }: PageProps) {
 
   return (
     <>
-      <h1>Inserting</h1>
-      <p className="lead">How the text gets into the window you were in when you started dictating.</p>
+      <h1>Delivery</h1>
+      <p className="lead">How completed dictation reaches the window you were in when recording started. The hotkey leaves Amber in the background.</p>
       <Section>
-        <Row
-          label="Method"
+        {linux ? <>
+          <Row label="Copy and paste completed dictation (Ctrl+V)" hint="Off by default: review the result and copy it yourself. When enabled, completed text goes to the clipboard even when automatic paste is unavailable. Amber attempts one paste into the original target without bringing either window forward.">
+            <Switch on={s.insert.pasteOnCompletion} onChange={(v) => save((x) => {
+              x.insert.pasteOnCompletion = v;
+              x.insert.method = "paste";
+            })} />
+          </Row>
+          <Row label={x11 ? "Restricted X11 paste" : "Manual paste on this desktop"} hint={x11
+            ? "Automatic Ctrl+V supports single-line text in native editors such as Gedit, Kate or Mousepad, with unchanged window and input focus. Terminals, browsers, dialogs and unknown targets, changed focus, and multiline text still receive clipboard text for manual paste. Editable fields within a window cannot be verified."
+            : "Wayland and unknown sessions cannot safely identify or paste into the target yet. Background clipboard access can also be restricted: on Wayland, Amber must be focused to copy. Otherwise open Recorder and use Copy."} />
+          <Row label="Clipboard replacement" hint="Opted-in completion replaces clipboard text, images or files; Linux does not restore them. Clipboard managers may retain the text. Keep Amber running until you paste. Interrupted recordings always require review. Results remain in Recorder, even when a paste is blocked or cannot be confirmed. Testing recordings never change the clipboard." />
+        </> : <Row
+          label="Completed dictation"
           hint={
             s.insert.method === "paste"
               ? "Through the clipboard and Ctrl+V - fast and works almost everywhere."
@@ -35,9 +48,9 @@ export function InsertPage({ s, save, phase }: PageProps) {
           }
         >
           <Segmented value={s.insert.method} options={METHODS} onChange={(v) => save((x) => (x.insert.method = v))} />
-        </Row>
-        {s.insert.method === "paste" && (
-          <Row label="Restore the clipboard" hint="Puts back the text that was on the clipboard before. Images on the clipboard are not kept. Dictations never land in the clipboard history (Win+V).">
+        </Row>}
+        {!linux && s.insert.method === "paste" && (
+          <Row label="Restore the clipboard" hint="Puts back the previous clipboard text unless something else was copied meanwhile. With images or files, Amber types instead so they are preserved. Dictations are excluded from Windows clipboard history (Win+V).">
             <Switch on={s.insert.restoreClipboard} onChange={(v) => save((x) => (x.insert.restoreClipboard = v))} />
           </Row>
         )}
@@ -45,7 +58,7 @@ export function InsertPage({ s, save, phase }: PageProps) {
           <Switch on={s.insert.trailingSpace} onChange={(v) => save((x) => (x.insert.trailingSpace = v))} />
         </Row>
       </Section>
-      <Section title="Try it">
+      {!linux && <Section title="Try it">
         <div className="row column">
           <div className="note">
             Click into the field and press {s.hotkey.dictate ? <b>{pretty(s.hotkey.dictate)}</b> : "the dictate button"}, or use the button. Microphone, engine and inserting all
@@ -67,7 +80,7 @@ export function InsertPage({ s, save, phase }: PageProps) {
             {last && <span className="note error">{last}</span>}
           </div>
         </div>
-      </Section>
+      </Section>}
     </>
   );
 }

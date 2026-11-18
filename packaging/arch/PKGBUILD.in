@@ -42,6 +42,7 @@ check() {
     npm run test:ui
     cargo test --workspace --frozen
     python tools/test-x11.py
+    python tools/test-x11.py --app "${srcdir}/target/release/amber-dictation"
     desktop-file-validate packaging/arch/amber-dictation.desktop
 }
 

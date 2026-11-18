@@ -3,12 +3,13 @@
 //! for how it is tied to the app.
 
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::process::{self, Output};
 
 use amber_core::local::{self, Layout};
+use amber_core::engine::{CancellationToken, ErrorKind, SttError, TranscribeOptions, Transcriber, WhisperServerTranscriber};
 use serde::Serialize;
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -43,7 +44,7 @@ struct Running {
 
 impl Running {
     fn served(&self) -> Served {
-        Served { url: self.base.clone(), runtime: self.key.runtime.clone(), model: self.key.model.clone() }
+        Served { url: self.base.clone(), runtime: self.key.runtime.clone(), model: self.key.model.clone(), snapshot_transcriber: None }
     }
 }
 
@@ -53,11 +54,12 @@ pub struct Served {
     pub url: String,
     pub runtime: String,
     pub model: String,
+    pub snapshot_transcriber: Option<Box<dyn Transcriber>>,
 }
 
 #[derive(Default)]
 pub struct Whisper {
-    running: Mutex<Option<Running>>,
+    running: Arc<Mutex<Option<Running>>>,
     /// The last lines the server printed - the reason when it dies.
     output: Output,
     status: Mutex<Option<Status>>,
@@ -96,13 +98,30 @@ impl Whisper {
     /// Like [ensure], with [model] instead of the configured one - what the phone chose. One
     /// model at a time: the PC's own dictations load theirs again on their next use.
     pub fn ensure_model(&self, app: &tauri::AppHandle, model: Option<&str>) -> Result<Served, String> {
+        self.ensure_with(app, model, None)
+    }
+
+    pub fn ensure_snapshot(&self, app: &tauri::AppHandle, settings: &amber_core::settings::LocalSettings) -> Result<Served, String> {
+        let mut served = self.ensure_with(app, Some(&settings.model), Some(settings))?;
+        // Both the client's context and its identity come from the model actually served,
+        // including the old installed model retained while the requested one downloads.
+        let slack = local::model(&served.model).filter(|m| m.short_context).map(|m| m.context_slack);
+        served.snapshot_transcriber = Some(Box::new(SnapshotEngine {
+            running: self.running.clone(),
+            base: served.url.clone(),
+            transcriber: WhisperServerTranscriber::new(&served.url, slack),
+        }));
+        Ok(served)
+    }
+
+    fn ensure_with(&self, app: &tauri::AppHandle, model: Option<&str>, snapshot: Option<&amber_core::settings::LocalSettings>) -> Result<Served, String> {
         use tauri::Manager;
         // The Engine page shows the PC's own model; a phone's switch is not its news.
         let own = model.is_none();
         let mut running = self.running.lock().unwrap();
         let core = app.state::<crate::state::Core>();
         let layout = &core.paths.layout;
-        let settings = core.settings().local;
+        let settings = snapshot.cloned().unwrap_or_else(|| core.settings().local);
         let key = Key { runtime: settings.runtime.clone(), model: model.unwrap_or(&settings.model).to_string(), threads: settings.threads };
 
         let rt = local::runtime(&key.runtime).ok_or("Unknown runtime.")?;
@@ -283,6 +302,39 @@ impl Whisper {
     }
 }
 
+struct SnapshotEngine {
+    running: Arc<Mutex<Option<Running>>>,
+    base: String,
+    transcriber: WhisperServerTranscriber,
+}
+
+impl Transcriber for SnapshotEngine {
+    fn transcribe(&self, wav: &[u8], options: &TranscribeOptions) -> Result<String, SttError> {
+        self.transcribe_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        with_snapshot(&self.running, &self.base, |r| &r.base, cancel, || {
+            self.transcriber.transcribe_cancellable(wav, options, cancel)
+        })
+    }
+}
+
+/// Stop/replacement needs this same mutex. The secret URL identifies a particular helper,
+/// not just a model name or reusable TCP port. A change before lock acquisition is a retry,
+/// never permission to send a request under stale model metadata.
+fn with_snapshot<T, R>(running: &Mutex<Option<T>>, base: &str, identity: impl FnOnce(&T) -> &str, cancel: &CancellationToken, infer: impl FnOnce() -> Result<R, SttError>) -> Result<R, SttError> {
+    cancel.check()?;
+    let running = running.lock().unwrap();
+    cancel.check()?;
+    if !running.as_ref().is_some_and(|r| identity(r) == base) {
+        return Err(SttError::new(ErrorKind::Unreachable, "The local model changed before recognition started. Try the test again.", "snapshot helper replaced"));
+    }
+    let result = infer();
+    cancel.check()?;
+    result
+}
+
 /// whisper-server's arguments. It runs in the models folder, so the model is its file name;
 /// a tuned (short-context) model runs without flash attention ([local::flash_attention]).
 fn server_args(model: &local::Model, port: u16, threads: u32, path: &str) -> Vec<String> {
@@ -307,5 +359,68 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--model", tuned.file]) && args.windows(2).any(|w| w == ["--port", "5000"]));
         let stock = local::model("large-v3-turbo-q5_0").unwrap();
         assert!(!server_args(stock, 5000, 8, "/k").contains(&"--no-flash-attn".to_string()), "the full window keeps it");
+    }
+
+    #[test]
+    fn snapshot_pins_selected_helper_through_success_failure_and_cancellation() {
+        for (fail, cancelled) in [(false, false), (true, false), (false, true)] {
+            let running = Mutex::new(Some("actual-fallback-helper"));
+            let cancel = CancellationToken::default();
+            let result = with_snapshot(&running, "actual-fallback-helper", |r| *r, &cancel, || {
+                assert!(running.try_lock().is_err(), "model replacement must wait for inference");
+                if cancelled { cancel.cancel(); }
+                if fail { Err(SttError::new(ErrorKind::Server, "test failure", "test failure")) } else { Ok("recognized") }
+            });
+            assert!(running.try_lock().is_ok(), "every request exit releases the helper");
+            match (fail, cancelled) {
+                (_, true) => assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled),
+                (true, false) => assert_eq!(result.unwrap_err().kind, ErrorKind::Server),
+                _ => assert_eq!(result.unwrap(), "recognized"),
+            }
+        }
+    }
+
+    #[test]
+    fn changed_or_stopped_helper_never_runs_under_snapshot_metadata() {
+        for current in [None, Some("http://127.0.0.1:5000/new-secret")] {
+            let running = Mutex::new(current);
+            let result = with_snapshot(&running, "http://127.0.0.1:5000/old-secret", |r| *r, &CancellationToken::default(), || -> Result<(), SttError> {
+                panic!("a replacement must not receive this snapshot's inference");
+            });
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Unreachable);
+            assert!(running.try_lock().is_ok());
+        }
+    }
+
+    #[test]
+    fn cancelled_snapshot_does_not_wait_for_model_or_start_inference() {
+        let running = Mutex::new(Some("helper"));
+        let _busy = running.lock().unwrap();
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        let result = with_snapshot(&running, "helper", |r| *r, &cancel, || -> Result<(), SttError> {
+            panic!("cancelled snapshots must not run inference");
+        });
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn upload_entry_point_keeps_snapshot_guard_and_local_upload_metadata() {
+        let base = "http://127.0.0.1:9/test-helper";
+        let engine = SnapshotEngine {
+            running: Arc::new(Mutex::new(None)),
+            base: base.into(),
+            transcriber: WhisperServerTranscriber::new(base, None),
+        };
+        let options = TranscribeOptions::new("en", "");
+        let cancel = CancellationToken::default();
+        // With no matching helper, this must fail before making an HTTP request.
+        let (result, upload) = engine.transcribe_with_upload(&[], &options, &cancel);
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Unreachable);
+        assert!(upload.is_none());
+        cancel.cancel();
+        let (result, upload) = engine.transcribe_with_upload(&[], &options, &cancel);
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        assert!(upload.is_none());
     }
 }

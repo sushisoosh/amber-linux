@@ -61,7 +61,7 @@ export type TerminalMode = "default" | "off" | "auto" | "bash" | "powershell";
 export interface Settings {
   engine: EngineKind;
   local: { runtime: string; model: string; threads: number; keepLoaded: boolean; chunking: boolean };
-  server: { provider: string; baseUrl: string; model: string; localFallback: boolean };
+  server: { provider: string; baseUrl: string; model: string; uploadFormat: "wav" | "opus"; localFallback: boolean };
   language: string;
   vocabulary: string;
   microphone: string;
@@ -76,7 +76,7 @@ export interface Settings {
     hiddenIn: string[];
     hideFullscreen: boolean;
   };
-  insert: { method: InsertMethod; restoreClipboard: boolean; trailingSpace: boolean };
+  insert: { method: InsertMethod; pasteOnCompletion: boolean; restoreClipboard: boolean; trailingSpace: boolean };
   sounds: boolean;
   autostart: boolean;
   autoUpdate: boolean;
@@ -259,4 +259,71 @@ export interface StatsSummary {
 export interface Snippet {
   trigger: string;
   text: string;
+}
+
+/** Immutable metadata for the engine used by a particular test attempt. */
+export interface TestEngine {
+  engine: EngineKind;
+  provider: string;
+  model: string;
+  runtime: string | null;
+  baseUrl: string | null;
+}
+
+export type TestConfig = Pick<Settings, "engine" | "local" | "server" | "cleanup" | "language" | "vocabulary" | "microphone">;
+export type TestPhase = "idle" | "recording" | "recognizing" | "cleaning" | "cancelling";
+export type TestCleanupStatus = "notRun" | "disabled" | "empty" | "success" | "skipped" | "error";
+
+export interface UploadStats {
+  format: string;
+  inputBytes: number;
+  uploadBytes: number;
+  encodingMs: number;
+  note: string | null;
+}
+
+export interface TestResult {
+  id: number;
+  at: number;
+  recordingId: number | null;
+  sourceTestId: number | null;
+  canReplay: boolean;
+  config: TestConfig;
+  microphone: string | null;
+  microphoneFallback: boolean;
+  interrupted: boolean;
+  audioMs: number;
+  preparedAudioMs: number;
+  recognitionMs: number | null;
+  cleanupMs: number | null;
+  attempts: { engine: TestEngine; ms: number; error: string | null; upload: UploadStats | null }[];
+  actualEngine: TestEngine | null;
+  cleanupEngine: TestEngine | null;
+  fallback: boolean;
+  cleanupStatus: TestCleanupStatus;
+  cleanupError: string | null;
+  remoteAudio: boolean;
+  remoteText: boolean;
+  raw: string;
+  text: string;
+  error: string | null;
+}
+
+export interface SavedTestTable {
+  id: number;
+  name: string;
+  savedAt: number;
+  results: TestResult[];
+}
+
+export interface TestingState {
+  revision: number;
+  phase: TestPhase;
+  active: TestResult | null;
+  results: TestResult[];
+  savedTables: SavedTestTable[];
+  tableBusy: boolean;
+  tableStorageError: string | null;
+  audioBytes: number;
+  recordingCount: number;
 }

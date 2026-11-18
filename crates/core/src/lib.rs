@@ -23,4 +23,5 @@ pub mod spoken;
 pub mod stats;
 pub mod terminal;
 pub mod text;
+pub mod testing;
 pub mod insertion;

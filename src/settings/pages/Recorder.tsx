@@ -85,7 +85,7 @@ export function Recorder({ s, phase, phaseMessage, refresh, toast, go, desktop, 
     <div className={`recorder ${compact ? "compact" : ""}`}>
       {!compact && <>
         <h1>Recorder</h1>
-        <p className="lead">Record, review, then copy and paste where you choose. This window works without a tray icon or floating bubble.</p>
+        <p className="lead">Record without leaving your active app. Review and copy the result, or enable Ctrl+V on completion in Delivery.</p>
       </>}
       <Section title={compact ? undefined : "Dictation"}>
         <div className="row recorder-controls">
@@ -109,6 +109,11 @@ export function Recorder({ s, phase, phaseMessage, refresh, toast, go, desktop, 
         </Row>}
       </Section>
       {!compact && <>
+        <Section title="Delivery">
+          <Row label={s.insert.pasteOnCompletion ? "Paste on completion is enabled" : "Review and copy"} hint="The hotkey captures the destination before showing a non-focusing recording indicator. Ctrl+V is optional and restricted to supported X11 editors; Wayland uses manual Copy. Starting from this window does not select another app as a target.">
+            <button className="btn" onClick={() => go("insert")}>Configure delivery</button>
+          </Row>
+        </Section>
         <Section title="Latest result">
           {resultError && <Row label={<span className="note error" role="alert">{resultError}</span>}>
             <button className="btn" onClick={() => void loadResult()}>Refresh</button>
