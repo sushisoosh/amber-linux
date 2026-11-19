@@ -1,11 +1,12 @@
 // The last dictations, kept on this PC: nothing dictated into the wrong window, or that
 // could not be inserted, is lost.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { DictationEvent, HistoryEntry } from "../../shared/types";
 import type { PageProps } from "../App";
+import { DEFAULT_HISTORY_FILTERS, filterHistory, historyPrograms, type HistoryFilters } from "../history";
 import { Row, Section, Switch } from "../ui";
 
 export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProps) {
@@ -13,6 +14,12 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [filters, setFilters] = useState<HistoryFilters>(DEFAULT_HISTORY_FILTERS);
+  const deferredQuery = useDeferredValue(filters.query);
+  const searching = filters.query !== deferredQuery;
+  const visibleEntries = filterHistory(entries, { ...filters, query: deferredQuery }, Date.now());
+  const programs = historyPrograms(entries);
+  const filtered = filters.query !== "" || filters.program !== null || filters.date !== "all" || filters.status !== "all";
   const load = useCallback(async () => {
     try {
       setEntries(await invoke<HistoryEntry[]>("history_list"));
@@ -77,12 +84,88 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
       </Section>
       {linux && <p className="note">If your wallet was unavailable when Amber started, unlock it and restart Amber to reload encrypted history. Keep any needed result before restarting. Do not turn history off to retry: that deletes stored dictations.</p>}
       {s.history && (
-        <Section title={entries.length ? `${entries.length} dictations` : loadError ? "History unavailable" : linux ? "No loaded dictations" : "Nothing yet"}>
-          {entries.map((e) => (
-            <div className="item" key={e.at} style={{ alignItems: "flex-start" }}>
-              <div className="name">
+        <Section title="Saved dictations">
+          <div className="row column" role="search" aria-label="Filter history" style={{ gap: 12 }}>
+            <label style={{ display: "grid", gap: 6, minWidth: 0 }}>
+              Search history
+              <input
+                type="text"
+                value={filters.query}
+                placeholder="Search text or program"
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
+                style={{ width: "100%", minWidth: 0 }}
+                onChange={(e) => setFilters({ ...filters, query: e.target.value })}
+              />
+            </label>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+              <label style={{ display: "grid", gap: 6, flex: "1 1 160px", minWidth: 0 }}>
+                Program
+                <select
+                  value={filters.program === null ? "" : `program:${filters.program}`}
+                  style={{ minWidth: 0, width: "100%" }}
+                  onChange={(e) => setFilters({ ...filters, program: e.target.value === "" ? null : e.target.value.slice(8) })}
+                >
+                  <option value="">All programs</option>
+                  {filters.program !== null && !programs.some((p) => p.value === filters.program) && (
+                    <option value={`program:${filters.program}`}>{filters.program || "Unknown program"} (no saved dictations)</option>
+                  )}
+                  {programs.map((p) => <option key={p.value} value={`program:${p.value}`}>{p.label}</option>)}
+                </select>
+              </label>
+              <label style={{ display: "grid", gap: 6, flex: "1 1 160px", minWidth: 0 }}>
+                Date range
+                <select
+                  value={filters.date}
+                  aria-describedby="history-date-hint"
+                  style={{ minWidth: 0, width: "100%" }}
+                  onChange={(e) => setFilters({ ...filters, date: e.target.value as HistoryFilters["date"] })}
+                >
+                  <option value="all">All dates</option>
+                  <option value="today">Today</option>
+                  <option value="7days">Last 7 days</option>
+                  <option value="30days">Last 30 days</option>
+                </select>
+              </label>
+              <label style={{ display: "grid", gap: 6, flex: "1 1 160px", minWidth: 0 }}>
+                Insertion status
+                <select
+                  value={filters.status}
+                  style={{ minWidth: 0, width: "100%" }}
+                  onChange={(e) => setFilters({ ...filters, status: e.target.value as HistoryFilters["status"] })}
+                >
+                  <option value="all">All statuses</option>
+                  <option value="inserted">Inserted</option>
+                  <option value="not-inserted">Not inserted</option>
+                </select>
+              </label>
+            </div>
+            <div className="note" id="history-date-hint">Date ranges use local calendar days and include today. Search stays in memory only.</div>
+          </div>
+          <div className="row" style={{ flexWrap: "wrap" }}>
+            <div className="label note" role="status" aria-live="polite" aria-atomic="true">
+              {searching ? "Updating results..." : `${visibleEntries.length} of ${entries.length} saved dictations shown`}
+              {loadError && entries.length > 0 && " (last loaded history; refresh failed)"}
+            </div>
+            <button className="btn" disabled={!filtered && !searching} onClick={() => setFilters(DEFAULT_HISTORY_FILTERS)}>Clear filters</button>
+          </div>
+          {visibleEntries.length === 0 && !searching && (
+            <div className="row note">
+              {entries.length > 0
+                ? "No dictations match these filters. Try another search or clear the filters."
+                : loadError
+                  ? "History unavailable. Saved dictations could not be loaded."
+                  : linux
+                    ? "No loaded dictations. New dictations appear here when encrypted history storage is available."
+                    : "No saved dictations yet. New dictations will appear here while history is on."}
+            </div>
+          )}
+          {visibleEntries.map((e) => (
+            <div className="item" key={e.at} style={{ alignItems: "flex-start", flexWrap: "wrap" }}>
+              <div className="name" style={{ flexBasis: 240 }}>
                 <div className="hint">
-                  {new Date(e.at).toLocaleString()} · {e.program || "unknown program"}
+                  {new Date(e.at).toLocaleString()} · {e.program.trim() || "unknown program"}
                   {!e.inserted && " · not inserted"}
                 </div>
                 <div style={{ whiteSpace: "pre-wrap", userSelect: "text", marginTop: 2 }}>{e.text}</div>
@@ -117,9 +200,11 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
             </div>
           ))}
           {entries.length > 0 && (
-            <div className="row">
+            <div className="row" style={{ flexWrap: "wrap" }}>
+              <div className="label note" id="history-delete-hint">Deletes all saved dictations, including those hidden by filters.</div>
               <button
                 className="btn danger"
+                aria-describedby="history-delete-hint"
                 onClick={async () => {
                   try {
                     await invoke("history_clear");
@@ -130,7 +215,7 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
                   }
                 }}
               >
-                Delete all
+                Delete all history
               </button>
             </div>
           )}

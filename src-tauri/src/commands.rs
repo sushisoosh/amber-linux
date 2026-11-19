@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use amber_core::engine::OpenAiTranscriber;
 use amber_core::local::{self, DownloadError};
 use amber_core::providers;
 use amber_core::settings::{EngineKind, Settings};
@@ -27,6 +26,8 @@ pub struct ProviderInfo {
     key_url: &'static str,
     needs_key: bool,
     has_key: bool,
+    supports_speech: bool,
+    supports_cleanup: bool,
 }
 
 #[derive(Serialize)]
@@ -180,6 +181,8 @@ fn providers_info(core: &Core) -> Vec<ProviderInfo> {
             key_url: p.key_url,
             needs_key: p.needs_key,
             has_key: core.has_key(p.id),
+            supports_speech: p.supports_speech(),
+            supports_cleanup: p.supports_cleanup(),
         })
         .collect()
 }
@@ -196,14 +199,16 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<Setting
 
 fn save_settings_inner(app: &AppHandle, core: &Core, settings: Settings) -> Result<Settings, String> {
     let _transaction = core.settings_changes.lock().unwrap();
+    amber_core::connections::validate(&settings.connections)?;
+    amber_core::instructions::validate(&settings.instructions)?;
     let before = core.settings();
     if settings.history && !before.history {
         crate::secrets::check_available()?;
     }
-    if let Some(base) = (settings.server.provider == providers::CUSTOM.id).then(|| settings.server.base_url.trim()).filter(|b| !b.is_empty()) {
+    if let Some(base) = (settings.server.connection_id.is_none() && settings.server.provider == providers::CUSTOM.id).then(|| settings.server.base_url.trim()).filter(|b| !b.is_empty()) {
         providers::check_base_url(base)?;
     }
-    if settings.cleanup.provider == providers::CUSTOM.id && !settings.cleanup.base_url.trim().is_empty() {
+    if settings.cleanup.connection_id.is_none() && settings.cleanup.provider == providers::CUSTOM.id && !settings.cleanup.base_url.trim().is_empty() {
         providers::check_base_url(&settings.cleanup.base_url)?;
     }
     let mut after = core.try_update_settings(|s| *s = settings)?;
@@ -307,7 +312,7 @@ pub async fn test_server(app: AppHandle, provider: String, base_url: String, key
     }
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = Instant::now();
-        OpenAiTranscriber::new(&base, &key, "").check().map(|_| t0.elapsed().as_millis() as u64).map_err(|e| e.message)
+        amber_core::engine::check_provider(p, &base, &key).map(|_| t0.elapsed().as_millis() as u64).map_err(|e| e.message)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -370,14 +375,17 @@ pub async fn mic_test(app: AppHandle, device: Option<String>) -> Result<(), Stri
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalItem {
-    id: &'static str,
-    label: &'static str,
-    note: &'static str,
+    id: String,
+    label: String,
+    note: String,
     size_mb: u32,
     installed: bool,
     wants_gpu: bool,
     /// Kept for existing downloads; shown only while installed.
     replaced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    family: Option<&'static str>,
+    imported: bool,
 }
 
 #[derive(Serialize)]
@@ -388,27 +396,45 @@ pub struct LocalInfo {
     has_nvidia: bool,
     recommended: (&'static str, &'static str),
     /// Model id -> measured milliseconds for 10 s of speech on the current runtime.
-    measured: std::collections::HashMap<&'static str, u64>,
+    measured: std::collections::HashMap<String, u64>,
     status: whisper::Status,
     downloads: Vec<String>,
     folder: String,
     llm_runtimes: Vec<LocalItem>,
     llm_models: Vec<LocalItem>,
     llm_status: whisper::Status,
+    onnx_runtime_installed: bool,
+    imports_error: Option<String>,
 }
 
 #[tauri::command]
 pub fn local_info(core: State<Core>) -> LocalInfo {
     let layout = &core.paths.layout;
     let has_nvidia = has_nvidia();
+    let (imports, imports_error) = match amber_core::imports::list(layout) {
+        Ok(models) => (models, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     LocalInfo {
         runtimes: local::RUNTIMES
             .iter()
-            .map(|r| LocalItem { id: r.id, label: r.label, note: r.note, size_mb: r.size_mb, installed: layout.runtime_installed(r), wants_gpu: r.id == "cuda", replaced: false })
+            .map(|r| LocalItem { id: r.id.into(), label: r.label.into(), note: r.note.into(), size_mb: r.size_mb, installed: layout.runtime_installed(r), wants_gpu: r.id == "cuda", replaced: false, family: None, imported: false })
             .collect(),
         models: local::MODELS
             .iter()
-            .map(|m| LocalItem { id: m.id, label: m.label, note: m.note, size_mb: m.size_mb, installed: layout.model_installed(m), wants_gpu: m.wants_gpu, replaced: m.replaced })
+            .map(|m| LocalItem { id: m.id.into(), label: m.label.into(), note: m.note.into(), size_mb: m.size_mb, installed: layout.model_installed(m), wants_gpu: m.wants_gpu, replaced: m.replaced, family: Some("whisper"), imported: false })
+            .chain(amber_core::onnx::MODELS.iter().map(|m| LocalItem {
+                id: m.id.into(), label: m.label.into(), note: m.note.into(), size_mb: m.size_mb(), installed: amber_core::onnx::installed(layout, m),
+                wants_gpu: false, replaced: false,
+                family: Some(if matches!(m.backend, amber_core::onnx::Backend::Parakeet) { "parakeet" } else { "moonshine" }),
+                imported: false,
+            }))
+            .chain(imports.iter().map(|m| LocalItem {
+                id: m.id.clone(), label: m.name.clone(),
+                note: format!("Imported {}; languages: {}. Integrity-checked, not publisher-verified.", m.variant.family(), if m.languages.is_empty() { "multilingual".into() } else { m.languages.join(", ") }),
+                size_mb: m.size_mb(), installed: amber_core::imports::resolve(layout, &m.id).is_ok_and(|model| amber_core::imports::installed(layout, &model)),
+                wants_gpu: false, replaced: false, family: Some(m.variant.family()), imported: true,
+            }))
             .collect(),
         has_nvidia,
         recommended: local::recommend(has_nvidia, threads(), total_ram_mb()),
@@ -417,21 +443,32 @@ pub fn local_info(core: State<Core>) -> LocalInfo {
             .filter_map(|m| {
                 let key = amber_core::estimate::key("local", &core.settings().local.runtime, m.id);
                 // What a 10-second dictation takes on this PC, once measured.
-                core.estimates.rate(&key).map(|r| (m.id, 200 + (10_000.0 * r.per_ms) as u64))
+                core.estimates.rate(&key).map(|r| (m.id.to_string(), 200 + (10_000.0 * r.per_ms) as u64))
             })
+            .chain(amber_core::onnx::MODELS.iter().filter_map(|m| {
+                let key = amber_core::estimate::key("local", "onnx-cpu", m.id);
+                core.estimates.rate(&key).map(|r| (m.id.to_string(), 200 + (10_000.0 * r.per_ms) as u64))
+            }))
+            .chain(imports.iter().filter_map(|m| {
+                let runtime = if m.variant == amber_core::imports::Variant::Whisper { core.settings().local.runtime } else { "onnx-cpu".into() };
+                let key = amber_core::estimate::key("local", &runtime, &m.id);
+                core.estimates.rate(&key).map(|r| (m.id.clone(), 200 + (10_000.0 * r.per_ms) as u64))
+            }))
             .collect(),
         status: core.whisper.status(),
         downloads: core.downloads.lock().unwrap().keys().cloned().collect(),
         folder: layout.root.display().to_string(),
         llm_runtimes: local::LLM_RUNTIMES
             .iter()
-            .map(|r| LocalItem { id: r.id, label: r.label, note: r.note, size_mb: r.size_mb(), installed: layout.llm_runtime_installed(r), wants_gpu: r.id == "cuda", replaced: false })
+            .map(|r| LocalItem { id: r.id.into(), label: r.label.into(), note: r.note.into(), size_mb: r.size_mb(), installed: layout.llm_runtime_installed(r), wants_gpu: r.id == "cuda", replaced: false, family: None, imported: false })
             .collect(),
         llm_models: local::LLM_MODELS
             .iter()
-            .map(|m| LocalItem { id: m.id, label: m.label, note: m.note, size_mb: m.size_mb, installed: layout.llm_model_installed(m), wants_gpu: true, replaced: false })
+            .map(|m| LocalItem { id: m.id.into(), label: m.label.into(), note: m.note.into(), size_mb: m.size_mb, installed: layout.llm_model_installed(m), wants_gpu: true, replaced: false, family: None, imported: false })
             .collect(),
         llm_status: core.llm.status(),
+        onnx_runtime_installed: amber_core::onnx::runtime_installed(layout),
+        imports_error,
     }
 }
 
@@ -589,9 +626,12 @@ fn plan(core: &Core, kind: Kind, id: &str) -> Result<(Vec<Fetch>, Option<Install
 #[tauri::command]
 pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, select: bool) -> Result<(), String> {
     let key = key_of(kind, &id);
-    let (fetches, install) = plan(&core, kind, &id)?;
+    let onnx_model = if kind == Kind::Model { amber_core::onnx::model(&id) } else { None };
+    let (fetches, install) = if onnx_model.is_some() { (Vec::new(), None) } else { plan(&core, kind, &id)? };
     #[cfg(target_os = "linux")]
-    check_download_space(&core.paths.layout.root, &fetches, install.is_some())?;
+    check_download_space(&core.paths.layout.root, onnx_model.map_or_else(
+        || fetches.iter().map(|f| f.size).sum(), |m| m.files.iter().map(|f| f.size).sum()
+    ), install.is_some() || onnx_model.is_some())?;
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut downloads = core.downloads.lock().unwrap();
@@ -609,20 +649,27 @@ pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, selec
         let combined: u64 = fetches.iter().map(|f| f.size).sum();
         let single = fetches.len() == 1;
         let mut offset = 0u64;
-        let mut result = Ok(());
-        for f in &fetches {
-            result = local::download_verified(&f.url, f.sha256, &f.file, &cancel, &mut |d, t| {
-                if single {
-                    emit(d, t, "running", None)
-                } else {
-                    emit(offset + d, Some(combined), "running", None)
+        let mut result = if let Some(model) = onnx_model {
+            let core = app.state::<Core>();
+            core.whisper.stop_model(&app, model.id);
+            amber_core::onnx::download(&core.paths.layout, model, &cancel, &mut |d, t| emit(d, t, "running", None))
+        } else {
+            let mut result = Ok(());
+            for f in &fetches {
+                result = local::download_verified(&f.url, f.sha256, &f.file, &cancel, &mut |d, t| {
+                    if single {
+                        emit(d, t, "running", None)
+                    } else {
+                        emit(offset + d, Some(combined), "running", None)
+                    }
+                });
+                if result.is_err() {
+                    break;
                 }
-            });
-            if result.is_err() {
-                break;
+                offset += f.size;
             }
-            offset += f.size;
-        }
+            result
+        };
         let unpacks = install.is_some();
         if result.is_ok() {
             if let Some(install) = install {
@@ -674,7 +721,7 @@ pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, selec
 }
 
 #[cfg(target_os = "linux")]
-fn check_download_space(root: &std::path::Path, fetches: &[Fetch], unpack: bool) -> Result<(), String> {
+fn check_download_space(root: &std::path::Path, bytes: u64, unpack: bool) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|_| "Invalid model directory.")?;
     let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -683,7 +730,6 @@ fn check_download_space(root: &std::path::Path, fetches: &[Fetch], unpack: bool)
     }
     let info = unsafe { info.assume_init() };
     let free = (info.f_bavail as u64).saturating_mul(info.f_frsize as u64);
-    let bytes = fetches.iter().fold(0u64, |sum, file| sum.saturating_add(file.size));
     let needed = bytes.saturating_mul(if unpack { 3 } else { 1 }).saturating_add(256 * 1024 * 1024);
     if free < needed {
         return Err(format!("Not enough disk space. This download needs about {} MiB including installation headroom; {} MiB is available.", needed / (1 << 20), free / (1 << 20)));
@@ -706,6 +752,9 @@ pub async fn remove_download(app: AppHandle, kind: Kind, id: String) -> Result<(
     tauri::async_runtime::spawn_blocking(move || {
         let core = app.state::<Core>();
         let layout = &core.paths.layout;
+        if core.downloads.lock().unwrap().contains_key(&key_of(kind, &id)) {
+            return Err("Cancel the download before deleting it.".into());
+        }
         match kind {
             Kind::Runtime => core.whisper.stop_runtime(&app, &id),
             Kind::Model => core.whisper.stop_model(&app, &id),
@@ -715,7 +764,11 @@ pub async fn remove_download(app: AppHandle, kind: Kind, id: String) -> Result<(
         }
         match kind {
             Kind::Runtime => std::fs::remove_dir_all(layout.runtime_dir(local::runtime(&id).ok_or("Unknown runtime.")?)),
-            Kind::Model => std::fs::remove_file(layout.model_path(local::model(&id).ok_or("Unknown model.")?)),
+            Kind::Model => if let Some(model) = amber_core::onnx::model(&id) {
+                std::fs::remove_dir_all(amber_core::onnx::model_dir(layout, model))
+            } else {
+                std::fs::remove_file(layout.model_path(local::model(&id).ok_or("Unknown model.")?))
+            },
             Kind::LlmRuntime => std::fs::remove_dir_all(layout.llm_runtime_dir(local::llm_runtime(&id).ok_or("Unknown runtime.")?)),
             Kind::LlmModel => std::fs::remove_file(layout.llm_model_path(local::llm_model(&id).ok_or("Unknown model.")?)),
             Kind::Tunnel => std::fs::remove_file(layout.cloudflared_exe()),
@@ -733,6 +786,15 @@ pub fn start_local(app: AppHandle) {
         let core = app.state::<Core>();
         let _ = core.whisper.ensure(&app);
     });
+}
+
+/// Releases memory, not the downloaded weights. The next use loads the selected model.
+#[tauri::command]
+pub async fn stop_local(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        core.dictation.when_idle(|| core.whisper.stop(&app))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -872,14 +934,22 @@ pub struct Preview {
 pub async fn cleanup_preview(app: AppHandle, text: String, style: amber_core::profiles::WritingStyle) -> Preview {
     tauri::async_runtime::spawn_blocking(move || {
         let s = app.state::<Core>().settings();
-        let fillers = crate::llm::by_rule(&s, &text);
+        let instruction = amber_core::instructions::match_start(&s.instructions, &text);
+        let fillers = if instruction.is_some() { text.clone() } else { crate::llm::by_rule(&s, &text) };
         if !s.cleanup.smart {
             return Preview { fillers, smart: None, error: None, ms: 0 };
         }
         let t0 = Instant::now();
         let languages = amber_core::engine::TranscribeOptions::new(&s.language, "");
         let ask = amber_core::cleanup::Ask { style, instruction: "", vocabulary: &s.vocabulary, language: languages.fixed() };
-        let result = crate::llm::cleaner(&app, &s, true).and_then(|c| c.clean(&fillers, &ask).map_err(|e| e.message));
+        let result = if instruction.as_ref().is_some_and(|matched| matched.body.is_empty()) {
+            Err("Say a request after the instruction keyword.".into())
+        } else {
+            crate::llm::cleaner(&app, &s, true).and_then(|c| match instruction {
+                Some(matched) => c.transform_cancellable(matched.body, matched.instruction, &amber_core::engine::CancellationToken::default()).map_err(|e| e.message),
+                None => c.clean(&fillers, &ask).map_err(|e| e.message),
+            })
+        };
         let ms = t0.elapsed().as_millis() as u64;
         match result {
             Ok(smart) => Preview { fillers, smart: Some(smart), error: None, ms },
@@ -918,6 +988,7 @@ pub struct ChatProvider {
 pub fn chat_providers(core: State<Core>) -> Vec<ChatProvider> {
     providers::ALL
         .iter()
+        .filter(|p| p.supports_cleanup())
         .map(|p| ChatProvider {
             id: p.id,
             name: p.name,

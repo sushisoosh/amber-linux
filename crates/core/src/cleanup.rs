@@ -1,6 +1,6 @@
 //! The smart cleanup: a chat model tidies a dictation - punctuation, false starts, and
-//! self-corrections ("um drei, nee stopp, um vier" -> "um vier"). One OpenAI-style client for
-//! the local llama.cpp server and OpenAI-compatible providers. The prompt and the
+//! self-corrections ("um drei, nee stopp, um vier" -> "um vier"). OpenAI chat and Anthropic
+//! Messages adapters share the same prompt and validation. The prompt and the
 //! safety rules come from Amber for Android.
 //!
 //! Any failure keeps the dictation as recognized: a cleanup must never lose text.
@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::engine::{CancellationToken, ErrorKind, SttError};
 use crate::profiles::WritingStyle;
+use crate::providers::{Provider, CleanupApi};
 
 /// A cleanup is worth a short wait, never a long one; the recognized text is ready.
 pub const TIMEOUT: Duration = Duration::from_secs(12);
@@ -295,6 +296,7 @@ pub struct ChatCleaner {
     /// Provider-specific request fields, e.g. `reasoning_effort` for gpt-oss.
     extra: Option<Value>,
     http: Client,
+    api: CleanupApi,
 }
 
 impl ChatCleaner {
@@ -305,7 +307,34 @@ impl ChatCleaner {
             model: model.to_string(),
             extra,
             http: crate::engine::client(TIMEOUT, base_url.trim()),
+            api: CleanupApi::OpenAi,
         }
+    }
+
+    pub fn for_provider(provider: &Provider, custom_base: &str, api_key: &str, model: &str) -> Result<Self, SttError> {
+        let api = provider.cleanup_api.ok_or_else(|| fail("This provider does not support cleanup in Amber.", "speech-only provider"))?;
+        let base = crate::providers::effective_base_url(provider, custom_base);
+        crate::engine::validate_endpoint(&base)?;
+        let mut extra = provider.chat_model(model).and_then(|m| m.extra).and_then(|e| serde_json::from_str(e).ok());
+        if provider.id == "openrouter" {
+            // Also applies to user-entered model IDs: never request automatic provider retries.
+            extra.get_or_insert_with(|| json!({}))["provider"] = json!({"allow_fallbacks": false});
+        }
+        let mut cleaner = Self::new(&base, api_key, model, extra);
+        cleaner.api = api;
+        if api == CleanupApi::Anthropic {
+            cleaner.url = format!("{base}/messages");
+        } else if provider.id == "mistral" {
+            // Mistral's native /v1 chat may return chunk arrays; its official compatibility
+            // endpoint guarantees the OpenAI shape used here and by forwarded phone calls.
+            // https://docs.mistral.ai/inference/conversations/chat-completion
+            cleaner.url = "https://api.mistral.ai/openai/v1/chat/completions".into();
+        } else if !provider.base_url.is_empty() {
+            // Known APIs have exact paths, including Gemini's /v1beta/openai prefix.
+            // Custom servers keep the shipped root /v1 and full-URL behavior of new().
+            cleaner.url = format!("{base}/chat/completions");
+        }
+        Ok(cleaner)
     }
 
     pub fn clean(&self, text: &str, ask: &Ask) -> Result<String, SttError> {
@@ -349,6 +378,31 @@ impl ChatCleaner {
         cancel.check()?;
         Ok(cleaned)
     }
+
+    /// An explicitly selected saved transformation, not an ordinary tidy-up. Never weakens
+    /// clean_cancellable's meaning checks, retries remotely, or executes generated output.
+    pub fn transform_cancellable(&self, text: &str, instruction: &crate::instructions::Instruction, cancel: &CancellationToken) -> Result<String, SttError> {
+        cancel.check()?;
+        crate::instructions::validate(std::slice::from_ref(instruction)).map_err(|e| fail(&e, "invalid instruction"))?;
+        if !instruction.enabled || text.trim().is_empty() || text.chars().count() > crate::instructions::TEXT_CHARS {
+            return Err(fail("The instruction is disabled or its input is empty or too long; kept the original.", "invalid transformation input"));
+        }
+        let body = json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 4096,
+            "messages": crate::instructions::messages(instruction, text),
+        });
+        let reply = self.post(body, cancel)?;
+        let choice = reply.pointer("/choices/0").ok_or_else(|| fail("The instruction answer was empty; kept the original.", "missing choice"))?;
+        if !matches!(choice.get("finish_reason").and_then(Value::as_str), Some("stop" | "eos" | "eos_token" | "end_turn" | "stop_sequence")) {
+            return Err(fail("The instruction did not finish; kept the original.", "unexpected finish reason"));
+        }
+        let content = choice.pointer("/message/content").and_then(Value::as_str).unwrap_or("");
+        let transformed = crate::instructions::output(content, instruction.output).map_err(|e| fail(e, "invalid transformation output"))?;
+        cancel.check()?;
+        Ok(transformed)
+    }
 }
 
 impl ChatCleaner {
@@ -381,12 +435,77 @@ impl ChatCleaner {
                 map.insert(k.clone(), v.clone());
             }
         }
-        let mut req = self.http.post(&self.url).json(&body);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
+        let root = if self.api == CleanupApi::Anthropic {
+            self.post_anthropic(body, cancel)?
+        } else {
+            let mut req = self.http.post(&self.url).json(&body);
+            if !self.api_key.is_empty() {
+                req = req.bearer_auth(&self.api_key);
+            }
+            let (status, body) = crate::engine::request(&self.http, req, crate::engine::MAX_RESPONSE_BYTES, cancel)?;
+            crate::engine::response_json(status, &body)?
+        };
+        // HTTP 200 can contain a failed generation and partial text. Forwarding must reject
+        // it too, without exposing raw provider diagnostics from any returned choice.
+        let has_error = |value: &Value| value.get("error").is_some_and(|v| !v.is_null());
+        if has_error(&root) || root.get("choices").and_then(Value::as_array).is_some_and(|choices| {
+            choices.iter().any(|choice| has_error(choice) || choice.get("finish_reason").and_then(Value::as_str) == Some("error"))
+        }) {
+            return Err(fail("The cleanup provider reported an error.", "response contains a provider error"));
         }
-        let (status, body) = crate::engine::request(&self.http, req, crate::engine::MAX_RESPONSE_BYTES, cancel)?;
-        crate::engine::response_json(status, &body)
+        Ok(root)
+    }
+
+    fn post_anthropic(&self, mut body: Value, cancel: &CancellationToken) -> Result<Value, SttError> {
+        let source = body["messages"].as_array().ok_or_else(|| fail("The request has no messages.", ""))?;
+        let mut system = Vec::new();
+        let mut turns = Vec::new();
+        for message in source {
+            let content = message["content"].as_str()
+                .ok_or_else(|| fail("Anthropic cleanup accepts text messages only.", "unsupported message content"))?;
+            match message["role"].as_str() {
+                Some("system") if turns.is_empty() => system.push(content.to_string()),
+                Some("user" | "assistant") => turns.push(json!({"role": message["role"], "content": content})),
+                _ => return Err(fail("Anthropic cleanup needs leading system messages followed by user and assistant turns.", "unsupported message role or order")),
+            }
+        }
+        if turns.is_empty() { return Err(fail("The request has no user messages.", "empty conversation")); }
+        body["messages"] = json!(turns);
+        if !system.is_empty() { body["system"] = json!(system.join("\n\n")); }
+        // Pin the version supporting temperature, including the phone's forwarded value.
+        // 2026-10-21 removes sampling controls; 2023-06-01 remains supported.
+        let req = self.http.post(&self.url).header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01").json(&body);
+        let (status, bytes) = crate::engine::request(&self.http, req, crate::engine::MAX_RESPONSE_BYTES, cancel)?;
+        let root = crate::engine::response_json(status, &bytes)?;
+        if root.get("error").is_some_and(|v| !v.is_null()) {
+            return Err(fail("The cleanup provider reported an error.", "response contains an error field"));
+        }
+        let blocks = root["content"].as_array().ok_or_else(|| fail("The cleanup answer was empty.", "missing content blocks"))?;
+        let mut text = String::new();
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => text.push_str(block["text"].as_str().ok_or_else(|| fail("The cleanup answer was invalid.", "invalid text block"))?),
+                Some("thinking" | "redacted_thinking") => {},
+                _ => return Err(fail("The cleanup did not return plain text.", "unsupported content block")),
+            }
+        }
+        let finish = match root["stop_reason"].as_str() {
+            Some("end_turn" | "stop_sequence") => "stop",
+            Some("max_tokens") => "length",
+            Some("refusal") => "content_filter",
+            _ => "error",
+        };
+        // Keep the phone's public OpenAI-compatible response shape, not native Messages JSON.
+        let mut reply = json!({
+            "id": root["id"], "object": "chat.completion", "model": self.model,
+            "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}],
+        });
+        if let (Some(input), Some(output)) = (root["usage"]["input_tokens"].as_u64(), root["usage"]["output_tokens"].as_u64()) {
+            reply["usage"] = json!({"prompt_tokens": input, "completion_tokens": output, "total_tokens": input.saturating_add(output)});
+        }
+        Ok(reply)
     }
 }
 
@@ -537,6 +656,186 @@ mod tests {
         (200, "application/json", body.to_string().into_bytes())
     }
 
+    fn bash_instruction() -> crate::instructions::Instruction {
+        crate::instructions::Instruction {
+            id: "bash".into(), name: "Bash".into(), keyword: "bash".into(),
+            prompt: "Turn the request into a Bash command.".into(), enabled: true,
+            output: crate::instructions::InstructionOutput::Shell,
+        }
+    }
+
+    #[test]
+    fn explicit_transformation_is_bounded_and_separate_from_meaning_preserving_cleanup() {
+        let text = "list all files including hidden files";
+        let (url, rx) = serve(vec![reply("```bash\nls -la\n```\n", "stop"), reply("ls -la", "stop")]);
+        let cleaner = ChatCleaner::new(&url, "test-key", "chosen-model", None);
+        assert_eq!(cleaner.transform_cancellable(text, &bash_instruction(), &CancellationToken::default()).unwrap(), "ls -la");
+        let body: Value = serde_json::from_slice(&rx.recv().unwrap().body).unwrap();
+        assert_eq!(body["model"], "chosen-model");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert!(cleaner.clean(text, &Ask::default()).is_err(), "ordinary cleanup must still reject the same rewrite");
+        rx.recv().unwrap();
+        assert!(rx.try_recv().is_err(), "no retry or second provider");
+    }
+
+    #[test]
+    fn transformations_reject_truncated_unsafe_empty_and_disabled_requests() {
+        for (content, finish) in [("ls -la", "length"), ("ls -la", "error"), ("", "stop"), ("ls\r", "stop"), ("ls\u{1b}[13~", "stop")] {
+            let (url, rx) = serve(vec![reply(content, finish)]);
+            let cleaner = ChatCleaner::new(&url, "", "m", None);
+            assert!(cleaner.transform_cancellable("list files", &bash_instruction(), &CancellationToken::default()).is_err());
+            rx.recv().unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+        let cleaner = ChatCleaner::new("http://127.0.0.1:1", "", "m", None);
+        for text in ["", &"x".repeat(crate::instructions::TEXT_CHARS + 1)] {
+            assert_eq!(cleaner.transform_cancellable(text, &bash_instruction(), &CancellationToken::default()).unwrap_err().kind, ErrorKind::BadResponse);
+        }
+        let mut disabled = bash_instruction();
+        disabled.enabled = false;
+        assert_eq!(cleaner.transform_cancellable("list files", &disabled, &CancellationToken::default()).unwrap_err().kind, ErrorKind::BadResponse);
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        assert_eq!(cleaner.transform_cancellable("list files", &bash_instruction(), &cancel).unwrap_err().kind, ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn transformations_cancel_in_flight_without_waiting_for_the_provider() {
+        let (url, ready, release) = crate::engine::testserver::stalled(b"");
+        let cleaner = ChatCleaner::new(&url, "", "m", None);
+        let cancel = CancellationToken::default();
+        let worker_cancel = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(cleaner.transform_cancellable("list files", &bash_instruction(), &worker_cancel)).unwrap());
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel.cancel();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        drop(release);
+        worker.join().unwrap();
+    }
+
+    fn anthropic_reply(content: &str, stop: &str) -> (u16, &'static str, Vec<u8>) {
+        (200, "application/json", json!({"id": "msg_test", "type": "message", "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "not output"}, {"type": "text", "text": content}],
+            "stop_reason": stop, "usage": {"input_tokens": 10, "output_tokens": 4}}).to_string().into_bytes())
+    }
+
+    fn provider_at(provider: &Provider, url: &str, model: &str) -> ChatCleaner {
+        let mut cleaner = ChatCleaner::for_provider(provider, "https://ignored.invalid", " test-key ", model).unwrap();
+        let source = reqwest::Url::parse(&cleaner.url).unwrap();
+        cleaner.url = format!("{url}{}", source.path());
+        cleaner.http = crate::engine::client(TIMEOUT, url);
+        cleaner
+    }
+
+    #[test]
+    fn added_compatible_cleanup_providers_use_exact_paths_and_model_options() {
+        use crate::providers::*;
+        for (provider, path) in [(&OPENROUTER, "/api/v1/chat/completions"), (&GEMINI, "/v1beta/openai/chat/completions"),
+            (&MISTRAL, "/openai/v1/chat/completions"), (&DEEPSEEK, "/chat/completions"), (&OLLAMA, "/v1/chat/completions")] {
+            let model = provider.chat_models.first().unwrap();
+            let cleaner = ChatCleaner::for_provider(provider, "https://ignored.invalid", "test-key", model.id).unwrap();
+            assert_eq!(cleaner.url, format!("{}{path}", reqwest::Url::parse(provider.base_url).unwrap().origin().ascii_serialization()));
+            let (url, rx) = serve(vec![reply("Hello world.", "stop")]);
+            let mut cleaner = provider_at(provider, &url, model.id);
+            if !provider.needs_key { cleaner.api_key.clear(); }
+            assert_eq!(cleaner.clean("hello world", &Ask::default()).unwrap(), "Hello world.");
+            let req = rx.recv().unwrap();
+            assert!(req.head.starts_with(&format!("POST {path} ")));
+            assert_eq!(req.head.to_lowercase().contains("authorization: bearer test-key"), provider.needs_key);
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["model"], model.id);
+            assert_eq!(body["temperature"], 0);
+            assert!(body["max_tokens"].as_u64().unwrap() < 4096);
+            if let Some(extra) = model.extra {
+                for (key, value) in serde_json::from_str::<Value>(extra).unwrap().as_object().unwrap() {
+                    assert_eq!(&body[key], value);
+                }
+            }
+            assert!(rx.try_recv().is_err());
+        }
+        let cleaner = ChatCleaner::for_provider(&OPENROUTER, "", "key", "user/model").unwrap();
+        assert_eq!(cleaner.extra.unwrap()["provider"]["allow_fallbacks"], false);
+        for provider in ALL.iter().filter(|p| !p.supports_cleanup()) {
+            assert!(ChatCleaner::for_provider(provider, "", "key", "model").is_err());
+        }
+    }
+
+    #[test]
+    fn anthropic_uses_messages_auth_and_the_same_cleanup_safety_rules() {
+        let (url, rx) = serve(vec![anthropic_reply("We meet at four.", "end_turn")]);
+        let provider = &crate::providers::ANTHROPIC;
+        let cleaner = provider_at(provider, &url, provider.chat_models[0].id);
+        assert_eq!(cleaner.clean("we meet at three no wait at four", &Ask::default()).unwrap(), "We meet at four.");
+        let req = rx.recv().unwrap();
+        assert!(req.head.starts_with("POST /v1/messages "));
+        assert!(req.head.to_lowercase().contains("x-api-key: test-key\r\n"));
+        assert!(req.head.to_lowercase().contains("anthropic-version: 2023-06-01\r\n"));
+        assert!(!req.head.to_lowercase().contains("authorization:"));
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        assert!(body["system"].as_str().unwrap().contains("Never translate"));
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body["messages"].as_array().unwrap().iter().all(|m| m["role"] != "system"));
+        assert_eq!(body["messages"].as_array().unwrap().last().unwrap()["content"], "<dictation>\nwe meet at three no wait at four\n</dictation>");
+        assert_eq!(body["model"], provider.chat_models[0].id);
+        assert_eq!(body["temperature"], 0);
+
+        for (text, stop) in [("We meet at four.", "max_tokens"), ("We meet at five.", "end_turn"),
+            ("Wir treffen uns um vier.", "end_turn"), ("We meet at four.", "refusal"), ("", "end_turn")] {
+            let (url, _) = serve(vec![anthropic_reply(text, stop)]);
+            assert!(provider_at(provider, &url, provider.chat_models[0].id).clean("we meet at four", &Ask::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn anthropic_forwarding_preserves_phone_contract_and_token_bounds() {
+        let (url, rx) = serve(vec![anthropic_reply("Hello.", "end_turn")]);
+        let cleaner = provider_at(&crate::providers::ANTHROPIC, &url, "claude-haiku-4-5");
+        let reply = cleaner.forward(&json!({"model": "phone-model", "temperature": 0.3, "max_tokens": 99999,
+            "messages": [{"role": "system", "content": "Tidy up."}, {"role": "user", "content": "hello"}]})).unwrap();
+        assert_eq!(reply["choices"][0]["message"]["content"], "Hello.");
+        assert_eq!(reply["choices"][0]["finish_reason"], "stop");
+        assert_eq!(reply["object"], "chat.completion");
+        assert!(reply["created"].is_u64());
+        assert_eq!(reply["usage"]["total_tokens"], 14);
+        assert_eq!(reply["model"], "claude-haiku-4-5");
+        let body: Value = serde_json::from_slice(&rx.recv().unwrap().body).unwrap();
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["temperature"], 0.3);
+        assert_eq!(body["system"], "Tidy up.");
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hello"}]));
+        assert!(rx.try_recv().is_err());
+        // Reject unsupported forwarding shapes before a billable call, not by dropping data.
+        for messages in [json!([{"role": "user", "content": [{"type": "image_url"}]}]),
+            json!([{"role": "tool", "content": "x"}]), json!([{"role": "user", "content": "x"}, {"role": "system", "content": "late"}])] {
+            assert_eq!(cleaner.forward(&json!({"messages": messages})).unwrap_err().kind, ErrorKind::BadResponse);
+        }
+    }
+
+    #[test]
+    fn anthropic_errors_are_private_and_requests_remain_cancellable() {
+        for (status, body) in [(401, r#"{"error":"private credential"}"#), (429, "private credential"),
+            (200, r#"{"error":{"message":"private credential"}}"#), (200, r#"{"content":[{"type":"tool_use","name":"private"}],"stop_reason":"tool_use"}"#)] {
+            let (url, rx) = serve(vec![(status, "application/json", body.as_bytes().to_vec())]);
+            let error = provider_at(&crate::providers::ANTHROPIC, &url, "claude-haiku-4-5").clean("private text", &Ask::default()).unwrap_err();
+            assert!(!error.to_string().contains("private"));
+            rx.recv().unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+        let (url, ready, release) = crate::engine::testserver::stalled(b"");
+        let cleaner = provider_at(&crate::providers::ANTHROPIC, &url, "claude-haiku-4-5");
+        let token = CancellationToken::default();
+        let worker_token = token.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(cleaner.clean_cancellable("text", &Ask::default(), &worker_token)).unwrap());
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        token.cancel();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        drop(release);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn sends_the_dictation_as_data_and_reads_the_answer() {
         let (url, rx) = serve(vec![reply("Lass uns um vier Uhr treffen.", "stop")]);
@@ -589,6 +888,51 @@ mod tests {
         c.forward(&json!({ "messages": [{ "role": "user", "content": "x" }] })).unwrap();
         let body: Value = serde_json::from_slice(&rx.recv().unwrap().body).unwrap();
         assert_eq!(body["max_tokens"], 2_048);
+    }
+
+    #[test]
+    fn provider_error_envelopes_are_rejected_for_cleanup_and_forwarding() {
+        // OpenRouter documents HTTP-200 choice errors with partial content and raw metadata:
+        // https://openrouter.ai/docs/api-reference/errors
+        let choice = json!({"message": {"role": "assistant", "content": "Hello world."}, "finish_reason": "stop"});
+        let diagnostic = json!({"code": 502, "message": "PRIVATE_PROVIDER_MESSAGE",
+            "metadata": {"raw": "PRIVATE_PROVIDER_CREDENTIAL", "provider_name": "PRIVATE_PROVIDER_NAME"}});
+        let mut nested = choice.clone();
+        nested["error"] = diagnostic.clone();
+        let mut nested_failed = nested.clone();
+        nested_failed["finish_reason"] = json!("error");
+        let mut finish_only = choice.clone();
+        finish_only["finish_reason"] = json!("error");
+        for body in [json!({"choices": [nested_failed]}), json!({"choices": [nested]}),
+            json!({"choices": [finish_only]}), json!({"error": diagnostic, "choices": [choice.clone()]}),
+            json!({"choices": [choice.clone(), {"error": {"message": "PRIVATE_LATER_CHOICE"}}]})] {
+            for forward in [false, true] {
+                let (url, rx) = serve(vec![(200, "application/json", body.to_string().into_bytes())]);
+                let cleaner = provider_at(&crate::providers::OPENROUTER, &url, "openai/gpt-4.1-mini");
+                let error = if forward {
+                    cleaner.forward(&json!({"messages": [{"role": "user", "content": "hello world"}]})).unwrap_err()
+                } else {
+                    cleaner.clean("hello world", &Ask::default()).unwrap_err()
+                };
+                assert_eq!(error.kind, ErrorKind::BadResponse);
+                assert_eq!(error.message, "The cleanup provider reported an error.");
+                assert_eq!(error.detail, "response contains a provider error");
+                assert!(!format!("{error} {error:?}").contains("PRIVATE_"));
+                rx.recv().unwrap();
+                assert!(rx.try_recv().is_err(), "no paid retry");
+            }
+        }
+    }
+
+    #[test]
+    fn null_error_fields_do_not_change_successful_cleanup_or_forwarding() {
+        let body = json!({"error": null, "choices": [{"error": null, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "Hello world."}}]});
+        let response = (200, "application/json", body.to_string().into_bytes());
+        let (url, _) = serve(vec![response.clone(), response]);
+        let cleaner = ChatCleaner::new(&url, "test-key", "model", None);
+        assert_eq!(cleaner.clean("hello world", &Ask::default()).unwrap(), "Hello world.");
+        assert_eq!(cleaner.forward(&json!({"messages": [{"role": "user", "content": "hello world"}]})).unwrap(), body);
     }
 
     #[test]

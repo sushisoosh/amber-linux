@@ -12,9 +12,10 @@ const result: TestResult = {
   id: 7, at: 1700000000000, recordingId: 3, sourceTestId: 3, canReplay: true,
   config: {
     engine: "server", local: { runtime: "cpu", model: "local-snapshot", threads: 4, keepLoaded: true, chunking: true },
-    server: { provider: "custom", baseUrl: "https://speech.example/v1", model: "requested-cloud", uploadFormat: "opus", localFallback: true },
-    cleanup: { smart: true, engine: "server", fillers: true, spokenPunctuation: false, germanCommas: true, localRuntime: "cpu", localModel: "local-cleaner", provider: "custom", baseUrl: "https://cleanup.example/v1", model: "old-cleaner" },
+    server: { connectionId: null, provider: "custom", baseUrl: "https://speech.example/v1", model: "requested-cloud", uploadFormat: "opus", localFallback: true },
+    cleanup: { connectionId: null, smart: true, engine: "server", fillers: true, spokenPunctuation: false, germanCommas: true, localRuntime: "cpu", localModel: "local-cleaner", provider: "custom", baseUrl: "https://cleanup.example/v1", model: "old-cleaner" },
     language: "en", vocabulary: "Amber", microphone: "Selected microphone",
+    connections: [], instructions: [],
   },
   microphone: "Actual microphone", microphoneFallback: true, interrupted: false,
   audioMs: 4500, preparedAudioMs: 3200, recognitionMs: 1234, cleanupMs: 567,
@@ -104,6 +105,7 @@ function pageProps(phase: Phase, platform: Overview["platform"]): PageProps {
   const unexpected = () => assert.fail("SSR must not perform an application action");
   const s: Settings = {
     ...result.config,
+    connections: [], instructions: [],
     hotkey: { dictate: "", mode: "toggle", toggleBubble: "" },
     bubble: { visibility: "hidden", edge: "left", y: 0.5, monitor: "", size: 56, opacity: 1, hiddenIn: [], hideFullscreen: false },
     insert: { method: "paste", pasteOnCompletion: true, restoreClipboard: false, trailingSpace: true },

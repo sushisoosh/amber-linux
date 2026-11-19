@@ -117,6 +117,7 @@ fn begin(app: &AppHandle, source_test_id: Option<u64>) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if crate::linux_desktop::session_is_blocked() { return Err("Unlock the desktop before recording a test.".into()); }
     let core = app.state::<Core>();
+    let credentials = core.credential_guard();
     let mut inner = core.testing.0.lock().unwrap();
     inner.session.ensure_idle()?;
     let source = source_test_id.map(|id| inner.session.recording(id)
@@ -146,6 +147,7 @@ fn begin(app: &AppHandle, source_test_id: Option<u64>) -> Result<(), String> {
     if source.is_some() { inner.session.update(result.id, Phase::Recognizing); }
     let snapshot = inner.session.snapshot();
     drop(inner);
+    drop(credentials);
     emit(app, snapshot);
 
     let worker_app = app.clone();
@@ -488,5 +490,31 @@ mod tests {
         let restarted = testing();
         change(&restarted, &store, TableChange::Reload).unwrap();
         assert_eq!(restarted.snapshot().saved_tables.len(), 2);
+    }
+
+    #[test]
+    fn testing_snapshot_blocks_provider_and_connection_key_rotation_until_settled() {
+        let root = std::env::temp_dir().join(format!("amber-credential-guard-test-{}", amber_core::api::new_key()));
+        let core = Core::new(crate::state::Paths { settings: root.join("settings.json"), secrets: root.join("secrets.bin"),
+            logs: root.join("logs"), layout: amber_core::local::Layout { root } });
+        let connection = amber_core::connections::Connection { id: "conn_test".into(), name: "Test".into(),
+            provider: "groq".into(), base_url: String::new() };
+        {
+            let _credentials = core.credential_guard();
+            let mut inner = core.testing.0.lock().unwrap();
+            inner.session.begin(TestResult::new(1, 0, &core.settings())).unwrap();
+        }
+        for phase in [Phase::Recording, Phase::Recognizing, Phase::Cleaning, Phase::Cancelling] {
+            {
+                let mut inner = core.testing.0.lock().unwrap();
+                if phase == Phase::Cancelling { inner.session.cancel(); } else { inner.session.update(1, phase); }
+            }
+            assert!(core.set_key_for("groq", None, Some("must-not-save".into())).unwrap_err().contains("active test"));
+            assert!(core.set_connection_key(&connection, Some("must-not-save".into())).unwrap_err().contains("active test"));
+            assert!(core.key("groq").is_none());
+        }
+        core.testing.0.lock().unwrap().session.settled();
+        assert!(core.testing.snapshot().ensure_idle().is_ok());
+        assert!(!core.paths.secrets.exists(), "the guard must reject before touching encrypted storage");
     }
 }

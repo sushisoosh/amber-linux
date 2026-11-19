@@ -1,5 +1,5 @@
-//! Servers that speak the OpenAI audio API. Known services have a fixed address and a list
-//! of models; an own server (Speaches, LocalAI, whisper.cpp, ...) gets free fields.
+//! Speech and cleanup providers, including services with native HTTP protocols. Known
+//! services have fixed addresses; an own OpenAI-compatible server gets free fields.
 
 use reqwest::Url;
 
@@ -18,6 +18,12 @@ pub struct ChatModel {
     pub extra: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeechApi { OpenAi, Mistral, Deepgram, ElevenLabs }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupApi { OpenAi, Anthropic }
+
 pub struct Provider {
     pub id: &'static str,
     pub name: &'static str,
@@ -28,9 +34,14 @@ pub struct Provider {
     /// Where to get a key.
     pub key_url: &'static str,
     pub needs_key: bool,
+    pub speech_api: Option<SpeechApi>,
+    pub cleanup_api: Option<CleanupApi>,
 }
 
 impl Provider {
+    pub fn supports_speech(&self) -> bool { self.speech_api.is_some() }
+    pub fn supports_cleanup(&self) -> bool { self.cleanup_api.is_some() }
+
     pub fn default_model(&self) -> &'static str {
         self.models.first().map(|m| m.id).unwrap_or("whisper-1")
     }
@@ -57,6 +68,8 @@ pub const GROQ: Provider = Provider {
     ],
     key_url: "https://console.groq.com/keys",
     needs_key: true,
+    speech_api: Some(SpeechApi::OpenAi),
+    cleanup_api: Some(CleanupApi::OpenAi),
 };
 
 pub const OPENAI: Provider = Provider {
@@ -76,6 +89,8 @@ pub const OPENAI: Provider = Provider {
     ],
     key_url: "https://platform.openai.com/api-keys",
     needs_key: true,
+    speech_api: Some(SpeechApi::OpenAi),
+    cleanup_api: Some(CleanupApi::OpenAi),
 };
 
 // Same speech and cleanup defaults as Amber for Android, checked against /v1/models.
@@ -95,6 +110,98 @@ pub const TINFOIL: Provider = Provider {
     ],
     key_url: "https://dash.tinfoil.sh",
     needs_key: true,
+    speech_api: Some(SpeechApi::OpenAi),
+    cleanup_api: Some(CleanupApi::OpenAi),
+};
+
+// Protocols and model names checked against official API documentation, November 2026.
+// https://openrouter.ai/docs/api-reference/overview
+pub const OPENROUTER: Provider = Provider {
+    id: "openrouter", name: "OpenRouter", base_url: "https://openrouter.ai/api/v1",
+    models: &[],
+    chat_models: &[
+        ChatModel { id: "openai/gpt-4.1-mini", label: "GPT-4.1 mini", note: "via OpenRouter", extra: Some(r#"{"provider":{"allow_fallbacks":false}}"#) },
+        ChatModel { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", note: "via OpenRouter", extra: Some(r#"{"provider":{"allow_fallbacks":false}}"#) },
+    ],
+    key_url: "https://openrouter.ai/settings/keys", needs_key: true,
+    speech_api: None, cleanup_api: Some(CleanupApi::OpenAi),
+};
+
+// https://ai.google.dev/gemini-api/docs/openai
+pub const GEMINI: Provider = Provider {
+    id: "gemini", name: "Google Gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    models: &[],
+    chat_models: &[
+        ChatModel { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite", note: "low latency, minimal thinking", extra: Some(r#"{"reasoning_effort":"minimal"}"#) },
+    ],
+    key_url: "https://aistudio.google.com/apikey", needs_key: true,
+    speech_api: None, cleanup_api: Some(CleanupApi::OpenAi),
+};
+
+// https://docs.ollama.com/api/openai-compatibility
+pub const OLLAMA: Provider = Provider {
+    id: "ollama", name: "Ollama (local)", base_url: "http://127.0.0.1:11434/v1",
+    models: &[],
+    chat_models: &[
+        ChatModel { id: "qwen3:4b", label: "Qwen3 4B", note: "install in Ollama first; thinking off", extra: Some(r#"{"reasoning_effort":"none"}"#) },
+    ],
+    key_url: "", needs_key: false,
+    speech_api: None, cleanup_api: Some(CleanupApi::OpenAi),
+};
+
+// https://docs.mistral.ai/api/endpoint/audio/transcriptions
+pub const MISTRAL: Provider = Provider {
+    id: "mistral", name: "Mistral", base_url: "https://api.mistral.ai/v1",
+    models: &[
+        SpeechModel { id: "voxtral-mini-latest", label: "Voxtral Mini Transcribe", note: "multilingual transcription" },
+    ],
+    chat_models: &[
+        ChatModel { id: "mistral-small-latest", label: "Mistral Small", note: "fast cleanup", extra: None },
+    ],
+    key_url: "https://console.mistral.ai/api-keys", needs_key: true,
+    speech_api: Some(SpeechApi::Mistral), cleanup_api: Some(CleanupApi::OpenAi),
+};
+
+// https://api-docs.deepseek.com/ and /guides/thinking_mode
+pub const DEEPSEEK: Provider = Provider {
+    id: "deepseek", name: "DeepSeek", base_url: "https://api.deepseek.com",
+    models: &[],
+    chat_models: &[
+        ChatModel { id: "deepseek-flash", label: "DeepSeek Flash", note: "thinking off", extra: Some(r#"{"thinking":{"type":"disabled"}}"#) },
+    ],
+    key_url: "https://platform.deepseek.com/api_keys", needs_key: true,
+    speech_api: None, cleanup_api: Some(CleanupApi::OpenAi),
+};
+
+// https://platform.claude.com/docs/en/api/messages/create
+pub const ANTHROPIC: Provider = Provider {
+    id: "anthropic", name: "Anthropic", base_url: "https://api.anthropic.com/v1",
+    models: &[],
+    chat_models: &[
+        ChatModel { id: "claude-haiku-4-5", label: "Claude Haiku 4.5", note: "fast cleanup", extra: None },
+    ],
+    key_url: "https://platform.claude.com/settings/keys", needs_key: true,
+    speech_api: None, cleanup_api: Some(CleanupApi::Anthropic),
+};
+
+// https://developers.deepgram.com/reference/speech-to-text/listen-pre-recorded
+pub const DEEPGRAM: Provider = Provider {
+    id: "deepgram", name: "Deepgram", base_url: "https://api.deepgram.com/v1",
+    models: &[
+        SpeechModel { id: "nova-3", label: "Nova-3", note: "multilingual; vocabulary hints not sent (paid add-on)" },
+    ],
+    chat_models: &[], key_url: "https://console.deepgram.com", needs_key: true,
+    speech_api: Some(SpeechApi::Deepgram), cleanup_api: None,
+};
+
+// https://elevenlabs.io/docs/api-reference/speech-to-text/convert
+pub const ELEVENLABS: Provider = Provider {
+    id: "elevenlabs", name: "ElevenLabs", base_url: "https://api.elevenlabs.io/v1",
+    models: &[
+        SpeechModel { id: "scribe_v2", label: "Scribe v2", note: "multilingual; vocabulary hints not sent (paid add-on)" },
+    ],
+    chat_models: &[], key_url: "https://elevenlabs.io/app/settings/api-keys", needs_key: true,
+    speech_api: Some(SpeechApi::ElevenLabs), cleanup_api: None,
 };
 
 pub const CUSTOM: Provider = Provider {
@@ -105,9 +212,14 @@ pub const CUSTOM: Provider = Provider {
     chat_models: &[],
     key_url: "",
     needs_key: false,
+    speech_api: Some(SpeechApi::OpenAi),
+    cleanup_api: Some(CleanupApi::OpenAi),
 };
 
-pub const ALL: [&Provider; 4] = [&GROQ, &OPENAI, &TINFOIL, &CUSTOM];
+pub const ALL: [&Provider; 12] = [
+    &GROQ, &OPENAI, &TINFOIL, &MISTRAL, &DEEPGRAM, &ELEVENLABS,
+    &OPENROUTER, &GEMINI, &DEEPSEEK, &ANTHROPIC, &OLLAMA, &CUSTOM,
+];
 
 pub fn by_id(id: &str) -> Option<&'static Provider> {
     ALL.iter().copied().find(|p| p.id == id)
@@ -264,8 +376,10 @@ mod tests {
             assert_eq!(by_id(p.id).map(|q| q.id), Some(p.id));
             if !p.base_url.is_empty() {
                 assert!(check_base_url(p.base_url).is_ok(), "{}", p.id);
-                assert!(!p.models.is_empty());
+                assert_eq!(!p.models.is_empty(), p.supports_speech());
+                assert_eq!(!p.chat_models.is_empty(), p.supports_cleanup());
             }
+            assert!(p.supports_speech() || p.supports_cleanup());
         }
         assert_eq!(GROQ.default_model(), "whisper-large-v3-turbo");
         for p in ALL {

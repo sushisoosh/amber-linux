@@ -16,6 +16,8 @@ import { WelcomePage } from "./pages/Welcome";
 import { PhonePage } from "./pages/Phone";
 import { CleanupPage } from "./pages/Cleanup";
 import { CredentialsPage } from "./pages/Credentials";
+import { ConnectionsPage } from "./pages/Connections";
+import { InstructionsPage } from "./pages/Instructions";
 import { TestingPage } from "./pages/Testing";
 import { ProgramsPage } from "./pages/Programs";
 import { HistoryPage } from "./pages/History";
@@ -28,7 +30,7 @@ import { phaseLabel } from "./ui";
 export interface PageProps {
   ov: Overview;
   s: Settings;
-  save: (change: (s: Settings) => void) => Promise<void>;
+  save: (change: (s: Settings) => void) => Promise<boolean>;
   refresh: () => Promise<void>;
   go: (page: PageId) => void;
   toast: (message: string, ok?: boolean) => void;
@@ -38,7 +40,7 @@ export interface PageProps {
   desktop: ReturnType<typeof useDesktop>;
 }
 
-export type PageId = "recorder" | "welcome" | "engine" | "cleanup" | "credentials" | "testing" | "programs" | "snippets" | "microphone" | "hotkeys" | "bubble" | "insert" | "phone" | "history" | "statistics" | "app";
+export type PageId = "recorder" | "welcome" | "engine" | "cleanup" | "connections" | "credentials" | "instructions" | "testing" | "programs" | "snippets" | "microphone" | "hotkeys" | "bubble" | "insert" | "phone" | "history" | "statistics" | "app";
 
 const LINUX_HIDDEN = new Set<PageId>(["programs", "bubble", "phone"]);
 
@@ -51,6 +53,8 @@ const PAGES: { id: PageId; label: string; value: (o: Overview) => string }[] = [
     value: (o) => (o.settings.cleanup.smart ? (o.settings.cleanup.engine === "local" ? "Local" : "Server") : o.settings.cleanup.fillers ? "Fillers" : "Off"),
   },
   { id: "credentials", label: "Credentials", value: () => "" },
+  { id: "connections", label: "Connections", value: (o) => String(o.settings.connections.length) },
+  { id: "instructions", label: "Instructions", value: (o) => String(o.settings.instructions.filter((i) => i.enabled).length) },
   { id: "testing", label: "Testing", value: () => "" },
   { id: "programs", label: "Programs", value: (o) => String(o.settings.profiles.length) },
   { id: "snippets", label: "Snippets", value: (o) => String(o.settings.snippets.length) },
@@ -65,12 +69,13 @@ const PAGES: { id: PageId; label: string; value: (o: Overview) => string }[] = [
 ];
 
 function providerName(o: Overview) {
+  if (o.settings.server.connectionId) return o.settings.connections.find((c) => c.id === o.settings.server.connectionId)?.name ?? "Missing connection";
   return o.providers.find((p) => p.id === o.settings.server.provider)?.name ?? "Server";
 }
 
 function initialPage(): PageId {
   const p = new URLSearchParams(location.search).get("page");
-  return (["recorder", "welcome", "engine", "cleanup", "credentials", "testing", "programs", "snippets", "microphone", "hotkeys", "bubble", "insert", "phone", "history", "statistics", "app"] as PageId[]).includes(p as PageId)
+  return (["recorder", "welcome", "engine", "cleanup", "connections", "credentials", "instructions", "testing", "programs", "snippets", "microphone", "hotkeys", "bubble", "insert", "phone", "history", "statistics", "app"] as PageId[]).includes(p as PageId)
     ? (p as PageId)
     : "recorder";
 }
@@ -154,16 +159,18 @@ export function App() {
 
   const save = useCallback(
     async (change: (s: Settings) => void) => {
-      if (!latest.current) return;
+      if (!latest.current) return false;
       const next: Settings = structuredClone(latest.current);
       change(next);
       latest.current = next;
       setOv((o) => (o ? { ...o, settings: next } : o));
       const mine = ++saveSeq.current;
+      let savedSuccessfully = false;
       // A later full snapshot must not commit before a slow wallet-backed save.
       const run = saveTail.current.then(async () => {
         try {
           const saved = await invoke<Settings>("save_settings", { settings: next });
+          savedSuccessfully = true;
           if (mine === saveSeq.current) {
             latest.current = saved;
             setOv((o) => (o ? { ...o, settings: saved } : o));
@@ -190,6 +197,7 @@ export function App() {
       pending.current.delete(run);
       setSettingsSaving(pending.current.size > 0);
       await desktop.refresh();
+      return savedSuccessfully;
     },
     [desktop.refresh, toast],
   );
@@ -239,6 +247,8 @@ export function App() {
         {currentPage === "engine" && <EnginePage {...props} />}
         {currentPage === "cleanup" && <CleanupPage {...props} />}
         {currentPage === "credentials" && <CredentialsPage {...props} />}
+        {currentPage === "connections" && <ConnectionsPage {...props} />}
+        {currentPage === "instructions" && <InstructionsPage {...props} />}
         {currentPage === "testing" && <TestingPage {...props} />}
         {currentPage === "programs" && <ProgramsPage {...props} />}
         {currentPage === "snippets" && <SnippetsPage {...props} />}

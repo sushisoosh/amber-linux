@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React, { createElement, type ComponentProps, type ComponentType } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { ChatProvider, Overview, Settings, TestResult } from "../shared/types";
+import type { ChatProvider, LocalInfo, LocalItem, Overview, Settings, TestResult } from "../shared/types";
 import type { PageProps } from "./App";
-import { DownloadItem } from "./downloads";
+import { DownloadItem, SpeechModelActions } from "./downloads";
 import { AppPage } from "./pages/AppPage";
 import { CleanupPage } from "./pages/Cleanup";
 import { CredentialLink, CredentialsPage } from "./pages/Credentials";
-import { EnginePage } from "./pages/Engine";
+import { EnginePage, visibleSpeechModels } from "./pages/Engine";
 import { HistoryPage } from "./pages/History";
 import { HotkeysPage, pretty } from "./pages/Hotkeys";
 import { InsertPage } from "./pages/Insert";
@@ -18,10 +18,15 @@ import { MicrophonePage } from "./pages/Microphone";
 import { Recorder } from "./pages/Recorder";
 import { TestingPage, TestResultDetails } from "./pages/Testing";
 import { phaseLabel } from "./ui";
+import { availableConnections, chooseConnection, eligibleModels } from "./connections";
+import { ConnectionsPage } from "./pages/Connections";
+import { BASH_EXAMPLE, instructionIssue, instructionKeyword, InstructionsPage } from "./pages/Instructions";
+import "./history.test";
 
 const settings: Settings = {
   engine: "server", local: { runtime: "cpu", model: "tiny", threads: 0, keepLoaded: false, chunking: false },
-  server: { provider: "custom", baseUrl: "https://speech.example/v1", model: "whisper", uploadFormat: "wav", localFallback: false },
+  server: { connectionId: null, provider: "custom", baseUrl: "https://speech.example/v1", model: "whisper", uploadFormat: "wav", localFallback: false },
+  connections: [], instructions: [],
   language: "en", vocabulary: "", microphone: "", hotkey: { dictate: "Super+KeyD", mode: "toggle", toggleBubble: "" },
   bubble: { visibility: "hidden", edge: "left", y: 0.5, monitor: "", size: 64, opacity: 1, hiddenIn: [], hideFullscreen: false },
   insert: { method: "paste", pasteOnCompletion: false, restoreClipboard: false, trailingSpace: false }, sounds: false,
@@ -31,6 +36,7 @@ const settings: Settings = {
   discord: { muteWhileDictating: true },
   terminal: { enabled: true, automatic: true, safeMode: true, runCommands: false, hotkey: "Ctrl+KeyT", prefixes: [] },
   cleanup: {
+    connectionId: null,
     smart: true, engine: "local", fillers: true, spokenPunctuation: false, germanCommas: false,
     localRuntime: "cpu", localModel: "cleanup", provider: "custom", baseUrl: "", model: "cleanup",
   },
@@ -44,7 +50,7 @@ function props(platform: Overview["platform"] = "linux", change: Partial<Setting
     s,
     ov: {
       platform, version: "test", settings: s, phase: "idle",
-      providers: [{ id: s.server.provider, name: "Test provider", baseUrl: s.server.baseUrl, models: [], hasKey: true, keyUrl: "", needsKey: false }],
+      providers: [{ id: s.server.provider, name: "Test provider", baseUrl: s.server.baseUrl, models: [], hasKey: true, keyUrl: "", needsKey: s.server.provider !== "custom", supportsSpeech: true, supportsCleanup: true }],
     },
     phase: "idle", phaseMessage: null, settingsSaving: false, compact: false,
     save: unexpectedAction, refresh: unexpectedAction, quit: unexpectedAction, toast: unexpectedAction, go: unexpectedAction,
@@ -164,7 +170,7 @@ test("Credentials manages Tinfoil with a local engine without saving any setting
     const p = props(platform, { engine: "local", cleanup: { ...settings.cleanup, engine: "server", provider: "tinfoil" } });
     const provider = {
       id: "tinfoil", name: "Tinfoil.sh", baseUrl: "https://inference.tinfoil.sh/v1", hasKey: false,
-      keyUrl: "https://dash.tinfoil.sh", needsKey: true, models: [],
+      keyUrl: "https://dash.tinfoil.sh", needsKey: true, models: [], supportsSpeech: true, supportsCleanup: true,
     };
     p.ov.providers.push(provider);
     const before = structuredClone(p.s);
@@ -189,7 +195,7 @@ test("Credentials manages Tinfoil with a local engine without saving any setting
 test("Built-in runtime has no download or delete action while ordinary models retain both", () => {
   const item: ComponentProps<typeof DownloadItem> = {
     local: { info: null, progress: {}, errors: {}, reload: unexpectedAction, download: unexpectedAction },
-    kind: "runtime", item: { id: "cpu", label: "CPU", note: "Embedded", sizeMb: 0, installed: true, wantsGpu: false, replaced: false },
+    kind: "runtime", item: { id: "cpu", label: "CPU", note: "Embedded", sizeMb: 0, installed: true, wantsGpu: false, replaced: false, imported: false },
     selected: true, onSelect: unexpectedAction, toast: unexpectedAction,
   };
   const builtIn = render(DownloadItem, item);
@@ -197,7 +203,154 @@ test("Built-in runtime has no download or delete action while ordinary models re
   assert.doesNotMatch(builtIn, />Delete<|>Download<|0 MB/);
   const model: ComponentProps<typeof DownloadItem> = { ...item, kind: "model", item: { ...item.item, sizeMb: 75 } };
   assert.match(render(DownloadItem, model), />Delete</);
-  assert.match(render(DownloadItem, { ...model, item: { ...model.item, installed: false } }), />Download</);
+  assert.match(render(DownloadItem, { ...model, item: { ...model.item, installed: false } }), />Download &amp; use</);
+  assert.match(render(DownloadItem, { ...model, selectOnDownload: false, item: { ...model.item, installed: false } }), />Download</);
+});
+
+test("Speech model browsing preserves the selected model and separates backend families", () => {
+  const model = (id: string, family: LocalItem["family"], installed = false): LocalItem => ({
+    id, family, label: id, note: "", sizeMb: 1, installed, wantsGpu: false, replaced: false, imported: false,
+  });
+  const models = [model("futo-multilingual-74", "whisper"), model("tiny-q5_1", "whisper", true),
+    model("parakeet-v3-int8", "parakeet"), model("moonshine-tiny-int8", "moonshine")];
+  const ids = (view: Parameters<typeof visibleSpeechModels>[1], selected = "tiny-q5_1") => visibleSpeechModels(models, view, selected).map((m) => m.id);
+  assert.deepEqual(ids("recommended"), ["futo-multilingual-74", "tiny-q5_1"]);
+  assert.deepEqual(ids("whisper"), ["futo-multilingual-74", "tiny-q5_1"]);
+  assert.deepEqual(ids("parakeet"), ["tiny-q5_1", "parakeet-v3-int8"]);
+  assert.deepEqual(ids("moonshine"), ["tiny-q5_1", "moonshine-tiny-int8"]);
+  assert.deepEqual(ids("installed"), ["tiny-q5_1"]);
+});
+
+test("Speech controls distinguish unloading memory from loading and refuse busy UI actions", () => {
+  const p = { busy: false, toast: unexpectedAction };
+  assert.match(render(SpeechModelActions, { ...p, status: { state: "stopped" } }), />Load now</);
+  assert.match(render(SpeechModelActions, { ...p, status: { state: "ready" } }), />Unload model</);
+  assert.match(render(SpeechModelActions, { ...p, busy: true, status: { state: "ready" } }), /disabled=""/);
+  assert.match(render(SpeechModelActions, { ...p, status: { state: "starting" } }), /disabled=""/);
+  const failed = render(SpeechModelActions, { ...p, status: { state: "failed", message: "Failed to switch models" } });
+  assert.match(failed, />Load now</);
+  assert.match(failed, />Unload model</, "a failed switch can leave the previous model resident");
+});
+
+test("An installed ONNX model exposes runtime repair and does not offer irrelevant Whisper tuning", (t) => {
+  const info: LocalInfo = {
+    runtimes: [], models: [{ id: "parakeet-v3-int8", label: "Parakeet v3", family: "parakeet", note: "25 languages", installed: true, sizeMb: 671, wantsGpu: false, replaced: false, imported: false }],
+    hasNvidia: false, recommended: ["cpu", "futo-multilingual-74"], measured: {}, status: { state: "ready", message: "Parakeet v3 on CPU" },
+    downloads: [], folder: "/models", llmRuntimes: [], llmModels: [], llmStatus: { state: "stopped" }, onnxRuntimeInstalled: false, importsError: null,
+  };
+  const useState = React.useState;
+  let suppliedInfo = false;
+  t.mock.method(React, "useState", ((initial: unknown) => {
+    if (initial === null && !suppliedInfo) { suppliedInfo = true; return useState(info); }
+    return useState(initial);
+  }) as typeof React.useState);
+  const p = props("linux", { engine: "local", local: { ...settings.local, model: "parakeet-v3-int8" } });
+  const html = render(EnginePage, p);
+  assert.match(html, /Model library/);
+  assert.match(html, />Install runtime</);
+  assert.match(html, /119 MiB extra download/);
+  assert.match(html, />Unload model</);
+  assert.match(html, /The Whisper runtime choice does not apply/);
+  assert.match(html, /Use downloads when finished/);
+  assert.doesNotMatch(html, /CPU threads|Whisper runs on/);
+});
+
+test("Connections keep account keys independent and filter operations conservatively", () => {
+  const p = props();
+  p.s.connections = [{ id: "conn_speech", name: "My speech account", provider: "custom", baseUrl: "https://named.example/v1" },
+    { id: "conn_chat", name: "My text account", provider: "anthropic", baseUrl: "https://api.anthropic.com/v1" }];
+  p.ov.providers.push({ id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", models: [], hasKey: false, needsKey: true, keyUrl: "", supportsSpeech: false, supportsCleanup: true });
+  assert.deepEqual(availableConnections(p.s.connections, p.ov.providers, "speech").map((c) => c.id), ["conn_speech"]);
+  assert.equal(availableConnections(p.s.connections, p.ov.providers, "cleanup").length, 2);
+  const models = [{ id: "speech", label: "Speech", capabilities: ["speech" as const], note: "" },
+    { id: "chat", label: "Chat", capabilities: ["cleanup" as const], note: "" }, { id: "unknown", label: "Unknown", capabilities: [], note: "" }];
+  assert.deepEqual(eligibleModels(models, "speech", false).map((m) => m.id), ["speech"]);
+  assert.deepEqual(eligibleModels(models, "cleanup", true).map((m) => m.id), ["chat", "unknown"]);
+  const html = render(ConnectionsPage, p);
+  assert.match(html, /independent key|own encrypted key/);
+  assert.match(html, /never copied automatically/);
+  assert.match(html, /My speech account/);
+  assert.match(html, /Discover models/);
+  p.s.server.connectionId = "conn_speech";
+  const engine = render(EnginePage, p);
+  assert.match(engine, /named.example/);
+  assert.match(engine, /Discover models/);
+  assert.doesNotMatch(engine, />Manage keys</);
+  p.s.server.connectionId = "conn_missing";
+  const missing = render(EnginePage, p);
+  assert.match(missing, /Connection unavailable/);
+  assert.doesNotMatch(missing, /Speech model ID/);
+});
+
+test("Instructions explain explicit opt-in, whole-word triggers and shell review-only delivery", () => {
+  const p = props();
+  const rule = { id: "bash-rule", ...BASH_EXAMPLE };
+  assert.equal(rule.enabled, false);
+  assert.equal(rule.output, "shell");
+  assert.equal(instructionIssue(rule, []), null);
+  assert.match(instructionIssue({ ...rule, id: "duplicate", keyword: "BASH" }, [rule])!, /already used/);
+  for (const keyword of ["bash command", "bash-", "", "x".repeat(41)]) assert.ok(instructionIssue({ ...rule, keyword }, []));
+  assert.equal(instructionKeyword("  BASH: list files"), "bash");
+  assert.equal(instructionKeyword("bashful list files"), "bashful");
+  assert.equal(instructionKeyword("bash-file list files"), null);
+  assert.equal(instructionKeyword("\"bash\" list files"), null);
+  p.s.instructions = [rule];
+  const html = render(InstructionsPage, p);
+  assert.match(html, /Instructions/);
+  assert.match(html, /First word only/);
+  assert.match(html, /review\/copy-only/);
+  assert.match(html, /never automatically paste or execute/);
+  assert.match(html, /New instructions start disabled/);
+  assert.match(html, /These desktop rules are not applied to phone API requests/);
+  p.s.cleanup.smart = false;
+  assert.match(render(InstructionsPage, p), /Smart cleanup is off/);
+});
+
+test("Returning from a saved connection restores the default provider's model family", () => {
+  const s = structuredClone(settings);
+  s.server.provider = "groq";
+  s.cleanup.provider = "groq";
+  s.connections = [{ id: "conn_openai", name: "OpenAI", provider: "openai", baseUrl: "https://api.openai.com/v1" },
+    { id: "conn_claude", name: "Claude", provider: "anthropic", baseUrl: "https://api.anthropic.com/v1" }];
+  const providers = props().ov.providers.map((p) => ({ ...p, id: "groq", models: [{ id: "whisper-large-v3", label: "Whisper", note: "" }] }));
+  providers.push({ ...providers[0], id: "openai", models: [{ id: "whisper-1", label: "Whisper", note: "" }] });
+  const chats = [{ id: "groq", name: "Groq", hasKey: false, models: [{ id: "llama-3.3-70b-versatile", label: "Llama", note: "" }] },
+    { id: "anthropic", name: "Claude", hasKey: false, models: [{ id: "claude-haiku-4-5", label: "Claude", note: "" }] }];
+  chooseConnection(s, "speech", "conn_openai", providers, chats);
+  assert.equal(s.server.model, "whisper-1");
+  chooseConnection(s, "speech", null, providers, chats);
+  assert.equal(s.server.model, "whisper-large-v3");
+  chooseConnection(s, "cleanup", "conn_claude", providers, chats);
+  assert.equal(s.cleanup.model, "claude-haiku-4-5");
+  chooseConnection(s, "cleanup", null, providers, chats);
+  assert.equal(s.cleanup.model, "llama-3.3-70b-versatile");
+});
+
+test("Missing imported files can be removed but cannot be downloaded as a catalog model", () => {
+  const p: ComponentProps<typeof DownloadItem> = {
+    local: { info: null, progress: {}, errors: {}, reload: unexpectedAction, download: unexpectedAction }, kind: "model",
+    item: { id: `import-${"a".repeat(32)}`, label: "My model", note: "Imported", sizeMb: 30, installed: false, imported: true, wantsGpu: false, replaced: false, family: "moonshine" },
+    selected: false, onSelect: unexpectedAction, toast: unexpectedAction,
+  };
+  const html = render(DownloadItem, p);
+  assert.match(html, /files missing/);
+  assert.match(html, />Delete</);
+  assert.doesNotMatch(html, />Download/);
+  assert.match(html, /disabled=""/);
+  assert.deepEqual(visibleSpeechModels([p.item], "imported", "none"), [p.item]);
+});
+
+test("Cleanup-only providers have credentials but never appear as speech engines", () => {
+  const p = props();
+  p.ov.providers.push({ id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", models: [],
+    hasKey: false, keyUrl: "", needsKey: true, supportsSpeech: false, supportsCleanup: true });
+  const speech = render(EnginePage, p);
+  assert.doesNotMatch(speech, /Anthropic/);
+  assert.match(speech, /Speech model ID/);
+  const credentials = render(CredentialsPage, p);
+  assert.match(credentials, /Anthropic API key/);
+  assert.match(credentials, /Smart cleanup only/);
+  assert.match(credentials, /Speech recognition and smart cleanup/);
 });
 
 test("Recorder provides stop/cancel, safe processing controls, failed retry and the ready label", () => {
@@ -250,11 +403,12 @@ test("Tinfoil exposes speech and cleanup models without claiming key or enclave 
     });
     p.ov.providers = [{
       id: "tinfoil", name: "Tinfoil.sh", baseUrl: "https://inference.tinfoil.sh/v1", hasKey: true,
-      keyUrl: "https://dash.tinfoil.sh", needsKey: true,
+      keyUrl: "https://dash.tinfoil.sh", needsKey: true, supportsSpeech: true, supportsCleanup: true,
       models: [{ id: "voxtral-small-24b", label: "Voxtral Small 24B", note: "recommended" }],
     }];
     const engine = render(EnginePage, p);
-    assert.match(engine, /selected="">Voxtral Small 24B</);
+    assert.match(engine, /value="voxtral-small-24b"/);
+    assert.match(engine, />Voxtral Small 24B</);
     assert.match(engine, /Public catalogs, including Tinfoil&#x27;s, do not validate the API key/);
     assert.match(engine, /Audio upload/);
     assert.match(engine, /WAV \(lossless, default\)/);
@@ -264,7 +418,8 @@ test("Tinfoil exposes speech and cleanup models without claiming key or enclave 
     assert.match(compressed, /Live authenticated inference has not been verified/);
     assert.match(compressed, /local recognition, fallback and retained test recordings keep the original WAV/);
     const cleanup = render(CleanupPage, p);
-    assert.match(cleanup, /selected="">DeepSeek V4.1 Flash</);
+    assert.match(cleanup, /value="deepseek-v4-1-flash"/);
+    assert.match(cleanup, />DeepSeek V4.1 Flash</);
     assert.match(cleanup, /Uses the Tinfoil.sh key/);
     assert.match(cleanup, /thinking disabled/);
     for (const html of [engine, cleanup]) {

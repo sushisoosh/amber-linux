@@ -7,8 +7,9 @@ preview until the real-desktop integration matrix has passed, not a claim of
 Windows feature parity. Upstream source, artwork, and redistribution remain subject
 to the repository license and the author's written permission.
 
-- Local CPU Whisper inference is built in; only model weights need downloading.
-  OpenAI-compatible recognition and optional local/server cleanup are supported.
+- Local CPU Whisper inference is built in; only its model weights need downloading.
+  Parakeet and Moonshine additionally download a verified ONNX Runtime on first setup.
+  Hosted recognition and optional local/server cleanup are supported.
 - Dictation shortcuts leave Amber in the background. The Linux Recorder page keeps results
   in memory for review and explicit Copy by default. Under **Delivery**, enable **Copy and
   paste completed dictation (Ctrl+V)** to copy completed text and paste automatically on
@@ -25,7 +26,7 @@ to the repository license and the author's written permission.
   Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
   causes plaintext persistence. Credential-save errors leave keys available only
   for the current session. History, statistics, and login startup are opt-in.
-- Phone/tunnel/control servers, terminal-command generation, Discord mute, automatic
+- Phone/tunnel/control servers, automatic terminal-command mode, Discord mute, automatic
   per-app profiles, the Windows updater, and the Windows floating bubble are disabled
   in the Linux desktop. Updates are installed from Linux packages.
 
@@ -152,9 +153,9 @@ The remainder of this README describes the upstream Windows application.
 Dictation into **any** window - Amber's Android dictation, on the PC. Speak, and the text
 appears where your cursor is: in Notepad, the browser, Discord, VS Code, Word.
 
-Local-first: your voice is recognized on this PC by whisper.cpp (CPU or NVIDIA GPU), or -
-your choice - by a server with your own API key (Groq, OpenAI, Tinfoil.sh, or your own
-OpenAI-compatible server).
+Local-first: your voice is recognized on this PC by whisper.cpp (CPU or NVIDIA GPU),
+Parakeet or Moonshine (CPU), or by a server with your own API key. Local model setup
+downloads files; recognition itself stays offline.
 
 ## Installing
 
@@ -196,9 +197,14 @@ Say "neue Zeile", "neuer Absatz", "Komma", "Fragezeichen", "Punkt" (at a sentenc
 |---|---|---|
 | Local, CPU | nowhere | whisper.cpp `b5454`, 8 MB |
 | Local, NVIDIA GPU | nowhere | CUDA 12.4 build with cuBLAS, 653 MB |
+| Parakeet, CPU | nowhere | v3 int8: 25 languages including German; v2 int8: English only |
+| Moonshine, CPU | nowhere | Tiny/Base int8, English only; long recordings are chunked |
 | Groq | Groq | Whisper large-v3(-turbo), about $0.04 per hour of speech |
 | OpenAI | OpenAI | GPT-4o (mini) Transcribe, Whisper |
 | Tinfoil.sh | Tinfoil | Voxtral Small 24B (default), Whisper large-v3-turbo; HTTPS without client enclave verification |
+| Mistral | Mistral | Voxtral Mini Transcribe |
+| Deepgram | Deepgram | Nova-3; native transcription API |
+| ElevenLabs | ElevenLabs | Scribe v2; no speaker labels or paid vocabulary add-on |
 | Own server | your server | anything with `POST /v1/audio/transcriptions`; plain `http://` only inside your network |
 
 For Tinfoil on either desktop platform, save an inference API key from
@@ -212,7 +218,7 @@ Unlike Android, the desktop client does not verify enclave attestation. The conn
 test only fetches the public model catalog; a successful test does not validate the key
 or prove that inference works.
 
-The local models are the ones Amber for Android uses: **FUTO Base** and **FUTO Small**
+The recommended Whisper models are the ones Amber for Android uses: **FUTO Base** and **FUTO Small**
 (keyboard.futo.org) and **ACFT Large v3 Turbo q8_0** (DeadBranches on Hugging Face, from
 MahmoudAshraf's Apache-2.0 fine-tune). All three are tuned so the encoder stops where the
 speech stops - Amber sends whisper-server a matching `audio_ctx` per request instead of a
@@ -228,6 +234,52 @@ Face at a fixed commit) and SHA-256 in `crates/core/src/local.rs`; a runtime arc
 a required DLL is refused. A file with the wrong checksum is deleted, never run. The local
 engine runs as `whisper-server.exe` on `127.0.0.1` only, in a Windows job object, so it never
 outlives Amber.
+
+The **Engine > Model library** also offers stock Whisper Tiny, Base, Small, Medium,
+Large v3 and Turbo variants, including compact Q5, Q8 and F16 weights and selected
+English-only variants. These use the full encoder context; the tuned dictation defaults
+remain unchanged. **Use downloads when finished** can be switched off to download without
+changing the selected model. Downloads remain cancellable and checksum-verified.
+
+Parakeet and Moonshine use `transcribe-rs` with CPU ONNX Runtime 1.24.4. Their first download
+also fetches a checksum-pinned Microsoft native runtime package (about 119 MiB); only the
+platform libraries and license notices are installed. No Python or .NET setup is needed.
+Windows additionally requires the Microsoft Visual C++ 2015-2022 x64 redistributable.
+The supplied Linux runtime targets x64 GNU/Linux with glibc 2.27 or newer and a compatible
+system C++ runtime. Parakeet v3 detects its 25 supported languages automatically; v2 and
+these Moonshine variants only recognize English. Neither engine uses the vocabulary prompt
+or forces the selected language. Long ONNX recordings use bounded chunks, which can affect
+words near chunk boundaries. Model manifests and runtime hashes live in `crates/core/src/onnx.rs`.
+
+### Model Memory
+
+Downloaded, selected and loaded are separate states. With **Load when Amber starts** on
+(the default), Amber preloads the selected local speech model at startup. Otherwise a
+dictation starts loading it while you speak; Testing loads it on demand. It stays resident
+between dictations. **Load now** warms it explicitly; **Unload model** releases the speech
+model without deleting the files or changing the selection. Active desktop recordings/tests
+must finish first, and in-flight local inference holds the model lock. The next use loads
+it again. Switching models replaces the resident speech model; switching to a server or
+quitting releases it. Ordinary local use has no configurable idle-unload timer. A model
+used for server fallback retains the existing ten-minute idle cleanup behavior.
+
+### Custom Model Imports
+
+**Engine > Import a local speech model** accepts Whisper GGML `.bin` files, Parakeet int8
+ONNX folders, and Moonshine Tiny/Base ONNX folders. Browse to the source, name the model,
+declare its actual supported languages, and confirm that you trust its source. This is a
+speech importer, not a cleanup GGUF or arbitrary-ONNX importer. Each ONNX variant lists the
+exact filenames it expects; external-data ONNX files and symlinks are rejected.
+
+Imports copy files into managed storage, validate their structure and record SHA-256
+checksums. Source files are never changed or deleted, and their paths are not persisted.
+Checksums detect changes but do not establish publisher trust or architecture compatibility.
+Imports appear under **Imported models** and can be selected, unloaded and deleted like
+catalog models; deleting removes only Amber's copy. Importing is offline. If ONNX Runtime
+is missing, its separate **Install ONNX runtime** action explicitly downloads it.
+The importer reclaims its own abandoned staging/unregistered copies before a subsequent
+import. Failed deletions remain visible and retryable. **Select after import** is persisted
+by the backend, so closing the settings window does not lose that preference.
 
 With a server engine, a server that cannot be reached (offline, down) hands the recording to
 the downloaded local model with a notice - never the other way round.
@@ -251,6 +303,11 @@ are checked against their advertised formats before uploading; older Amber catal
 an audio list retain their documented WAV baseline. If WAV is selected instead of Opus,
 that decision is shown in the test result. Amber never retries a rejected paid request
 automatically with a different format.
+
+The Mistral, Deepgram and ElevenLabs adapters currently use WAV even when Opus is selected.
+This is decided before uploading and recorded in Testing details, not a retry of a paid
+request. Deepgram and ElevenLabs vocabulary hints are omitted because their keyterms options
+add a surcharge.
 
 ## Testing
 
@@ -298,7 +355,8 @@ Between recognition and inserting (*Settings → Cleanup*):
 - **Smart cleanup** (optional): a language model resolves self-corrections ("um drei, nee
   stopp, um vier" → "um vier"), false starts and punctuation. Locally with llama.cpp
   `b11981` and Qwen3 4B Instruct 2507 (Apache 2.0; CUDA 641 MB + model 2.4 GB, ~3 GB of
-  graphics memory), or through Groq, OpenAI, Tinfoil.sh or an own server with a key managed in Credentials.
+   graphics memory), or through Groq, OpenAI, Tinfoil.sh, Mistral, OpenRouter, Google Gemini,
+   DeepSeek, Anthropic, local Ollama or an own server. Keys are managed in Credentials.
   The prompt puts hard rules first - the dictation's language (named when one is chosen or
   clear from its words), every negation, number, name and condition kept, never an answer -
   then what to fix, self-corrections ("um drei, nee, um vier" → "um vier"), the style with
@@ -313,6 +371,59 @@ Between recognition and inserting (*Settings → Cleanup*):
 - **Per program** (*Settings → Programs*): a writing style - as spoken, casual (chats),
   formal (mail), concise (notes) - an own instruction, and the smart cleanup as set, always
   or never. The program is the window the dictation started in.
+
+Provider lists distinguish speech recognition from cleanup. Named providers offer curated
+model presets; Own server accepts a model ID, but compatibility with arbitrary model
+parameters is not guaranteed. The Ollama preset connects to `http://127.0.0.1:11434/v1` without a key;
+install Ollama and pull the chosen model separately. Use Own server for a different address.
+Connection checks do not submit inference requests and do not prove that a selected model
+or API key can perform paid inference. Anthropic uses its native Messages protocol while
+Amber's phone API remains OpenAI-compatible.
+
+### Connections and Discovery
+
+**Settings > Connections** saves multiple named provider accounts or OpenAI-compatible
+base URLs. Each has an independent encrypted key, bound to its identity, provider and
+origin; existing provider-default keys are not copied automatically. Choose a saved
+connection separately under Engine and Cleanup. **Provider default** preserves the original
+Credentials workflow. Selected connections cannot be removed from the UI until deselected.
+
+**Discover models** makes one catalog GET using that connection's key, never an inference
+request. Known operation capabilities are shown separately for speech and cleanup; models
+without sufficient capability information are explicitly unclassified. Discovery is bounded
+to one page and 1,024 model IDs, reports truncation, and does not prove inference access,
+pricing or compatibility with every model's parameters. Curated presets and an explicit
+advanced manual-ID option remain available. ElevenLabs' catalog primarily lists voice
+generation models, so use the Scribe presets for transcription.
+
+Saved custom URLs are exact API bases: `/models`, `/audio/transcriptions` and
+`/chat/completions` are appended without changing the prefix. HTTPS is required except
+for literal loopback addresses. Missing/stale connections fail rather than silently using
+another endpoint or key. Testing snapshots retain the selected connections and instruction
+rules; credential changes are blocked until the test or its cancellation has settled.
+
+### Keyword Instructions
+
+**Settings > Instructions** is a separate opt-in transformation feature. A first whole
+keyword selects a saved prompt and is removed before transforming the rest of the dictation.
+For example, **Use Bash example** creates an editable, initially disabled `bash` rule:
+
+```text
+bash list all files modified today
+```
+
+The chosen cleanup model can turn that into command text such as `find . -type f -mtime -1`.
+Shell output is always review/copy-only, never automatically pasted or executed, even if
+terminal auto-run is enabled. Choose Text output for transformations meant for normal
+delivery, such as drafting an email. Rule prompts are ordinary settings, not secret storage.
+
+Rules require both their own Enabled switch and global smart cleanup; a program's Never
+setting still prevents them. Matching happens before filler cleanup: `please bash...`,
+`bashful...` and quoted keywords do not trigger the Bash rule. Failure keeps the original
+request, including its keyword. Enabled rules defer streaming chunks so they apply once to
+the complete utterance. Testing/replay and the explicit preview support them; phone API
+cleanup does not apply desktop instruction rules. Ordinary cleanup retains its existing
+meaning-preservation checks.
 
 ## Terminal commands
 
@@ -351,6 +462,10 @@ should have gone. Switching the history off deletes it. A recording whose recogn
 stays in memory for ten minutes: *Recognize again* (tray or History page) puts the text on
 the clipboard. The statistics count words and timings only, never the text: today, the
 streak, time saved against typing at 40 words a minute, programs, the wait per engine.
+
+History supports text/program search and combined program, local-date and insertion-status
+filters. Search terms stay in memory only. **Delete all history** always clears the entire
+history, including entries hidden by the current filters; the UI makes this scope explicit.
 
 ## Stream Deck
 
@@ -502,5 +617,5 @@ engine an NVIDIA card from the GTX 900 series on with a current driver.
 
 ## Not in yet
 
-Parakeet (the better choice for PCs without an NVIDIA GPU) and Tinfoil's enclave
-verification - both exist in Amber for Android. The roadmap is `docs/PLAN.md`.
+Tinfoil's enclave verification, configurable idle model unloading, and GPU acceleration for
+the new ONNX speech engines are not implemented. The roadmap is `docs/PLAN.md`.

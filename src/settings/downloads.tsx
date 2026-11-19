@@ -34,6 +34,7 @@ export function useLocal() {
       }),
       listen<LocalStatus>("local-status", (e) => setInfo((i) => (i ? { ...i, status: e.payload } : i))),
       listen<LocalStatus>("llm-status", (e) => setInfo((i) => (i ? { ...i, llmStatus: e.payload } : i))),
+      listen("local-models-changed", () => { void reload(); }),
     ];
     return () => subs.forEach((s) => s.then((un) => un()));
   }, [reload]);
@@ -67,6 +68,7 @@ export function DownloadItem({
   warning,
   measured,
   builtIn = false,
+  selectOnDownload = true,
   toast,
 }: {
   local: Local;
@@ -79,6 +81,7 @@ export function DownloadItem({
   /** Measured milliseconds for 10 s of speech on this PC. */
   measured?: number;
   builtIn?: boolean;
+  selectOnDownload?: boolean;
   toast: (message: string) => void;
 }) {
   const { info, progress, errors, reload, download } = local;
@@ -87,10 +90,14 @@ export function DownloadItem({
   const running = progress[key] ?? (info?.downloads.includes(key) ? { key, done: 0, total: null, state: "running" as const } : null);
   return (
     <div className="item">
-      <div
+      <button
+        type="button"
         className={`radio ${selected ? "on" : ""} ${!item.installed ? "disabled" : ""}`}
-        onClick={() => item.installed && onSelect()}
-        title={item.installed ? "" : "Download it first"}
+        aria-label={`Use ${item.label}`}
+        aria-pressed={selected}
+        disabled={!item.installed}
+        onClick={onSelect}
+        title={item.installed ? "" : item.imported ? "Imported files are missing; import the source again" : "Download it first"}
       />
       <div className="name">
         <div>
@@ -98,6 +105,8 @@ export function DownloadItem({
           {recommended && <span className="tag amber">recommended</span>}
           {item.replaced && <span className="tag">replaced</span>}
           {item.installed && <span className="tag ok">installed</span>}
+          {item.imported && <span className="tag">imported</span>}
+          {item.imported && !item.installed && <span className="tag">files missing</span>}
         </div>
         <div className="hint">
           {item.note} · {included ? "Built into Amber; no download needed" : size(item.sizeMb)}
@@ -113,12 +122,13 @@ export function DownloadItem({
             Cancel
           </button>
         </>
-      ) : item.installed ? (
+      ) : item.installed || item.imported ? (
         <button
           className="btn danger"
           onClick={async () => {
             try {
-              await invoke("remove_download", { kind, id: item.id });
+              if (item.imported) await invoke("remove_imported_model", { id: item.id });
+              else await invoke("remove_download", { kind, id: item.id });
             } catch (e) {
               toast(String(e));
             }
@@ -128,12 +138,35 @@ export function DownloadItem({
           Delete
         </button>
       ) : (
-        <button className="btn" onClick={() => download(kind, item.id, true).catch((e) => toast(String(e)))}>
-          Download
+        <button className="btn" onClick={() => download(kind, item.id, selectOnDownload).catch((e) => toast(String(e)))}>
+          {selectOnDownload ? "Download & use" : "Download"}
         </button>
       )}
     </div>
   );
+}
+
+export function SpeechModelActions({ status, busy, toast }: { status: LocalStatus; busy: boolean; toast: (message: string) => void }) {
+  const [pending, setPending] = useState(false);
+  const run = async (unload: boolean) => {
+    setPending(true);
+    try {
+      await invoke(unload ? "stop_local" : "start_local");
+    } catch (error) {
+      toast(String(error));
+    } finally {
+      setPending(false);
+    }
+  };
+  const disabled = busy || pending || status.state === "starting";
+  return <div className="model-actions">
+    {status.state !== "ready" && <button className="btn" disabled={disabled} onClick={() => run(false)}>
+      {pending ? "Please wait..." : "Load now"}
+    </button>}
+    {(status.state === "ready" || status.state === "failed") && <button className="btn" disabled={disabled} onClick={() => run(true)}>
+      {pending ? "Please wait..." : "Unload model"}
+    </button>}
+  </div>;
 }
 
 /** "Ready", "Loading…" and so on, with a dot in the matching colour. */

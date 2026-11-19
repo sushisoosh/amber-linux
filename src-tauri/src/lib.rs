@@ -4,11 +4,13 @@ mod autostart;
 mod bubble;
 mod capture;
 mod commands;
+mod connections;
 mod control;
 mod diag;
 mod dictation;
 mod hotkeys;
 mod insert;
+mod imports;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
 mod llm;
@@ -151,6 +153,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     unsafe { libc::umask(0o077); }
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         // First: a second start only brings the running Amber forward - or hands it a tunnel
         // setup (tools/setup-tunnel.sh).
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -214,6 +217,17 @@ pub fn run() {
             commands::cancel_download,
             commands::remove_download,
             commands::start_local,
+            commands::stop_local,
+            connections::has_connection_key,
+            connections::set_connection_key,
+            connections::test_connection,
+            connections::discover_connection_models,
+            imports::browse_local_model,
+            imports::import_local_model,
+            imports::cancel_model_import,
+            imports::remove_imported_model,
+            imports::setup_onnx_runtime,
+            imports::cancel_onnx_runtime_setup,
             commands::bubble_pointer,
             commands::bubble_config,
             commands::open_settings,

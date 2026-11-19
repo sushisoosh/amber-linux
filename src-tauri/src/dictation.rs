@@ -6,12 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use amber_core::audio::{self, Rejected};
-use amber_core::engine::{CancellationToken, ErrorKind, OpenAiTranscriber, TranscribeOptions, Transcriber};
-#[cfg(not(target_os = "linux"))]
-use amber_core::engine::WhisperServerTranscriber;
+use amber_core::engine::{CancellationToken, ErrorKind, provider_transcriber, TranscribeOptions, Transcriber};
 use amber_core::chunking::{self, ChunkPlanner, FrameVad, Parts};
 use amber_core::{estimate, local};
-use amber_core::providers;
 use amber_core::settings::{EngineKind, Settings};
 use amber_core::text;
 use serde::Serialize;
@@ -76,6 +73,8 @@ struct Inner {
     chunks: Option<ChunkJob>,
     cancel: CancellationToken,
     result: Option<DictationResult>,
+    /// Generated shell output must not reach either automatic or shortcut-driven paste.
+    result_copy_only: bool,
     pending_paste: Option<CancellationToken>,
 }
 
@@ -108,6 +107,7 @@ impl Default for Dictation {
                 chunks: None,
                 cancel: CancellationToken::default(),
                 result: None,
+                result_copy_only: false,
                 pending_paste: None,
             }),
             processing: AtomicBool::new(false),
@@ -124,6 +124,15 @@ impl Dictation {
     /// Recording or working on the result.
     pub fn is_active(&self) -> bool {
         self.processing.load(Ordering::Acquire) || matches!(self.inner.lock().unwrap().phase, Phase::Recording | Phase::Transcribing | Phase::Inserting)
+    }
+
+    /// Keep a new desktop recording from racing a user-requested model unload.
+    pub fn when_idle<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
+        let inner = self.inner.lock().unwrap();
+        if self.processing.load(Ordering::Acquire) || matches!(inner.phase, Phase::Recording | Phase::Transcribing | Phase::Inserting) {
+            return Err("Stop the recording or wait for recognition to finish before unloading the model.".into());
+        }
+        Ok(action())
     }
 
     /// Share the ordinary worker gate, but never acquire a target or delivery consent.
@@ -178,7 +187,7 @@ pub fn clear_result(app: &AppHandle) {
     announce(app, phase, None);
 }
 
-fn keep_result(app: &AppHandle, session: u64, result: DictationResult) -> bool {
+fn keep_result(app: &AppHandle, session: u64, result: DictationResult, copy_only: bool) -> bool {
     let core = app.state::<Core>();
     let mut inner = core.dictation.inner.lock().unwrap();
     if inner.session != session || inner.cancel.is_cancelled() {
@@ -186,6 +195,7 @@ fn keep_result(app: &AppHandle, session: u64, result: DictationResult) -> bool {
     }
     inner.cancel_pending_paste();
     inner.result = Some(result.clone());
+    inner.result_copy_only = copy_only;
     inner.phase = Phase::Ready;
     let _ = app.emit("dictation-result", &result);
     drop(inner);
@@ -209,6 +219,10 @@ pub fn insert_last_result(app: &AppHandle) {
             crate::notify(app, "Amber", "There is no dictation result to insert.");
             return;
         };
+        if inner.result_copy_only {
+            crate::notify(app, "Amber", "Shell instructions are review/copy-only. Review the result and use Copy; Amber will not paste or execute it.");
+            return;
+        }
         let cancel = CancellationToken::default();
         inner.pending_paste = Some(cancel.clone());
         (result, inner.session, cancel)
@@ -385,7 +399,8 @@ fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u6
                 // Cancelled while the microphone was opening.
                 return;
             }
-            if settings.engine == EngineKind::Local && settings.local.chunking {
+            if settings.engine == EngineKind::Local && settings.local.chunking && !settings.instructions.iter().any(|r| r.enabled) {
+                // An instruction belongs to the whole utterance, not the first audio chunk.
                 inner.chunks = ChunkJob::start(&app, &settings, recorder.shared_samples(), recorder.rate, inner.cancel.clone());
             }
             inner.recorder = Some(recorder);
@@ -519,8 +534,10 @@ struct Asked {
 #[allow(clippy::too_many_arguments)]
 fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, program: Option<&str>, asked: &Asked, target: Option<Target>, spoken_ms: u64) -> bool {
     use amber_core::terminal::{self as term, Answer, Shell};
-    // A snippet's phrase stays a snippet, also in a terminal.
-    if !settings.terminal.enabled || amber_core::snippets::find(&settings.snippets, spoken).is_some() {
+    // Saved keyword transformations take precedence over automatic/prefixed terminal mode,
+    // even when smart cleanup is off or the request is empty. Never run their output.
+    if !settings.terminal.enabled || amber_core::snippets::find(&settings.snippets, spoken).is_some()
+        || amber_core::instructions::match_start(&settings.instructions, spoken).is_some() {
         return false;
     }
     let prefixed = term::command_prefix(spoken, &settings.terminal.prefixes);
@@ -708,11 +725,13 @@ fn run(
             });
         }
     };
-    if terminal(app, &settings, session, &text::clean(&raw), program.as_deref(), &asked, target, prepared.spoken_ms) {
+    let recognized = text::clean(&raw);
+    let copy_only = instruction_copy_only(&settings, &recognized);
+    if terminal(app, &settings, session, &recognized, program.as_deref(), &asked, target, prepared.spoken_ms) {
         return;
     }
     let profile = program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
-    let (cleaned, _skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &text::clean(&raw), profile, true, cancel);
+    let (cleaned, skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, cancel);
     if cancel.is_cancelled() { return; }
     if cleaned.is_empty() {
         crate::diag::info(format!("{} ms of audio, nothing recognized", prepared.spoken_ms));
@@ -723,8 +742,10 @@ fn run(
     {
         let exposure = exposure_label(settings.engine == EngineKind::Server, remote_cleanup);
         let mut result = DictationResult {
-            text: text::compose(&cleaned, settings.insert.trailing_space),
-            message: if interrupted {
+            text: text::compose(&cleaned, settings.insert.trailing_space && !copy_only),
+            message: if copy_only {
+                "Shell instruction ready for review and copy only. Amber will not paste or execute it. The clipboard has not been changed."
+            } else if interrupted {
                 "The microphone stopped unexpectedly, so this result may be incomplete. Review and copy; the clipboard has not been changed."
             } else {
                 "Ready to review and copy. The clipboard has not been changed."
@@ -732,7 +753,10 @@ fn run(
             engine: engine.clone(),
             exposure: exposure.into(),
         };
-        if amber_core::insertion::paste_on_completion(&core.settings().insert, asked.paste_on_completion, interrupted) {
+        if let Some(why) = skipped.filter(|_| amber_core::instructions::match_start(&settings.instructions, &recognized).is_some()) {
+            result.message = format!("{why} {}", result.message);
+        }
+        if !copy_only && amber_core::insertion::paste_on_completion(&core.settings().insert, asked.paste_on_completion, interrupted) {
             {
                 let mut inner = core.dictation.inner.lock().unwrap();
                 if inner.session != session || cancel.is_cancelled() { return; }
@@ -746,7 +770,7 @@ fn run(
             };
         }
         let message = result.message.clone();
-        if keep_result(app, session, result) {
+        if keep_result(app, session, result, copy_only) {
             core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
                 prepared.spoken_ms, stopped.elapsed().as_millis() as u64);
             crate::notify(app, "Amber", &message);
@@ -765,6 +789,22 @@ fn run(
         inner.phase = Phase::Inserting;
     }
     announce(app, Phase::Inserting, None);
+    if copy_only {
+        // Copy only: even a safe-looking single line may be destructive, and multi-line
+        // shell text can execute on paste without a separate Enter keypress.
+        if let Err(e) = insert::to_clipboard(&cleaned) {
+            return fail(app, session, format!("The shell instruction could not be copied: {e}"), true);
+        }
+        core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
+            prepared.spoken_ms, stopped.elapsed().as_millis() as u64);
+        let message = format!("{}Shell instruction copied for review. Amber did not paste it or press Enter.",
+            skipped.map(|why| format!("{why} ")).unwrap_or_default());
+        core.dictation.inner.lock().unwrap().phase = Phase::Done;
+        announce(app, Phase::Done, Some(message.clone()));
+        crate::notify(app, "Amber", &message);
+        settle(app, session, Duration::from_millis(2500));
+        return;
+    }
     let final_text = text::compose(&cleaned, settings.insert.trailing_space);
     let outcome = insert::insert(&final_text, &settings.insert, target);
 
@@ -856,7 +896,9 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
     };
     let profile = failed.program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
     cancel.check().map_err(|e| e.message)?;
-    let (text, _, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &text::clean(&raw), profile, true, &cancel);
+    let recognized = text::clean(&raw);
+    let copy_only = instruction_copy_only(&settings, &recognized);
+    let (text, _, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, &cancel);
     cancel.check().map_err(|e| e.message)?;
     if text.is_empty() {
         fail(app, session, "Nothing recognized.".into(), false);
@@ -865,10 +907,12 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     if !keep_result(app, session, DictationResult {
         text: text.clone(),
-        message: "Ready to review and copy. The clipboard has not been changed.".into(),
+        message: if copy_only {
+            "Shell instruction ready for review and copy only. Amber will not paste or execute it."
+        } else { "Ready to review and copy. The clipboard has not been changed." }.into(),
         engine: engine.clone(),
         exposure: exposure_label(failed.remote_speech, remote_cleanup).into(),
-    }) {
+    }, copy_only) {
         return Err("Dictation was cancelled.".into());
     }
     #[cfg(not(target_os = "linux"))]
@@ -886,11 +930,16 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
         core.dictation.inner.lock().unwrap().phase = Phase::Done;
         announce(app, Phase::Done, Some("The result is on the clipboard.".into()));
         settle(app, session, Duration::from_millis(900));
-        let _ = remote_cleanup;
+        let _ = (remote_cleanup, copy_only);
     }
     core.memory.remember(&settings, &text, failed.program.as_deref().unwrap_or(""), &engine, false, failed.spoken_ms, started.elapsed().as_millis() as u64);
     crate::diag::info(format!("recognized again: {} words", text::words(&text)));
     Ok(text)
+}
+
+fn instruction_copy_only(settings: &Settings, recognized: &str) -> bool {
+    amber_core::instructions::match_start(&settings.instructions, recognized)
+        .is_some_and(|selected| selected.instruction.output == amber_core::instructions::InstructionOutput::Shell)
 }
 
 /// Watches the growing recording, cuts it at real pauses (`chunking::ChunkPlanner`) and
@@ -1120,6 +1169,14 @@ fn unload_after_fallback(app: &AppHandle) {
 /// Whether the local engine could take over: runtime and model downloaded.
 fn local_ready(core: &Core, s: &Settings) -> bool {
     let layout = &core.paths.layout;
+    if amber_core::imports::is_import_id(&s.local.model) {
+        return amber_core::imports::resolve(layout, &s.local.model).is_ok_and(|m| {
+            amber_core::imports::installed(layout, &m) && if m.is_onnx() { amber_core::onnx::runtime_installed(layout) } else { local::runtime(&s.local.runtime).is_some_and(|rt| layout.runtime_installed(rt)) }
+        });
+    }
+    if let Some(model) = amber_core::onnx::model(&s.local.model) {
+        return amber_core::onnx::runtime_installed(layout) && amber_core::onnx::installed(layout, model);
+    }
     local::runtime(&s.local.runtime).is_some_and(|rt| layout.runtime_installed(rt))
         && local::model(&s.local.model).is_some_and(|m| layout.model_installed(m))
 }
@@ -1141,12 +1198,7 @@ fn local_snapshot(app: &AppHandle, settings: &Settings) -> Result<Picked, String
 }
 
 fn picked_local(served: crate::whisper::Served) -> Picked {
-    #[cfg(not(target_os = "linux"))]
-    let slack = local::model(&served.model).filter(|m| m.short_context).map(|m| m.context_slack);
     Picked {
-        #[cfg(not(target_os = "linux"))]
-        transcriber: served.snapshot_transcriber.unwrap_or_else(|| Box::new(WhisperServerTranscriber::new(&served.url, slack))),
-        #[cfg(target_os = "linux")]
         transcriber: served.transcriber,
         label: format!("local {}/{}", served.runtime, served.model),
         estimate_key: estimate::key("local", &served.runtime, &served.model),
@@ -1158,6 +1210,14 @@ fn picked_local(served: crate::whisper::Served) -> Picked {
 /// set in the app, or else the PC's own. One local model at a time.
 pub fn transcriber_for(app: &AppHandle, settings: &Settings, model: Option<&str>) -> Result<Picked, String> {
     let layout = &app.state::<Core>().paths.layout;
+    if let Some(id) = model.filter(|id| id.starts_with("import-")) {
+        let imported = amber_core::imports::resolve(layout, id).map_err(|e| e.to_string())?;
+        if !amber_core::imports::installed(layout, &imported) { return Err("The requested imported model is missing or incomplete. Import it again.".into()); }
+        return local_model(app, Some(id));
+    }
+    if let Some(m) = model.and_then(amber_core::onnx::model).filter(|m| amber_core::onnx::installed(layout, m)) {
+        return local_model(app, Some(m.id));
+    }
     if let Some(m) = model.and_then(local::model).filter(|m| layout.model_installed(m)) {
         if !(settings.engine == EngineKind::Local && settings.local.model == m.id) {
             return local_model(app, Some(m.id));
@@ -1177,16 +1237,11 @@ pub fn transcriber(app: &AppHandle, settings: &Settings) -> Result<Picked, Strin
     match settings.engine {
         EngineKind::Local => local(app),
         EngineKind::Server => {
-            let provider = providers::by_id(&settings.server.provider).ok_or("Unknown server provider.")?;
-            let base = providers::effective_base_url(provider, &settings.server.base_url);
-            providers::check_base_url(&base)?;
-            let key = core.key_for(provider.id, &base).unwrap_or_default();
-            if provider.needs_key && key.is_empty() {
-                return Err(format!("No API key for {} yet - add it on the Credentials page.", provider.name));
-            }
-            let transcriber = OpenAiTranscriber::new(&base, &key, &settings.server.model)
-                .with_upload_format(settings.server.upload_format);
-            let transcriber = if provider.id == "custom" { transcriber.with_catalog_discovery() } else { transcriber };
+            let target = amber_core::connections::resolve_speech(settings)?;
+            let key = crate::connections::key_for(&core, &target)?;
+            let (provider, base) = (target.provider, target.base_url);
+            let transcriber = provider_transcriber(provider, &base, &key, &settings.server.model, settings.server.upload_format)
+                .map_err(|e| e.message)?;
             Ok(Picked {
                 transcriber: Box::new(transcriber),
                 label: format!("{} {}", provider.id, settings.server.model),
@@ -1216,6 +1271,48 @@ mod windows_whisper_tests;
 #[cfg(test)]
 mod testing_tests {
     use super::*;
+
+    #[test]
+    fn shell_instructions_are_copy_only_even_when_terminal_auto_run_and_paste_are_enabled() {
+        let mut settings = Settings::default();
+        settings.terminal.enabled = true;
+        settings.terminal.automatic = true;
+        settings.terminal.run_commands = true;
+        settings.insert.paste_on_completion = true;
+        settings.instructions.push(amber_core::instructions::Instruction {
+            id: "bash".into(), name: "Bash".into(), keyword: "bash".into(),
+            prompt: amber_core::instructions::BASH_PROMPT.into(), enabled: true,
+            output: amber_core::instructions::InstructionOutput::Shell,
+        });
+        for smart in [false, true] {
+            settings.cleanup.smart = smart;
+            assert!(instruction_copy_only(&settings, "BASH: list files"));
+            assert!(instruction_copy_only(&settings, "bash:"), "an empty request cannot fall into terminal mode");
+        }
+        assert!(!instruction_copy_only(&settings, "please say bash"));
+        settings.instructions[0].output = amber_core::instructions::InstructionOutput::Text;
+        assert!(!instruction_copy_only(&settings, "bash list files"));
+        assert!(amber_core::instructions::match_start(&settings.instructions, "bash list files").is_some(),
+            "text transformations also bypass terminal auto mode");
+    }
+
+    #[test]
+    fn unload_requires_an_idle_worker_and_excludes_new_recordings() {
+        let dictation = Dictation::default();
+        assert_eq!(dictation.when_idle(|| {
+            assert!(dictation.inner.try_lock().is_err(), "new recordings must wait for unload");
+            "unloaded"
+        }).unwrap(), "unloaded");
+        for phase in [Phase::Recording, Phase::Transcribing, Phase::Inserting] {
+            dictation.inner.lock().unwrap().phase = phase;
+            assert!(dictation.when_idle(|| panic!("must not unload while busy")).is_err());
+        }
+        dictation.inner.lock().unwrap().phase = Phase::Idle;
+        dictation.reserve_test().unwrap();
+        assert!(dictation.when_idle(|| panic!("must not unload during Testing")).is_err());
+        dictation.release_test();
+        assert!(dictation.when_idle(|| ()).is_ok());
+    }
 
     #[test]
     fn testing_reserves_worker_without_target_or_delivery_and_cancels_pending_paste() {

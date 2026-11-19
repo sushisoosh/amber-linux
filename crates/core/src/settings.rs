@@ -13,6 +13,8 @@ pub struct Settings {
     pub engine: EngineKind,
     pub local: LocalSettings,
     pub server: ServerSettings,
+    /// Named endpoint/account choices; credentials remain in the encrypted store.
+    pub connections: Vec<crate::connections::Connection>,
     /// "auto", an ISO 639-1 code ("de"), or several to choose among ("de,en"). A fixed language
     /// makes Whisper translate everything else into it, so "auto" is the default.
     pub language: String,
@@ -44,6 +46,8 @@ pub struct Settings {
     pub statistics: bool,
     /// Spoken phrases that insert a saved text.
     pub snippets: Vec<crate::snippets::Snippet>,
+    /// Explicit first-keyword transformations, separate from ordinary cleanup.
+    pub instructions: Vec<crate::instructions::Instruction>,
     pub discord: DiscordSettings,
     /// Spoken requests in terminals become shell commands.
     pub terminal: TerminalSettings,
@@ -55,6 +59,7 @@ impl Default for Settings {
             engine: EngineKind::Local,
             local: LocalSettings::default(),
             server: ServerSettings::default(),
+            connections: Vec::new(),
             language: "auto".into(),
             vocabulary: String::new(),
             microphone: String::new(),
@@ -73,6 +78,7 @@ impl Default for Settings {
             history_days: 7,
             statistics: true,
             snippets: Vec::new(),
+            instructions: Vec::new(),
             discord: DiscordSettings::default(),
             terminal: TerminalSettings::default(),
         }
@@ -110,7 +116,9 @@ impl Default for LocalSettings {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ServerSettings {
-    /// "groq", "openai" or "custom", see `providers`.
+    /// None uses the original provider fields. A missing saved connection must fail closed.
+    pub connection_id: Option<String>,
+    /// A speech-capable provider id, see `providers`.
     pub provider: String,
     /// Only used for "custom"; known providers have a fixed address.
     pub base_url: String,
@@ -124,7 +132,7 @@ pub struct ServerSettings {
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        ServerSettings { provider: "groq".into(), base_url: String::new(), model: "whisper-large-v3-turbo".into(), upload_format: UploadFormat::Wav, local_fallback: true }
+        ServerSettings { connection_id: None, provider: "groq".into(), base_url: String::new(), model: "whisper-large-v3-turbo".into(), upload_format: UploadFormat::Wav, local_fallback: true }
     }
 }
 
@@ -304,6 +312,7 @@ impl Default for PhoneSettings {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct CleanupSettings {
+    pub connection_id: Option<String>,
     /// Drop "äh", "ähm" and the like - rules, local, instant.
     pub fillers: bool,
     /// "neue Zeile", "Komma", "Fragezeichen" ... become the marks they name.
@@ -318,7 +327,7 @@ pub struct CleanupSettings {
     pub local_runtime: String,
     /// See `local::LLM_MODELS`.
     pub local_model: String,
-    /// "groq", "openai" or "custom"; the key is the one the speech engine uses.
+    /// A cleanup-capable provider id; credentials are shared per provider.
     pub provider: String,
     /// Only for "custom".
     pub base_url: String,
@@ -328,6 +337,7 @@ pub struct CleanupSettings {
 impl Default for CleanupSettings {
     fn default() -> Self {
         CleanupSettings {
+            connection_id: None,
             fillers: true,
             spoken_punctuation: true,
             german_commas: true,
@@ -383,15 +393,20 @@ impl Settings {
         if crate::local::runtime(&self.local.runtime).is_none() {
             self.local.runtime = d.local.runtime;
         }
-        if crate::local::model(&self.local.model).is_none() {
+        if crate::local::model(&self.local.model).is_none() && crate::onnx::model(&self.local.model).is_none() && !crate::imports::is_import_id(&self.local.model) {
             self.local.model = d.local.model;
         }
         self.local.threads = self.local.threads.min(64);
-        if crate::providers::by_id(&self.server.provider).is_none() {
+        self.connections = crate::connections::sanitize(std::mem::take(&mut self.connections));
+        self.instructions = crate::instructions::sanitize(std::mem::take(&mut self.instructions));
+        if !crate::providers::by_id(&self.server.provider).is_some_and(|p| p.supports_speech()) {
             self.server.provider = d.server.provider.clone();
+            self.server.model = d.server.model.clone();
         }
         if self.server.model.trim().is_empty() {
-            if let Some(p) = crate::providers::by_id(&self.server.provider) {
+            let provider = self.server.connection_id.as_ref().and_then(|id| self.connections.iter().find(|c| &c.id == id)).map(|c| c.provider.as_str())
+                .or_else(|| self.server.connection_id.is_none().then_some(self.server.provider.as_str()));
+            if let Some(p) = provider.and_then(crate::providers::by_id) {
                 self.server.model = p.default_model().to_string();
             }
         }
@@ -451,12 +466,17 @@ impl Settings {
         if crate::local::llm_model(&c.local_model).is_none() {
             c.local_model = d.cleanup.local_model.clone();
         }
-        match crate::providers::by_id(&c.provider) {
+        match crate::providers::by_id(&c.provider).filter(|p| p.supports_cleanup()) {
             None => {
                 c.provider = d.cleanup.provider.clone();
                 c.model = d.cleanup.model.clone();
             }
-            Some(p) if c.model.trim().is_empty() => c.model = p.chat_models.first().map(|m| m.id.to_string()).unwrap_or_default(),
+            Some(p) if c.model.trim().is_empty() => {
+                let provider = if let Some(id) = &c.connection_id {
+                    self.connections.iter().find(|c| &c.id == id).and_then(|c| crate::providers::by_id(&c.provider))
+                } else { Some(p) };
+                c.model = provider.and_then(|p| p.chat_models.first()).map(|m| m.id.to_string()).unwrap_or_default();
+            },
             Some(_) => {}
         }
         self
@@ -529,6 +549,63 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_connection_defaults_use_the_selected_adapter_not_the_legacy_provider() {
+        let mut s = Settings::default();
+        s.connections = vec![
+            crate::connections::Connection { id: "conn_speech".into(), name: "Speech account".into(), provider: "openai".into(), base_url: crate::providers::OPENAI.base_url.into() },
+            crate::connections::Connection { id: "conn_text".into(), name: "Text account".into(), provider: "anthropic".into(), base_url: crate::providers::ANTHROPIC.base_url.into() },
+        ];
+        s.server.connection_id = Some("conn_speech".into());
+        s.server.model.clear();
+        s.cleanup.connection_id = Some("conn_text".into());
+        s.cleanup.model.clear();
+        let s = s.sanitized();
+        assert_eq!(s.server.provider, "groq", "dormant provider choice stays intact");
+        assert_eq!(s.server.model, crate::providers::OPENAI.default_model());
+        assert_eq!(s.cleanup.model, crate::providers::ANTHROPIC.chat_models[0].id);
+        crate::connections::validate_settings(&s).unwrap();
+    }
+
+    #[test]
+    fn new_rules_are_opt_in_and_missing_imports_or_connections_are_not_rerouted() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.connections.is_empty() && s.instructions.is_empty());
+        assert!(s.server.connection_id.is_none() && s.cleanup.connection_id.is_none());
+        s.local.model = format!("import-{}", "a".repeat(32));
+        s.server.connection_id = Some("conn_missing".into());
+        s.server.model.clear();
+        let s = s.sanitized();
+        assert!(s.local.model.starts_with("import-"), "a missing import must fail at lookup, not switch to another model");
+        assert_eq!(s.server.connection_id.as_deref(), Some("conn_missing"));
+        assert!(s.server.model.is_empty());
+        assert!(crate::connections::validate_settings(&s).is_err());
+        let mut old = serde_json::to_value(crate::testing::Config::from(&Settings::default())).unwrap();
+        old.as_object_mut().unwrap().remove("connections");
+        old.as_object_mut().unwrap().remove("instructions");
+        let restored: crate::testing::Config = serde_json::from_value(old).unwrap();
+        assert!(restored.connections.is_empty() && restored.instructions.is_empty());
+    }
+
+    #[test]
+    fn provider_capabilities_and_defaults_survive_settings_round_trip() {
+        for provider in crate::providers::ALL {
+            let mut settings = Settings::default();
+            settings.server.provider = provider.id.into();
+            settings.server.model.clear();
+            settings.cleanup.provider = provider.id.into();
+            settings.cleanup.model.clear();
+            let saved = serde_json::to_vec(&settings).unwrap();
+            let settings = serde_json::from_slice::<Settings>(&saved).unwrap().sanitized();
+            assert_eq!(settings.server.provider, if provider.supports_speech() { provider.id } else { "groq" });
+            assert_eq!(settings.cleanup.provider, if provider.supports_cleanup() { provider.id } else { "groq" });
+            if provider.supports_speech() { assert_eq!(settings.server.model, provider.default_model()); }
+            if provider.supports_cleanup() {
+                assert_eq!(settings.cleanup.model, provider.chat_models.first().map(|m| m.id).unwrap_or_default());
+            }
+        }
+    }
 
     #[test]
     fn upload_compression_is_opt_in_and_round_trips() {

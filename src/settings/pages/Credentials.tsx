@@ -25,14 +25,14 @@ export function CredentialsPage({ ov, s, refresh, desktop, toast }: PageProps) {
   return (
     <div className="credentials">
       <h1>Credentials</h1>
-      <p className="lead">Manage API keys independently of your engine and cleanup choices. A provider's key is shared by recognition and cleanup; adding or removing one does not change either selection. Saved keys are never displayed.</p>
+      <p className="lead">Manage API keys independently of your engine and cleanup choices. Where a provider supports both, its key is shared by recognition and cleanup; adding or removing one does not change either selection. Saved keys are never displayed.</p>
       <Section title="Storage">
         <Row label="Credential storage" hint={linux ? desktop.storage?.credentials ?? desktop.error ?? "Checking secure storage..." : "Saved keys are encrypted for your Windows account."}>
           <button className="btn" disabled={refreshing || desktop.loading} onClick={() => void refreshStatus()}>{refreshing ? "Refreshing..." : "Refresh status"}</button>
         </Row>
         {linux && <Row label="Persistence" hint="If your Secret Service wallet is locked or unavailable, a key change may work for this session only. Check the save result before relying on it after a restart." />}
       </Section>
-      {ov.providers.map((provider) => <CredentialEditor
+      {ov.providers.filter((provider) => provider.needsKey || provider.id === "custom").map((provider) => <CredentialEditor
         key={provider.id} provider={provider} addresses={addresses}
         refresh={refreshStatus} toast={toast}
       />)}
@@ -99,6 +99,7 @@ function CredentialEditor({ provider, addresses, refresh, toast }: {
 
   return (
     <Section title={provider.name}>
+      <Row label="Available for" hint={provider.supportsSpeech && provider.supportsCleanup ? "Speech recognition and smart cleanup" : provider.supportsSpeech ? "Speech recognition only" : "Smart cleanup only"} />
       <form onSubmit={(e) => { e.preventDefault(); void changeKey(key); }}>
         {custom && <>
           <Row label="Address for this key" hint="Keys are scoped to the server's scheme, host and port, on both desktop platforms. This field chooses the key to manage; it does not change your Engine or Cleanup addresses.">

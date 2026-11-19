@@ -24,14 +24,19 @@ function bytes(count: number) {
 }
 
 function Selection({ config }: { config: TestConfig }) {
-  const speech = config.engine === "local" ? `Local / ${config.local.runtime} / ${config.local.model}` : `${config.server.provider} / ${config.server.model}`;
+  const speechConnection = config.connections.find((c) => c.id === config.server.connectionId);
+  const cleanupConnection = config.connections.find((c) => c.id === config.cleanup.connectionId);
+  const speechProvider = config.server.connectionId ? speechConnection?.name ?? "Missing saved connection" : config.server.provider;
+  const cleanupProvider = config.cleanup.connectionId ? cleanupConnection?.name ?? "Missing saved connection" : config.cleanup.provider;
+  const speech = config.engine === "local" ? `Local / ${config.local.runtime} / ${config.local.model}` : `${speechProvider} / ${config.server.model}`;
   const cleanup = !config.cleanup.smart ? "Smart cleanup off" : config.cleanup.engine === "local"
-    ? `Local / ${config.cleanup.localRuntime} / ${config.cleanup.localModel}` : `${config.cleanup.provider} / ${config.cleanup.model}`;
+    ? `Local / ${config.cleanup.localRuntime} / ${config.cleanup.localModel}` : `${cleanupProvider} / ${config.cleanup.model}`;
   return <>
     <div>Recognition: {speech}</div>
     <div>Cleanup: {cleanup}</div>
     {config.engine === "server" && <div>Requested upload: {config.server.uploadFormat === "opus" ? "Ogg Opus (32 kbps, lossy)" : "WAV (uncompressed)"}</div>}
-    <div className="hint">{config.engine === "server" ? `Audio goes to ${config.server.provider === "custom" ? config.server.baseUrl || "your selected server" : config.server.provider}.` : "Audio stays on this computer."} {config.cleanup.smart && config.cleanup.engine === "server" ? `Text goes to ${config.cleanup.provider === "custom" ? config.cleanup.baseUrl || config.server.baseUrl || "your selected cleanup server" : config.cleanup.provider}.` : "Cleanup stays on this computer."}</div>
+    <div className="hint">{config.engine === "server" ? `Audio goes to ${config.server.connectionId ? speechConnection?.baseUrl ?? "a missing saved connection (request blocked)" : config.server.provider === "custom" ? config.server.baseUrl || "your selected server" : config.server.provider}.` : "Audio stays on this computer."} {config.cleanup.smart && config.cleanup.engine === "server" ? `Text goes to ${config.cleanup.connectionId ? cleanupConnection?.baseUrl ?? "a missing saved connection (request blocked)" : config.cleanup.provider === "custom" ? config.cleanup.baseUrl || config.server.baseUrl || "your selected cleanup server" : config.cleanup.provider}.` : "Cleanup stays on this computer."}</div>
+    {config.instructions.some((r) => r.enabled) && <div>Enabled instruction keywords: {config.instructions.filter((r) => r.enabled).map((r) => r.keyword).join(", ")}. Applied only with smart cleanup enabled.</div>}
   </>;
 }
 
@@ -87,6 +92,7 @@ export function TestResultDetails({ result: r, busy, replayDisabled, remove, rep
         <p>Rules: fillers {c.fillers ? "on" : "off"}; spoken punctuation {c.spokenPunctuation ? "on" : "off"}; German commas {c.germanCommas ? "on" : "off"}.</p>
         <p>{r.sourceTestId === null ? `Requested microphone: ${r.config.microphone || "system default"}.` : "This replay did not open a microphone; it used the original recording."} Live chunking is not used in Testing.</p>
         <label>Vocabulary prompt<textarea readOnly value={r.config.vocabulary} aria-label={`Vocabulary for test ${r.id}`} /></label>
+        {r.config.instructions.map((rule) => <details key={rule.id}><summary>{rule.name}: {rule.keyword} ({rule.enabled ? "enabled" : "disabled"}, {rule.output})</summary><pre className="instruction-result">{rule.prompt}</pre></details>)}
         <p>Recognition attempts (request time, excluding model setup):</p>
         {r.attempts.length ? <ol>{r.attempts.map((attempt, i) => <li key={i}>{engineLabel(attempt.engine)}: {duration(attempt.ms)}. {attempt.error ?? "Succeeded"}</li>)}</ol> : <p>No engine request started.</p>}
       </details>

@@ -9,6 +9,7 @@ import { DownloadItem, StatusLabel, useLocal } from "../downloads";
 import { Row, Section, Segmented, Switch } from "../ui";
 import { STYLES } from "./Programs";
 import { CredentialLink } from "./Credentials";
+import { ConnectionChoice, ConnectionModelPicker } from "../connections";
 
 const EXAMPLE = "Ähm, lass uns morgen um drei Uhr treffen, nee stopp, um vier Uhr, äh, im Café weil es da ruhig ist.";
 
@@ -46,7 +47,7 @@ export function CleanupPage(p: PageProps) {
             </button>
             <button className={`card ${c.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.cleanup.engine = "server"))}>
               <div className="title">Server with API key</div>
-              <div className="hint">Groq, OpenAI, Tinfoil.sh or your own server. The text is sent there.</div>
+              <div className="hint">Choose a text provider, local Ollama, or a compatible server. Recognized text is sent to that endpoint.</div>
             </button>
           </div>
           {c.engine === "local" ? <LocalModel {...p} /> : <ServerModel {...p} />}
@@ -103,7 +104,8 @@ function LocalModel({ s, save, toast, ov }: PageProps) {
   );
 }
 
-function ServerModel({ s, save, go, ov, toast }: PageProps) {
+function ServerModel(p: PageProps) {
+  const { s, save, go, ov, toast } = p;
   const [providers, setProviders] = useState<ChatProvider[]>([]);
   const [baseUrl, setBaseUrl] = useState(s.cleanup.baseUrl);
   useEffect(() => setBaseUrl(s.cleanup.baseUrl), [s.cleanup.baseUrl]);
@@ -111,25 +113,27 @@ function ServerModel({ s, save, go, ov, toast }: PageProps) {
     void invoke<ChatProvider[]>("chat_providers").then(setProviders).catch((e) => toast(`Could not load cleanup providers: ${e}`));
   }, []);
   const c = s.cleanup;
-  const provider = providers.find((x) => x.id === c.provider);
+  const connection = s.connections.find((v) => v.id === c.connectionId);
+  const provider = providers.find((x) => x.id === (c.connectionId ? connection?.provider : c.provider));
 
-  if (!provider) return null;
+  if (!provider) return <Section title="Server"><ConnectionChoice {...p} purpose="cleanup" cleanupProviders={providers} /><Row label={providers.length ? "Connection unavailable" : "Loading cleanup providers..."} hint="A missing or incompatible connection is never replaced with another provider automatically." /></Section>;
   return (
     <Section title="Server">
-      <Row label="Provider">
-        <Segmented
-          value={provider.id}
-          options={providers.map((x) => [x.id, x.name] as [string, string])}
-          onChange={(id) => {
+      <ConnectionChoice {...p} purpose="cleanup" cleanupProviders={providers} />
+      {connection ? <Row label={provider.name} hint={`${connection.name}: ${connection.baseUrl}`} /> : <Row label="Provider">
+        <select aria-label="Cleanup provider" value={provider.id} onChange={(e) => {
+          const id = e.target.value;
             void save((x) => {
               x.cleanup.provider = id;
               x.cleanup.model = providers.find((q) => q.id === id)?.models[0]?.id ?? "";
             });
-          }}
-        />
-      </Row>
+          }}>
+          {providers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      </Row>}
       {provider.id === "tinfoil" && <Row label="Tinfoil connection" hint="Uses https://inference.tinfoil.sh/v1 for cleanup text. HTTPS only: unlike Amber for Android, this desktop client does not verify Tinfoil's enclave attestation. DeepSeek and Gemma run with thinking disabled." />}
-      {provider.id === "custom" && (
+      {provider.id === "ollama" && <Row label="Local Ollama" hint="Connects to http://127.0.0.1:11434/v1 without an API key. Install Ollama separately and pull the model first; Amber does not download or manage Ollama models. Use Own server for a different address." />}
+      {provider.id === "custom" && !connection && (
         <Row label="Address" hint="Empty: the speech engine's own-server address. Use HTTPS, or HTTP only on a literal loopback address.">
           <input
             type="text"
@@ -141,20 +145,18 @@ function ServerModel({ s, save, go, ov, toast }: PageProps) {
           />
         </Row>
       )}
-      <Row label="Chat model" hint={provider.models.find((m) => m.id === c.model)?.note}>
+      {connection ? <ConnectionModelPicker key={`${connection.id}:${connection.provider}:${connection.baseUrl}`} connection={connection} purpose="cleanup" model={c.model}
+        presets={provider.models} disabled={p.settingsSaving} onSelect={(id) => void save((x) => { x.cleanup.model = id; })} /> : <Row label="Chat model" hint={provider.models.find((m) => m.id === c.model)?.note}>
         {provider.models.length > 0 ? (
-          <select value={c.model} onChange={(e) => save((x) => (x.cleanup.model = e.target.value))}>
-            {provider.models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
+          <select aria-label="Cleanup model" value={c.model} onChange={(e) => save((x) => (x.cleanup.model = e.target.value))}>
+            {provider.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
           </select>
         ) : (
-          <input type="text" defaultValue={c.model} placeholder="llama3.2" onBlur={(e) => e.target.value !== c.model && save((x) => (x.cleanup.model = e.target.value.trim()))} />
+          <input type="text" aria-label="Cleanup model ID" key={`${provider.id}:${c.model}`} defaultValue={c.model} placeholder="Model ID"
+            onBlur={(e) => e.target.value.trim() && e.target.value.trim() !== c.model && save((x) => (x.cleanup.model = e.target.value.trim()))} />
         )}
-      </Row>
-      <CredentialLink provider={ov.providers.find((p) => p.id === provider.id) ?? provider} go={go} />
+      </Row>}
+      {!connection && provider.id !== "ollama" && <CredentialLink provider={ov.providers.find((p) => p.id === provider.id) ?? provider} go={go} />}
     </Section>
   );
 }

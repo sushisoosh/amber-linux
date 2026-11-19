@@ -1,4 +1,4 @@
-//! Audio in, text out. HTTP adapters for OpenAI-compatible providers and the Windows local
+//! Audio in, text out. HTTP adapters for hosted providers and the Windows local
 //! whisper.cpp helper. Embedded backends implement the same [Transcriber] contract.
 
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
 
 use reqwest::{multipart, Client};
 use crate::settings::UploadFormat;
+use crate::providers::{Provider, SpeechApi, CleanupApi};
 
 /// Per-call file payload metadata, including failed attempts. Not a count of socket bytes:
 /// an interrupted request may have sent only part of the file; multipart overhead is excluded.
@@ -247,9 +248,18 @@ pub(crate) fn validate_endpoint(url: &str) -> Result<(), SttError> {
 /// The synchronous engine API runs on a blocking worker. A shared async transport lets
 /// cancellation drop an in-flight upload/read instead of leaving a detached HTTP worker.
 pub(crate) fn request(http: &Client, request: reqwest::RequestBuilder, limit: usize, cancel: &CancellationToken) -> Result<(u16, Vec<u8>), SttError> {
+    request_with_query(http, request, &[], limit, cancel)
+}
+
+/// Only adapter-generated parameters may be appended, after validating the query-free URL.
+/// User endpoints, including custom endpoints, still cannot contain queries or credentials.
+fn request_with_query(http: &Client, request: reqwest::RequestBuilder, query: &[(&str, String)], limit: usize, cancel: &CancellationToken) -> Result<(u16, Vec<u8>), SttError> {
     cancel.check()?;
-    let request = request.build().map_err(network_error)?;
+    let mut request = request.build().map_err(network_error)?;
     validate_endpoint(request.url().as_str())?;
+    if !query.is_empty() {
+        request.url_mut().query_pairs_mut().extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+    }
     static HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let runtime = HTTP_RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().expect("HTTP runtime"));
     let result = runtime.block_on(async {
@@ -288,7 +298,54 @@ pub(crate) fn response_json(status: u16, body: &[u8]) -> Result<serde_json::Valu
     serde_json::from_slice(body).map_err(|e| json_error(&e, body.len()))
 }
 
-/// OpenAI-compatible providers: `POST {base}/audio/transcriptions`.
+/// Construct the catalog provider's actual speech protocol, never a cleanup-only preset.
+pub fn provider_transcriber(provider: &Provider, custom_base: &str, api_key: &str, model: &str, format: UploadFormat) -> Result<OpenAiTranscriber, SttError> {
+    let api = provider.speech_api.ok_or_else(|| SttError::new(ErrorKind::Server,
+        "This provider does not support speech recognition in Amber.", "cleanup-only provider"))?;
+    let base = crate::providers::effective_base_url(provider, custom_base);
+    validate_endpoint(&base)?;
+    let mut transcriber = OpenAiTranscriber::new(&base, api_key, model).with_upload_format(format);
+    transcriber.api = api;
+    transcriber.discover = provider.id == "custom";
+    Ok(transcriber)
+}
+
+/// A non-billable catalog/key check. Public catalogs establish reachability, not key validity
+/// or access to a particular model; no inference or alternate endpoint is attempted.
+pub fn check_provider(provider: &Provider, custom_base: &str, api_key: &str) -> Result<(), SttError> {
+    let base = crate::providers::effective_base_url(provider, custom_base);
+    validate_endpoint(&base)?;
+    let http = client(Duration::from_secs(5), &base);
+    // OpenRouter's full public catalog can exceed our bounded response limit. Its key
+    // endpoint is small, authenticated, and non-billable: /api/v1/key, not inference.
+    let path = if provider.id == "openrouter" { "key" } else { "models" };
+    let mut req = http.get(format!("{base}/{path}"));
+    let key = api_key.trim();
+    if provider.cleanup_api == Some(CleanupApi::Anthropic) {
+        req = req.header("anthropic-version", "2023-06-01").header("x-api-key", key);
+    } else if provider.speech_api == Some(SpeechApi::Deepgram) {
+        req = req.header("Authorization", format!("Token {key}"));
+    } else if provider.speech_api == Some(SpeechApi::ElevenLabs) {
+        req = req.header("xi-api-key", key);
+    } else if !key.is_empty() {
+        req = req.bearer_auth(key);
+    }
+    let (status, body) = request(&http, req, MAX_CATALOG_BYTES, &CancellationToken::default())?;
+    let root = response_json(status, &body)?;
+    let valid = if provider.id == "openrouter" {
+        root.get("data").is_some_and(|v| v.is_object())
+    } else { match provider.speech_api {
+        Some(SpeechApi::Deepgram) => root.get("stt").is_some_and(|v| v.is_array()),
+        Some(SpeechApi::ElevenLabs) => root.is_array(),
+        _ => root.get("data").is_some_and(|v| v.is_array()),
+    }};
+    if !valid {
+        return Err(SttError::new(ErrorKind::BadResponse, "The server did not send the expected provider information.", "invalid catalog or key response"));
+    }
+    Ok(())
+}
+
+/// OpenAI audio by default; [provider_transcriber] selects native protocols when required.
 pub struct OpenAiTranscriber {
     base_url: String,
     api_key: String,
@@ -297,6 +354,7 @@ pub struct OpenAiTranscriber {
     discover: bool,
     catalog: OnceLock<Option<crate::providers::AmberCatalog>>,
     upload_format: UploadFormat,
+    api: SpeechApi,
 }
 
 impl OpenAiTranscriber {
@@ -309,6 +367,7 @@ impl OpenAiTranscriber {
             discover: false,
             catalog: OnceLock::new(),
             upload_format: UploadFormat::Wav,
+            api: SpeechApi::OpenAi,
         }
     }
 
@@ -406,6 +465,10 @@ impl OpenAiTranscriber {
         let catalog = if self.discover { self.discover_catalog(cancel)? } else { None };
         let mut format = self.upload_format;
         let mut format_note = None;
+        if self.api != SpeechApi::OpenAi && format == UploadFormat::Opus {
+            format = UploadFormat::Wav;
+            format_note = Some("This provider adapter uses WAV. Selected lossless WAV before uploading; no format retry.".into());
+        }
         if let Some(catalog) = &catalog {
             if !catalog.audio.iter().any(|f| f == format.as_str()) {
                 if format == UploadFormat::Opus && catalog.audio.iter().any(|f| f == "wav") {
@@ -437,6 +500,9 @@ impl OpenAiTranscriber {
             }.into());
         }
         upload.format = format.as_str().into();
+        if self.api != SpeechApi::OpenAi {
+            return self.native_upload(wav, options, cancel, upload, format_note);
+        }
         let (part, file_bytes) = if format == UploadFormat::Opus {
             let started = std::time::Instant::now();
             let encoded = crate::audio::encode_ogg_opus(wav, cancel);
@@ -491,6 +557,68 @@ impl OpenAiTranscriber {
         let language = root.get("language").and_then(|v| v.as_str()).map(str::to_string);
         cancel.check()?;
         Ok((text, language))
+    }
+
+    fn native_upload(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken, upload: &mut UploadStats, format_note: Option<String>) -> Result<(String, Option<String>), SttError> {
+        let terms = || options.prompt.as_deref().unwrap_or("").split([',', '\n'])
+            .map(str::trim).filter(|s| !s.is_empty()).take(100);
+        let mut query = Vec::new();
+        let req = match self.api {
+            SpeechApi::Deepgram => {
+                query.extend([("model", self.model.clone()), ("punctuate", "true".into()),
+                    ("filler_words", "true".into()), ("redact_usage", "true".into())]);
+                if let Some(language) = options.fixed() {
+                    query.push(("language", language.to_string()));
+                } else {
+                    query.push(("detect_language", "true".into()));
+                }
+                // Pre-recorded keyterm prompting is a billed add-on, not a free vocabulary hint.
+                self.http.post(format!("{}/listen", self.base_url))
+                    .header("Authorization", format!("Token {}", self.api_key))
+                    .header("Content-Type", "audio/wav").body(wav.to_vec())
+            }
+            SpeechApi::ElevenLabs => {
+                let mut form = multipart::Form::new().part("file", wav_part(wav))
+                    .text("model_id", self.model.clone()).text("tag_audio_events", "false")
+                    .text("diarize", "false").text("timestamps_granularity", "none");
+                if let Some(language) = options.fixed() { form = form.text("language_code", language.to_string()); }
+                // Keyterms carry an additional charge. Do not silently opt into that add-on.
+                self.http.post(format!("{}/speech-to-text", self.base_url))
+                    .header("xi-api-key", &self.api_key).multipart(form)
+            }
+            SpeechApi::Mistral => {
+                let mut form = multipart::Form::new().part("file", wav_part(wav))
+                    .text("model", self.model.clone()).text("temperature", "0");
+                if let Some(language) = options.fixed() { form = form.text("language", language.to_string()); }
+                // Mistral uses repeated context_bias fields, not OpenAI's free-form prompt.
+                for term in terms() { form = form.text("context_bias", term.to_string()); }
+                self.http.post(format!("{}/audio/transcriptions", self.base_url))
+                    .bearer_auth(&self.api_key).multipart(form)
+            }
+            SpeechApi::OpenAi => unreachable!("handled by OpenAI upload path"),
+        };
+        cancel.check()?;
+        upload.upload_bytes = wav.len() as u64;
+        upload.note = format_note;
+        if matches!(self.api, SpeechApi::ElevenLabs | SpeechApi::Deepgram) && options.prompt.is_some() {
+            let note = upload.note.get_or_insert_with(String::new);
+            if !note.is_empty() { note.push(' '); }
+            note.push_str("Vocabulary hints were not sent: this provider's keyterms are a paid add-on.");
+        }
+        let (status, body) = request_with_query(&self.http, req, &query, MAX_RESPONSE_BYTES, cancel)?;
+        let root = response_json(status, &body)?;
+        let (text, language) = if self.api == SpeechApi::Deepgram {
+            if root.get("err_code").is_some() || root.get("error").is_some_and(|v| !v.is_null()) {
+                return Err(SttError::new(ErrorKind::Server, "The engine reported an error.", "response contains an error field"));
+            }
+            let text = root.pointer("/results/channels/0/alternatives/0/transcript").and_then(|v| v.as_str())
+                .ok_or_else(|| SttError::new(ErrorKind::BadResponse, "The engine sent no text.", "missing Deepgram transcript"))?;
+            (text.to_string(), root.pointer("/results/channels/0/detected_language"))
+        } else {
+            (parse_text_value(&root, body.len())?, root.get(if self.api == SpeechApi::ElevenLabs { "language_code" } else { "language" }))
+        };
+        cancel.check()?;
+        Ok((text, language.and_then(|v| v.as_str()).map(str::to_string)))
     }
 }
 
@@ -783,6 +911,191 @@ mod tests {
 
     fn json(status: u16, body: &str) -> (u16, &'static str, Vec<u8>) {
         (status, "application/json", body.as_bytes().to_vec())
+    }
+
+    fn hosted_at(provider: &Provider, url: &str, format: UploadFormat) -> OpenAiTranscriber {
+        let mut engine = provider_transcriber(provider, "https://ignored.invalid", " test-key ", provider.default_model(), format).unwrap();
+        assert_eq!(engine.base_url, provider.base_url);
+        engine.base_url = format!("{url}/v1");
+        engine.http = client(Duration::from_secs(5), url);
+        engine
+    }
+
+    #[test]
+    fn deepgram_uses_raw_wav_token_auth_and_encoded_query_parameters() {
+        for language in ["auto", "de,en", "de-DE"] {
+            let (url, rx) = serve(vec![json(200, r#"{"results":{"channels":[{"detected_language":"de","alternatives":[{"transcript":"Hallo Welt."}]}]}}"#)]);
+            let engine = hosted_at(&crate::providers::DEEPGRAM, &url, UploadFormat::Wav);
+            let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+            let result = engine.transcribe_detecting(&wav, &TranscribeOptions::new(language, "Amber, A&B\nC++")).unwrap();
+            assert_eq!(result, ("Hallo Welt.".into(), Some("de".into())));
+            let req = rx.recv().unwrap();
+            assert_eq!(req.body, wav);
+            assert!(req.head.to_lowercase().contains("authorization: token test-key\r\n"));
+            assert!(req.head.to_lowercase().contains("content-type: audio/wav\r\n"));
+            let path = req.head.split_whitespace().nth(1).unwrap();
+            let parsed = reqwest::Url::parse(&format!("{url}{path}")).unwrap();
+            assert_eq!(parsed.path(), "/v1/listen");
+            let pairs: Vec<_> = parsed.query_pairs().collect();
+            let get = |key| pairs.iter().filter(|(k, _)| k == key).map(|(_, v)| v.as_ref()).collect::<Vec<_>>();
+            assert_eq!(get("model"), ["nova-3"]);
+            assert!(get("keyterm").is_empty(), "existing vocabulary must not activate a paid add-on");
+            assert_eq!(get("redact_usage"), ["true"]);
+            assert_eq!(get("language"), if language == "de-DE" { vec!["de"] } else { vec![] });
+            assert_eq!(get("detect_language"), if language == "de-DE" { vec![] } else { vec!["true"] });
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn deepgram_reports_omitted_paid_vocabulary_hints() {
+        let (url, _rx) = serve(vec![json(200, r#"{"results":{"channels":[{"alternatives":[{"transcript":"Amber"}]}]}}"#)]);
+        let engine = hosted_at(&crate::providers::DEEPGRAM, &url, UploadFormat::Wav);
+        let wav = crate::audio::encode_wav(&vec![0.1; 1600], 16_000);
+        let (result, upload) = engine.transcribe_with_upload(&wav, &TranscribeOptions::new("en", "Amber"), &CancellationToken::default());
+        assert_eq!(result.unwrap(), "Amber");
+        assert!(upload.unwrap().note.unwrap().contains("paid add-on"));
+    }
+
+    #[test]
+    fn native_multipart_adapters_send_only_supported_fields() {
+        for provider in [&crate::providers::MISTRAL, &crate::providers::ELEVENLABS] {
+            for language in ["de", "de,en", "auto"] {
+                let response = if provider.id == "mistral" { r#"{"text":"Hallo.","language":"de"}"# }
+                    else { r#"{"text":"Hallo.","language_code":"de"}"# };
+                let (url, rx) = serve(vec![json(200, response)]);
+                let engine = hosted_at(provider, &url, UploadFormat::Opus);
+                let wav = crate::audio::encode_wav(&vec![0.1; 16_000], 16_000);
+                let (result, upload) = engine.transcribe_with_upload(&wav, &TranscribeOptions::new(language, "Amber, Tauri"), &CancellationToken::default());
+                assert_eq!(result.unwrap(), "Hallo.");
+                let upload = upload.unwrap();
+                assert_eq!(upload.format, "wav");
+                assert_eq!(upload.upload_bytes, wav.len() as u64);
+                assert_eq!(upload.encoding_ms, 0);
+                assert!(upload.note.as_deref().unwrap().contains("before uploading"));
+                let req = rx.recv().unwrap();
+                let body = String::from_utf8_lossy(&req.body);
+                assert!(body.contains("filename=\"dictation.wav\"") && body.contains("Content-Type: audio/wav"));
+                assert!(req.body.windows(wav.len()).any(|w| w == wav));
+                for absent in ["prompt", "response_format", "amber_cleanup", "keyterms", "transcript_edit"] {
+                    assert!(!body.contains(&format!("name=\"{absent}\"")), "{absent}");
+                }
+                if provider.id == "mistral" {
+                    assert!(req.head.starts_with("POST /v1/audio/transcriptions "));
+                    assert!(req.head.to_lowercase().contains("authorization: bearer test-key\r\n"));
+                    assert!(body.contains("name=\"model\"\r\n\r\nvoxtral-mini-latest"));
+                    assert_eq!(body.matches("name=\"context_bias\"").count(), 2);
+                    assert_eq!(body.contains("name=\"language\"\r\n\r\nde"), language == "de");
+                } else {
+                    assert!(req.head.starts_with("POST /v1/speech-to-text "));
+                    assert!(req.head.to_lowercase().contains("xi-api-key: test-key\r\n"));
+                    assert!(!req.head.to_lowercase().contains("authorization:"));
+                    assert!(body.contains("name=\"model_id\"\r\n\r\nscribe_v2"));
+                    assert!(body.contains("name=\"tag_audio_events\"\r\n\r\nfalse"));
+                    assert!(body.contains("name=\"diarize\"\r\n\r\nfalse"));
+                    assert_eq!(body.contains("name=\"language_code\"\r\n\r\nde"), language == "de");
+                    assert!(upload.note.unwrap().contains("paid add-on"));
+                }
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn native_speech_failures_keep_upload_metadata_without_paid_retries() {
+        for provider in [&crate::providers::MISTRAL, &crate::providers::ELEVENLABS, &crate::providers::DEEPGRAM] {
+            for (status, body, kind) in [(401, "private-key", ErrorKind::Unauthorized), (429, "private-key", ErrorKind::RateLimited),
+                (500, "private-key", ErrorKind::Unavailable), (200, "private-key", ErrorKind::BadResponse),
+                (200, "{}", ErrorKind::BadResponse)] {
+                let (url, rx) = serve(vec![json(status, body)]);
+                let (result, upload) = hosted_at(provider, &url, UploadFormat::Wav)
+                    .transcribe_with_upload(b"private audio", &TranscribeOptions::default(), &CancellationToken::default());
+                let error = result.unwrap_err();
+                assert_eq!(error.kind, kind);
+                assert!(!error.to_string().contains("private"));
+                assert_eq!(upload.unwrap().upload_bytes, 13);
+                assert!(rx.recv().unwrap().head.starts_with("POST "));
+                assert!(rx.recv_timeout(Duration::from_millis(50)).is_err(), "one paid request only");
+            }
+        }
+    }
+
+    #[test]
+    fn native_speech_cancellation_aborts_in_flight_and_prevents_uploads() {
+        for provider in [&crate::providers::MISTRAL, &crate::providers::ELEVENLABS, &crate::providers::DEEPGRAM] {
+            let (url, ready, release) = testserver::stalled(b"");
+            let engine = hosted_at(provider, &url, UploadFormat::Wav);
+            let cancel = CancellationToken::default();
+            let worker_cancel = cancel.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || tx.send(engine.transcribe_with_upload(b"wav", &TranscribeOptions::default(), &worker_cancel)).unwrap());
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            cancel.cancel();
+            let (result, upload) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+            assert_eq!(upload.unwrap().upload_bytes, 3);
+            drop(release);
+            worker.join().unwrap();
+            let engine = provider_transcriber(provider, "", "key", provider.default_model(), UploadFormat::Wav).unwrap();
+            let (result, upload) = engine.transcribe_with_upload(b"wav", &TranscribeOptions::default(), &cancel);
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+            assert_eq!(upload.unwrap().upload_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn provider_checks_use_native_auth_and_non_billable_model_lists() {
+        for (provider, response, header) in [
+            (Provider { base_url: "", ..crate::providers::DEEPGRAM }, r#"{"stt":[]}"#, "authorization: token test-key"),
+            (Provider { base_url: "", ..crate::providers::ELEVENLABS }, "[]", "xi-api-key: test-key"),
+            (Provider { base_url: "", ..crate::providers::ANTHROPIC }, r#"{"data":[]}"#, "x-api-key: test-key"),
+            (Provider { base_url: "", ..crate::providers::GEMINI }, r#"{"data":[]}"#, "authorization: bearer test-key"),
+            (Provider { base_url: "", ..crate::providers::OPENROUTER }, r#"{"data":{"label":"test"}}"#, "authorization: bearer test-key"),
+        ] {
+            let (url, rx) = serve(vec![json(200, response)]);
+            check_provider(&provider, &format!("{url}/v1"), " test-key ").unwrap();
+            let req = rx.recv().unwrap();
+            assert!(req.head.starts_with(if provider.id == "openrouter" { "GET /v1/key " } else { "GET /v1/models " }));
+            assert!(req.head.to_lowercase().contains(header));
+            assert!(req.body.is_empty());
+            assert!(rx.try_recv().is_err());
+            let (url, _) = serve(vec![json(200, "{}")]);
+            assert_eq!(check_provider(&provider, &url, "key").unwrap_err().kind, ErrorKind::BadResponse);
+        }
+    }
+
+    #[test]
+    fn native_query_support_does_not_relax_endpoint_policy_or_capability_checks() {
+        for base in ["http://192.168.1.1/v1", "http://localhost/v1", "https://example.com/v1?key=private", "https://user:private@example.com/v1"] {
+            let provider = Provider { base_url: "", ..crate::providers::DEEPGRAM };
+            assert!(provider_transcriber(&provider, base, "key", "nova-3", UploadFormat::Wav).is_err());
+            assert!(check_provider(&provider, base, "key").is_err());
+        }
+        for provider in crate::providers::ALL.iter().filter(|p| !p.supports_speech()) {
+            assert!(provider_transcriber(provider, "", "key", "model", UploadFormat::Wav).is_err());
+        }
+    }
+
+    #[test]
+    fn native_speech_refuses_redirects_oversized_responses_and_embedded_errors() {
+        for provider in [&crate::providers::MISTRAL, &crate::providers::ELEVENLABS, &crate::providers::DEEPGRAM] {
+            let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            target.set_nonblocking(true).unwrap();
+            let (url, _) = testserver::serve_raw(vec![format!(
+                "HTTP/1.1 307 Redirect\r\nLocation: http://{}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target.local_addr().unwrap()
+            ).into_bytes()]);
+            let error = hosted_at(provider, &url, UploadFormat::Wav).transcribe(b"private audio", &TranscribeOptions::default()).unwrap_err();
+            assert_eq!(error.detail, "HTTP 307");
+            assert_eq!(target.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            let (url, _) = testserver::serve_raw(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n".to_vec()]);
+            let error = hosted_at(provider, &url, UploadFormat::Wav).transcribe(b"audio", &TranscribeOptions::default()).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::BadResponse);
+            assert!(error.detail.contains("exceeds"));
+            let (url, _) = serve(vec![json(200, r#"{"error":"private credential","text":"not accepted"}"#)]);
+            let error = hosted_at(provider, &url, UploadFormat::Wav).transcribe(b"audio", &TranscribeOptions::default()).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Server);
+            assert!(!error.to_string().contains("private"));
+        }
     }
 
     #[test]

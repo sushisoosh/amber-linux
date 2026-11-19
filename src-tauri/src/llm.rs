@@ -11,7 +11,6 @@ use amber_core::cleanup::{Ask, ChatCleaner};
 use amber_core::engine::CancellationToken;
 use amber_core::profiles::{self, CleanupChoice, Profile};
 use amber_core::local;
-use amber_core::providers;
 use amber_core::settings::{EngineKind, Settings};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -318,22 +317,12 @@ pub fn cleaner(app: &AppHandle, s: &Settings, wait: bool) -> Result<ChatCleaner,
             Ok(ChatCleaner::new(&endpoint.url, &endpoint.key, c.local_model.as_str(), None))
         }
         EngineKind::Server => {
-            let provider = providers::by_id(&c.provider).ok_or("Unknown cleanup provider.")?;
-            // An own server for the cleanup defaults to the speech engine's address.
-            let custom = if c.base_url.trim().is_empty() { &s.server.base_url } else { &c.base_url };
-            let base = providers::effective_base_url(provider, custom);
-            providers::check_base_url(&base)?;
-            // A cleanup-specific custom URL must not inherit the speech server's key unless
-            // its scheme, host and effective port match the credential's saved origin.
-            let key = app.state::<Core>().key_for(provider.id, &base).unwrap_or_default();
-            if provider.needs_key && key.is_empty() {
-                return Err(format!("No API key for {} - add it on the Credentials page.", provider.name));
-            }
+            let target = amber_core::connections::resolve_cleanup(s)?;
+            let key = crate::connections::key_for(&app.state::<Core>(), &target)?;
             if c.model.trim().is_empty() {
                 return Err("No chat model chosen for the cleanup.".into());
             }
-            let extra = provider.chat_model(&c.model).and_then(|m| m.extra).and_then(|e| serde_json::from_str(e).ok());
-            Ok(ChatCleaner::new(&base, &key, &c.model, extra))
+            target.cleaner(&key, &c.model).map_err(|e| e.message)
         }
     }
 }
@@ -384,12 +373,14 @@ pub fn command(app: &AppHandle, s: &Settings, spoken: &str, shell: amber_core::t
     amber_core::terminal::command_from(reply, shell)
 }
 
-/// What the dictation gets: a snippet if the dictation is its phrase; else the rules (fillers,
-/// spoken punctuation, German commas), and - when the smart cleanup runs for [profile]'s program - the
-/// model's tidy-up in that program's style. A failing model leaves the text as it was: never
-/// lost, never stuck. Returns why the model was skipped, if it was.
+/// General cleanup for phone requests, without desktop keyword instructions. Snippets, when
+/// permitted, win over the ordinary rules and meaning-preserving model cleanup.
 pub fn tidy(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool) -> (String, Option<String>) {
-    let (text, why, _) = tidy_cancellable(app, s, recognized, profile, snippets, &CancellationToken::default());
+    // The phone has no desktop copy-only delivery guard. Its existing general cleanup must
+    // not expose saved prompts or turn a remotely supplied keyword into executable output.
+    let mut phone = s.clone();
+    phone.instructions.clear();
+    let (text, why, _) = tidy_cancellable(app, &phone, recognized, profile, snippets, &CancellationToken::default());
     (text, why)
 }
 
@@ -419,9 +410,8 @@ pub fn tidy_for_test(app: &AppHandle, s: &Settings, result: &mut amber_core::tes
             }
             EngineKind::Server => {
                 let cleaner = cleaner(app, s, true)?;
-                let provider = providers::by_id(&c.provider).ok_or("Unknown cleanup provider.")?;
-                let custom = if c.base_url.trim().is_empty() { &s.server.base_url } else { &c.base_url };
-                (cleaner, Engine::server(provider.id, &providers::effective_base_url(provider, custom), &c.model), None)
+                let target = amber_core::connections::resolve_cleanup(s)?;
+                (cleaner, Engine::server(target.provider.id, &target.base_url, &c.model), None)
             }
         };
         result.cleanup_engine = Some(engine);
@@ -436,13 +426,24 @@ fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile
     if let Err(e) = cancel.check() {
         return (recognized.to_string(), Some(e.message), false);
     }
-    // A snippet's phrase on its own: its saved text, exactly as saved.
-    if let Some(snippet) = amber_core::snippets::find(&s.snippets, recognized).filter(|_| snippets) {
+    let instruction = amber_core::instructions::match_start(&s.instructions, recognized);
+    // Explicit leading instructions win; otherwise a snippet stays exactly as saved.
+    if let Some(snippet) = amber_core::snippets::find(&s.snippets, recognized).filter(|_| snippets && instruction.is_none()) {
         // The trigger is what was just said: logged only where dictated text is.
         crate::diag::info(if s.log_text && !cfg!(target_os = "linux") { format!("snippet \"{}\"", snippet.trigger) } else { "snippet inserted".to_string() });
         return (snippet.text.clone(), None, false);
     }
-    let text = by_rule(s, recognized);
+    if let Some(selected) = &instruction {
+        let error = if !s.cleanup.smart || !profiles::smart_cleanup(s.cleanup.smart, profile) {
+            Some("Keyword instructions need smart cleanup enabled globally and for this program; kept the original.")
+        } else if selected.body.is_empty() {
+            Some("Say a request after the instruction keyword; kept the original.")
+        } else { None };
+        if let Some(error) = error { return (recognized.into(), Some(error.into()), false); }
+    }
+    // Do not turn a later keyword into the first word by dropping fillers, and do not apply
+    // spoken punctuation to a request intended for an explicit transformation.
+    let text = if instruction.is_some() { recognized.into() } else { by_rule(s, recognized) };
     if !profiles::smart_cleanup(s.cleanup.smart, profile) || text.is_empty() {
         return (text, None, false);
     }
@@ -464,7 +465,10 @@ fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile
         // cleanup passes (), preserving its existing non-pinning behavior.
         cancel.check().map_err(|e| e.message)?;
         remote_attempted = s.cleanup.engine == EngineKind::Server;
-        let cleaned = c.clean_cancellable(&text, &ask, cancel).map_err(|e| e.message)?;
+        let cleaned = match &instruction {
+            Some(selected) => c.transform_cancellable(selected.body, selected.instruction, cancel),
+            None => c.clean_cancellable(&text, &ask, cancel),
+        }.map_err(|e| e.message)?;
         cancel.check().map_err(|e| e.message)?;
         Ok(cleaned)
     });
@@ -522,6 +526,80 @@ mod tests {
         s.cleanup.engine = engine;
         s.cleanup.smart = true;
         s
+    }
+
+    fn instruction_settings() -> Settings {
+        let mut s = settings(EngineKind::Server);
+        s.instructions.push(amber_core::instructions::Instruction {
+            id: "bash".into(), name: "Bash".into(), keyword: "bash".into(),
+            prompt: amber_core::instructions::BASH_PROMPT.into(), enabled: true,
+            output: amber_core::instructions::InstructionOutput::Shell,
+        });
+        s
+    }
+
+    #[test]
+    fn keyword_instructions_require_global_and_program_consent_and_nonempty_payload() {
+        let mut s = instruction_settings();
+        let cancel = CancellationToken::default();
+        let never = Profile { cleanup: CleanupChoice::Never, ..Profile::default() };
+        let always = Profile { cleanup: CleanupChoice::Always, ..Profile::default() };
+        for (smart, profile, text) in [(false, None, "Bash: list files"), (false, Some(&always), "Bash: list files"),
+            (true, Some(&never), "Bash: list files"), (true, None, "Bash:  ")] {
+            s.cleanup.smart = smart;
+            let (out, why, remote) = tidy_with_cleaner::<()>(&s, text, profile, false, &cancel, false,
+                || panic!("an inactive or empty instruction must not construct a model"));
+            assert_eq!(out, text);
+            assert!(why.is_some() && !remote);
+        }
+    }
+
+    #[test]
+    fn one_instruction_transforms_the_whole_utterance_and_keeps_internal_newlines() {
+        let mut s = instruction_settings();
+        let spoken = "Bash: list all files then print the working directory";
+        s.snippets.push(amber_core::snippets::Snippet { trigger: spoken.into(), text: "An overlapping snippet".into() });
+        let body = serde_json::json!({"choices": [{"message": {"content": "```bash\nls -la\npwd\n```\n"}, "finish_reason": "stop"}]}).to_string();
+        let (cleaner, server) = reply(200, body, None);
+        let result = tidy_with_cleaner(&s, spoken, None, true, &CancellationToken::default(), false, || Ok((cleaner, ())));
+        server.join().unwrap();
+        assert_eq!(result, ("ls -la\npwd".into(), None, true));
+    }
+
+    #[test]
+    fn an_instruction_failure_or_cancellation_keeps_the_trigger_and_original_request() {
+        let s = instruction_settings();
+        let spoken = "Bash: uh list all files comma then print the working directory";
+        for cancelled in [false, true] {
+            let cancel = CancellationToken::default();
+            let (cleaner, server) = reply(503, r#"{"error":"private spoken request"}"#.into(), cancelled.then(|| cancel.clone()));
+            let (out, why, remote) = tidy_with_cleaner(&s, spoken, None, false, &cancel, false, || Ok((cleaner, ())));
+            server.join().unwrap();
+            assert_eq!(out, spoken, "no filler/punctuation changes and no lost keyword on failure");
+            assert!(why.is_some() && remote);
+            assert!(!why.unwrap().contains("private spoken request"));
+        }
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        let (out, why, remote) = tidy_with_cleaner::<()>(&s, spoken, None, false, &cancel, false, || panic!("pre-cancelled"));
+        assert_eq!(out, spoken);
+        assert!(why.is_some() && !remote);
+        let missing = tidy_with_cleaner::<()>(&s, spoken, None, false, &CancellationToken::default(), false,
+            || Err("The selected cleanup model is not ready.".into()));
+        assert_eq!(missing, (spoken.into(), Some("The selected cleanup model is not ready.".into()), false));
+    }
+
+    #[test]
+    fn filler_removal_cannot_reveal_a_trigger_and_nonmatches_keep_cleanup_checks() {
+        let s = instruction_settings();
+        for spoken in ["uh bash list all files", "please use bash to list all files", "bashful people list files"] {
+            let body = serde_json::json!({"choices": [{"message": {"content": "ls -la"}, "finish_reason": "stop"}]}).to_string();
+            let (cleaner, server) = reply(200, body, None);
+            let (out, why, remote) = tidy_with_cleaner(&s, spoken, None, false, &CancellationToken::default(), false, || Ok((cleaner, ())));
+            server.join().unwrap();
+            assert_eq!(out, by_rule(&s, spoken));
+            assert!(why.is_some() && remote, "ordinary cleanup must reject the command rewrite");
+        }
     }
 
     #[test]

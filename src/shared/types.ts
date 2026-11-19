@@ -61,7 +61,8 @@ export type TerminalMode = "default" | "off" | "auto" | "bash" | "powershell";
 export interface Settings {
   engine: EngineKind;
   local: { runtime: string; model: string; threads: number; keepLoaded: boolean; chunking: boolean };
-  server: { provider: string; baseUrl: string; model: string; uploadFormat: "wav" | "opus"; localFallback: boolean };
+  server: { connectionId: string | null; provider: string; baseUrl: string; model: string; uploadFormat: "wav" | "opus"; localFallback: boolean };
+  connections: Connection[];
   language: string;
   vocabulary: string;
   microphone: string;
@@ -88,9 +89,11 @@ export interface Settings {
   historyDays: number;
   statistics: boolean;
   snippets: Snippet[];
+  instructions: Instruction[];
   discord: { muteWhileDictating: boolean };
   terminal: { enabled: boolean; automatic: boolean; safeMode: boolean; runCommands: boolean; hotkey: string; prefixes: string[] };
   cleanup: {
+    connectionId: string | null;
     fillers: boolean;
     spokenPunctuation: boolean;
     germanCommas: boolean;
@@ -104,6 +107,35 @@ export interface Settings {
   };
 }
 
+export interface Connection {
+  id: string;
+  name: string;
+  provider: string;
+  baseUrl: string;
+}
+
+export interface DiscoveredModel {
+  id: string;
+  label: string;
+  capabilities: ("speech" | "cleanup")[];
+  note: string;
+}
+
+export interface ModelDiscovery {
+  models: DiscoveredModel[];
+  truncated: boolean;
+  notice: string;
+}
+
+export interface Instruction {
+  id: string;
+  name: string;
+  keyword: string;
+  prompt: string;
+  enabled: boolean;
+  output: "text" | "shell";
+}
+
 export interface ProviderInfo {
   id: string;
   name: string;
@@ -112,6 +144,8 @@ export interface ProviderInfo {
   keyUrl: string;
   needsKey: boolean;
   hasKey: boolean;
+  supportsSpeech: boolean;
+  supportsCleanup: boolean;
 }
 
 export interface Overview {
@@ -130,6 +164,8 @@ export interface LocalItem {
   installed: boolean;
   wantsGpu: boolean;
   replaced: boolean;
+  family?: "whisper" | "parakeet" | "moonshine";
+  imported: boolean;
 }
 
 export interface LocalStatus {
@@ -150,6 +186,8 @@ export interface LocalInfo {
   llmRuntimes: LocalItem[];
   llmModels: LocalItem[];
   llmStatus: LocalStatus;
+  onnxRuntimeInstalled: boolean;
+  importsError: string | null;
 }
 
 export interface DownloadEvent {
@@ -270,7 +308,7 @@ export interface TestEngine {
   baseUrl: string | null;
 }
 
-export type TestConfig = Pick<Settings, "engine" | "local" | "server" | "cleanup" | "language" | "vocabulary" | "microphone">;
+export type TestConfig = Pick<Settings, "engine" | "local" | "server" | "cleanup" | "language" | "vocabulary" | "microphone" | "connections" | "instructions">;
 export type TestPhase = "idle" | "recording" | "recognizing" | "cleaning" | "cancelling";
 export type TestCleanupStatus = "notRun" | "disabled" | "empty" | "success" | "skipped" | "error";
 

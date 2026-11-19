@@ -356,11 +356,31 @@ input[type="range"] {
   padding: 11px 18px;
 }
 
+.model-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.connection-models {
+  max-height: 340px;
+  overflow: auto;
+}
+
+.instruction-result {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 .item + .item {
   border-top: 1px solid var(--outline);
 }
 
 .item .radio {
+  appearance: none;
+  padding: 0;
+  background: transparent;
   width: 16px;
   height: 16px;
   border-radius: 50%;
@@ -381,6 +401,8 @@ input[type="range"] {
 
 .item .name {
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .item .name .hint {

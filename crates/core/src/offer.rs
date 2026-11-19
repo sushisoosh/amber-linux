@@ -8,6 +8,7 @@ use crate::settings::{EngineKind, Settings};
 /// cloud models set in the app can run (a provider and its key).
 pub struct Installed {
     pub speech: Vec<String>,
+    pub imported_speech: Vec<ModelInfo>,
     /// Where the local speech models run: "NVIDIA GPU (CUDA)".
     pub speech_runtime: String,
     pub llms: Vec<String>,
@@ -18,7 +19,6 @@ pub struct Installed {
 
 /// The models the phone may choose among, local ones first, the PC's own as the default.
 pub fn pc_models(s: &Settings, installed: &Installed) -> Vec<ModelInfo> {
-    let provider = |id: &str| crate::providers::by_id(id).map_or(id.to_string(), |p| p.name.to_string());
     let mut speech: Vec<ModelInfo> = installed
         .speech
         .iter()
@@ -31,14 +31,25 @@ pub fn pc_models(s: &Settings, installed: &Installed) -> Vec<ModelInfo> {
             default: s.engine == EngineKind::Local && s.local.model == m.id,
         })
         .collect();
+    speech.extend(installed.speech.iter().filter_map(|id| crate::onnx::model(id)).map(|m| ModelInfo {
+        id: m.id.into(), kind: ModelKind::Speech, label: m.label.into(),
+        note: format!("on this PC - ONNX CPU; {}", m.note),
+        default: s.engine == EngineKind::Local && s.local.model == m.id,
+    }));
+    speech.extend(installed.imported_speech.iter().map(|m| ModelInfo {
+        id: m.id.clone(), label: m.label.clone(), note: m.note.clone(), kind: ModelKind::Speech,
+        default: s.engine == EngineKind::Local && s.local.model == m.id,
+    }));
     if installed.cloud_speech && !s.server.model.trim().is_empty() {
+      if let Ok(target) = crate::connections::resolve_speech(s) {
         speech.push(ModelInfo {
             id: s.server.model.clone(),
             kind: ModelKind::Speech,
             label: s.server.model.clone(),
-            note: format!("through this PC · {}", provider(&s.server.provider)),
+            note: format!("through this PC · {}", target.connection.map_or(target.provider.name, |c| &c.name)),
             default: s.engine == EngineKind::Server,
         });
+      }
     }
     let mut cleanup: Vec<ModelInfo> = installed
         .llms
@@ -53,14 +64,16 @@ pub fn pc_models(s: &Settings, installed: &Installed) -> Vec<ModelInfo> {
         })
         .collect();
     if installed.cloud_cleanup && !s.cleanup.model.trim().is_empty() {
-        let label = crate::providers::by_id(&s.cleanup.provider).and_then(|p| p.chat_model(&s.cleanup.model)).map_or(s.cleanup.model.clone(), |m| m.label.to_string());
+      if let Ok(target) = crate::connections::resolve_cleanup(s) {
+        let label = target.provider.chat_model(&s.cleanup.model).map_or(s.cleanup.model.clone(), |m| m.label.to_string());
         cleanup.push(ModelInfo {
             id: s.cleanup.model.clone(),
             kind: ModelKind::Cleanup,
             label,
-            note: format!("through this PC · {}", provider(&s.cleanup.provider)),
+            note: format!("through this PC · {}", target.connection.map_or(target.provider.name, |c| &c.name)),
             default: s.cleanup.engine == EngineKind::Server,
         });
+      }
     }
     // The PC's own may not be ready (a model still downloading): then the first is.
     for list in [&mut speech, &mut cleanup] {
@@ -82,6 +95,7 @@ mod tests {
     fn installed() -> Installed {
         Installed {
             speech: vec!["acft-large-v3-turbo-q8_0".into(), "futo-multilingual-74".into()],
+            imported_speech: Vec::new(),
             speech_runtime: "NVIDIA GPU (CUDA)".into(),
             llms: vec!["qwen3-4b-instruct-2507-q4km".into()],
             llm_runtime: "NVIDIA GPU (CUDA)".into(),
@@ -124,5 +138,35 @@ mod tests {
         // No key for the cloud, nothing downloaded: nothing to offer.
         let none = Installed { speech: vec![], llms: vec![], cloud_speech: false, cloud_cleanup: false, ..installed() };
         assert!(pc_models(&s, &none).is_empty());
+    }
+
+    #[test]
+    fn onnx_models_are_offered_without_claiming_the_whisper_gpu_runtime() {
+        let mut s = Settings::default();
+        s.local.model = "parakeet-v3-int8".into();
+        let mut installed = installed();
+        installed.speech.extend(["parakeet-v3-int8".into(), "moonshine-tiny-int8".into()]);
+        let models = pc_models(&s, &installed);
+        let parakeet = models.iter().find(|m| m.id == "parakeet-v3-int8").unwrap();
+        assert!(parakeet.default);
+        assert!(parakeet.note.contains("ONNX CPU") && !parakeet.note.contains("CUDA"));
+        assert!(models.iter().any(|m| m.id == "moonshine-tiny-int8" && !m.default));
+    }
+
+    #[test]
+    fn imported_models_and_saved_connection_names_are_advertised_without_source_paths() {
+        let mut s = Settings::default();
+        s.local.model = format!("import-{}", "b".repeat(32));
+        let mut installed = installed();
+        installed.imported_speech.push(ModelInfo { id: s.local.model.clone(), kind: ModelKind::Speech,
+            label: "My English model".into(), note: "Imported Moonshine on this PC".into(), default: false });
+        s.connections.push(crate::connections::Connection { id: "conn_personal".into(), name: "Personal OpenAI".into(), provider: "openai".into(), base_url: crate::providers::OPENAI.base_url.into() });
+        s.server.connection_id = Some("conn_personal".into());
+        s.server.model = "whisper-1".into();
+        let models = pc_models(&s, &installed);
+        assert!(models.iter().any(|m| m.id == s.local.model && m.default && m.label == "My English model"));
+        assert!(models.iter().find(|m| m.id == "whisper-1").unwrap().note.contains("Personal OpenAI"));
+        s.server.connection_id = Some("conn_missing".into());
+        assert!(!pc_models(&s, &installed).iter().any(|m| m.id == "whisper-1"));
     }
 }

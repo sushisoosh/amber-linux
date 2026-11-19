@@ -57,12 +57,17 @@ pub struct Config {
     pub language: String,
     pub vocabulary: String,
     pub microphone: String,
+    #[serde(default)]
+    pub connections: Vec<crate::connections::Connection>,
+    #[serde(default)]
+    pub instructions: Vec<crate::instructions::Instruction>,
 }
 
 impl From<&Settings> for Config {
     fn from(s: &Settings) -> Self {
         Self { engine: s.engine, local: s.local.clone(), server: s.server.clone(), cleanup: s.cleanup.clone(),
-            language: s.language.clone(), vocabulary: s.vocabulary.clone(), microphone: s.microphone.clone() }
+            language: s.language.clone(), vocabulary: s.vocabulary.clone(), microphone: s.microphone.clone(),
+            connections: s.connections.clone(), instructions: s.instructions.clone() }
     }
 }
 

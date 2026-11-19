@@ -99,13 +99,24 @@ impl Model {
 pub const MODELS_COMMIT: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 
 macro_rules! ggerganov {
-    ($file:literal) => {
+    ($file:expr) => {
         concat!("https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/", $file)
     };
 }
 
-/// The same models as Amber for Android 0.16, pinned by URL and SHA-256 there and here.
-pub const MODELS: [Model; 8] = [
+macro_rules! stock_model {
+    ($id:literal, $label:literal, $note:literal, $sha:literal, $mb:literal, $gpu:literal) => {
+        Model {
+            id: $id, file: concat!("ggml-", $id, ".bin"), label: $label, note: $note,
+            url: ggerganov!(concat!("ggml-", $id, ".bin")), sha256: $sha, size_mb: $mb,
+            wants_gpu: $gpu, short_context: false, context_slack: 0, replaced: false,
+        }
+    };
+}
+
+/// Tuned dictation defaults plus stock Whisper choices. Stock hashes are the LFS SHA-256
+/// values at MODELS_COMMIT; quantization reduces download/memory at a possible accuracy cost.
+pub const MODELS: [Model; 24] = [
     Model {
         id: "futo-multilingual-74",
         file: "voice-input-multilingual-74.bin",
@@ -151,68 +162,84 @@ pub const MODELS: [Model; 8] = [
     Model {
         id: "base-q5_1",
         file: "ggml-base-q5_1.bin",
-        label: "Base",
-        note: "replaced by Base (FUTO)",
+        label: "Whisper Base Q5_1",
+        note: "multilingual, compact 5-bit weights; full 30-second encoder context",
         url: ggerganov!("ggml-base-q5_1.bin"),
         sha256: "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
         size_mb: 57,
         wants_gpu: false,
         short_context: false,
         context_slack: 0,
-        replaced: true,
+        replaced: false,
     },
     Model {
         id: "small-q5_1",
         file: "ggml-small-q5_1.bin",
-        label: "Small",
-        note: "replaced by Small (FUTO)",
+        label: "Whisper Small Q5_1",
+        note: "multilingual, compact 5-bit weights; full 30-second encoder context",
         url: ggerganov!("ggml-small-q5_1.bin"),
         sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
         size_mb: 182,
         wants_gpu: false,
         short_context: false,
         context_slack: 0,
-        replaced: true,
+        replaced: false,
     },
     Model {
         id: "large-v3-turbo-q5_0",
         file: "ggml-large-v3-turbo-q5_0.bin",
-        label: "Large v3 Turbo (old)",
-        note: "always works through 30 s - the tuned Large v3 Turbo is as accurate and faster",
+        label: "Whisper Large v3 Turbo Q5_0",
+        note: "multilingual, compact 5-bit weights; full context, unlike the tuned model",
         url: ggerganov!("ggml-large-v3-turbo-q5_0.bin"),
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
         size_mb: 548,
         wants_gpu: true,
         short_context: false,
         context_slack: 0,
-        replaced: true,
+        replaced: false,
     },
     Model {
         id: "large-v3-turbo-q8_0",
         file: "ggml-large-v3-turbo-q8_0.bin",
-        label: "Large v3 Turbo q8 (old)",
-        note: "replaced by the tuned Large v3 Turbo",
+        label: "Whisper Large v3 Turbo Q8_0",
+        note: "multilingual, 8-bit weights; full context, unlike the tuned model",
         url: ggerganov!("ggml-large-v3-turbo-q8_0.bin"),
         sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
         size_mb: 834,
         wants_gpu: true,
         short_context: false,
         context_slack: 0,
-        replaced: true,
+        replaced: false,
     },
     Model {
         id: "large-v3-q5_0",
         file: "ggml-large-v3-q5_0.bin",
-        label: "Large v3 (old)",
-        note: "slowest; the tuned Large v3 Turbo is about as accurate",
+        label: "Whisper Large v3 Q5_0",
+        note: "multilingual, 5-bit weights; slower than Turbo, needs more memory",
         url: ggerganov!("ggml-large-v3-q5_0.bin"),
         sha256: "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1",
         size_mb: 1_031,
         wants_gpu: true,
         short_context: false,
         context_slack: 0,
-        replaced: true,
+        replaced: false,
     },
+    stock_model!("tiny-q5_1", "Whisper Tiny Q5_1", "multilingual, smallest download; lower accuracy", "818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7", 31, false),
+    stock_model!("tiny-q8_0", "Whisper Tiny Q8_0", "multilingual, 8-bit weights; fast, lower accuracy", "c2085835d3f50733e2ff6e4b41ae8a2b8d8110461e18821b09a15c40c42d1cca", 42, false),
+    stock_model!("tiny", "Whisper Tiny F16", "multilingual, original half-precision weights", "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21", 75, false),
+    stock_model!("tiny.en-q5_1", "Whisper Tiny English Q5_1", "English only, smallest download; lower accuracy", "c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b", 31, false),
+    stock_model!("base-q8_0", "Whisper Base Q8_0", "multilingual, 8-bit weights; full encoder context", "c577b9a86e7e048a0b7eada054f4dd79a56bbfa911fbdacf900ac5b567cbb7d9", 78, false),
+    stock_model!("base", "Whisper Base F16", "multilingual, original half-precision weights", "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe", 142, false),
+    stock_model!("base.en-q5_1", "Whisper Base English Q5_1", "English only, compact 5-bit weights", "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f", 57, false),
+    stock_model!("small-q8_0", "Whisper Small Q8_0", "multilingual, 8-bit weights; full encoder context", "49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f", 253, false),
+    stock_model!("small", "Whisper Small F16", "multilingual, original half-precision weights", "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b", 466, false),
+    stock_model!("small.en-q5_1", "Whisper Small English Q5_1", "English only, compact 5-bit weights", "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30", 182, false),
+    stock_model!("medium-q5_0", "Whisper Medium Q5_0", "multilingual, compact 5-bit weights; slow on a CPU", "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f", 515, true),
+    stock_model!("medium-q8_0", "Whisper Medium Q8_0", "multilingual, 8-bit weights; slow on a CPU", "42a1ffcbe4167d224232443396968db4d02d4e8e87e213d3ee2e03095dea6502", 786, true),
+    stock_model!("medium", "Whisper Medium F16", "multilingual, original half-precision weights; slow on a CPU", "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208", 1463, true),
+    stock_model!("medium.en-q5_0", "Whisper Medium English Q5_0", "English only, compact 5-bit weights; slow on a CPU", "76733e26ad8fe1c7a5bf7531a9d41917b2adc0f20f2e4f5531688a8c6cd88eb0", 515, true),
+    stock_model!("large-v3-turbo", "Whisper Large v3 Turbo F16", "multilingual, original half-precision weights; more memory than Q8", "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69", 1550, true),
+    stock_model!("large-v3", "Whisper Large v3 F16", "multilingual, largest download and memory use; slower than Turbo", "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2", 2952, true),
 ];
 
 /// Whisper's encoder sees 30 s at most, as 1500 positions: one per 320 samples at 16 kHz.
@@ -741,7 +768,7 @@ fn install_archives(zips: &[&Path], dest: &Path, server_exe: &str, required: &[&
 /// Puts [staging] where [dest] is. The old folder is moved aside first and comes back if the
 /// new one cannot take its place - on Windows a virus scanner briefly holding the fresh DLLs
 /// makes a rename fail with "access denied", so it is tried a few times.
-fn replace_dir(staging: &Path, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_dir(staging: &Path, dest: &Path) -> std::io::Result<()> {
     let retry = |f: &dyn Fn() -> std::io::Result<()>| {
         let mut wait = std::time::Duration::from_millis(200);
         for _ in 0..6 {
@@ -836,6 +863,8 @@ mod tests {
 
     #[test]
     fn catalog_is_consistent() {
+        let mut ids = std::collections::HashSet::new();
+        let mut files = std::collections::HashSet::new();
         for r in &RUNTIMES {
             if cfg!(target_os = "linux") {
                 assert_eq!(r.id, "cpu");
@@ -847,7 +876,10 @@ mod tests {
             }
         }
         for m in &MODELS {
+            assert!(ids.insert(m.id), "duplicate model id {}", m.id);
+            assert!(files.insert(m.file), "duplicate model file {}", m.file);
             assert_eq!(m.sha256.len(), 64);
+            assert!(m.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
             assert!(m.url.starts_with("https://") && m.url.ends_with(m.file), "{}", m.id);
             assert_eq!(model(m.id).map(|x| x.file), Some(m.file));
             assert_eq!(m.short_context, m.context_slack > 0, "{}", m.id);

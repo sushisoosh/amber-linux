@@ -1,9 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { PageProps } from "../App";
-import { Row, Section, Segmented, Switch } from "../ui";
-import { DownloadItem, StatusLabel, useLocal } from "../downloads";
+import { Row, Section, Switch } from "../ui";
+import { DownloadItem, SpeechModelActions, StatusLabel, useLocal } from "../downloads";
+import type { LocalItem } from "../../shared/types";
 import { CredentialLink } from "./Credentials";
+import { ConnectionChoice, ConnectionModelPicker } from "../connections";
+import { ModelImports } from "../modelImports";
 
 const LANGUAGES: [string, string][] = [
   ["de", "German"],
@@ -26,11 +29,11 @@ export function EnginePage(p: PageProps) {
       <div className="cards">
         <button className={`card ${s.engine === "local" ? "on" : ""}`} onClick={() => save((x) => (x.engine = "local"))}>
           <div className="title">On this PC</div>
-          <div className="hint">{linux ? "Built-in whisper.cpp on your CPU. Recognition works offline after downloading a model." : "whisper.cpp on your CPU or NVIDIA GPU. Private, works offline, free."}</div>
+          <div className="hint">{linux ? "Whisper, Parakeet or Moonshine on your CPU. Recognition works offline after setup." : "Whisper on CPU or NVIDIA GPU; Parakeet and Moonshine on CPU. Private, offline after setup."}</div>
         </button>
         <button className={`card ${s.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.engine = "server"))}>
           <div className="title">Server with API key</div>
-          <div className="hint">Groq, OpenAI, Tinfoil.sh or your own server. Your recording is sent there.</div>
+          <div className="hint">Use a speech provider or your own compatible server. Your recording is sent there.</div>
         </button>
       </div>
       {s.engine === "local" ? <LocalEngine {...p} /> : <ServerEngine {...p} />}
@@ -39,8 +42,8 @@ export function EnginePage(p: PageProps) {
           <div className="label">
             <div>Spoken languages</div>
             <div className="hint">
-              Pick the languages you speak. Several: Whisper on this PC picks among them for each dictation - a short one is not taken for Turkish or translated into English (a server
-              service detects on its own). One: everything else is translated into it. None: any language.
+              Whisper uses these as recognition hints, not a reliable translation mode. Several: local Whisper picks among them; none: automatic detection.
+              Parakeet v3 detects its supported languages automatically. Parakeet v2 and Moonshine are English-only. Server support varies.
             </div>
           </div>
           <Languages value={s.language} onChange={(v) => save((x) => (x.language = v))} />
@@ -48,7 +51,7 @@ export function EnginePage(p: PageProps) {
         <div className="row column">
           <div className="label">
             <div>Vocabulary</div>
-            <div className="hint">Names and terms the engine should expect, separated by commas.</div>
+            <div className="hint">Names and terms for engines that support a vocabulary prompt, separated by commas. Parakeet and Moonshine do not use this hint.</div>
           </div>
           <Vocabulary value={s.vocabulary} onSave={(v) => save((x) => (x.vocabulary = v))} />
         </div>
@@ -93,17 +96,61 @@ function Vocabulary({ value, onSave }: { value: string; onSave: (v: string) => v
   );
 }
 
-function LocalEngine({ s, save, toast, ov }: PageProps) {
+type ModelView = "recommended" | "whisper" | "parakeet" | "moonshine" | "installed" | "imported";
+
+export function visibleSpeechModels(models: LocalItem[], view: ModelView, selected: string): LocalItem[] {
+  return models.filter((m) => m.id === selected || (view === "installed" ? m.installed : view === "imported" ? m.imported : view === "recommended"
+    ? ["futo-multilingual-74", "futo-multilingual-244", "acft-large-v3-turbo-q8_0"].includes(m.id)
+    : m.family === view));
+}
+
+function LocalEngine(p: PageProps) {
+  const { s, save, toast, ov, phase } = p;
   // A download is selected by Amber once it is complete, so the engine that works now keeps
   // working until then.
   const local = useLocal();
+  const [view, setView] = useState<ModelView>("recommended");
+  const [selectOnDownload, setSelectOnDownload] = useState(true);
   const info = local.info;
   if (!info) return null;
 
   const st = info.status;
+  const selected = info.models.find((m) => m.id === s.local.model);
+  const onnx = selected?.family === "parakeet" || selected?.family === "moonshine";
   return (
     <>
-      <Section title="Runs on">
+      <Section title="Model library">
+        <Row label="Browse models" hint="The tuned Whisper models remain Amber's defaults. Other families and stock Whisper variants are optional; downloading weights does not mean they are loaded into memory.">
+          <select aria-label="Model library" value={view} onChange={(e) => setView(e.target.value as ModelView)}>
+            <option value="recommended">Tuned for dictation</option>
+            <option value="whisper">All Whisper variants</option>
+            <option value="parakeet">Parakeet</option>
+            <option value="moonshine">Moonshine</option>
+            <option value="installed">Downloaded models</option>
+            <option value="imported">Imported models</option>
+          </select>
+        </Row>
+        <Row label="Use downloads when finished" hint="Off: download for later without changing the selected model. On: select it only after all files have been verified.">
+          <Switch on={selectOnDownload} onChange={setSelectOnDownload} />
+        </Row>
+        {view === "whisper" && <Row label="Size and precision" hint="Tiny/Base favor speed; Small/Medium favor accuracy; Large needs more memory. English variants are English-only. Q5 is smaller than Q8; F16 uses original half-precision weights. Smaller weights can affect accuracy. Stock models keep the full encoder context." />}
+        {(view === "parakeet" || view === "moonshine") && <Row label="CPU recognition" hint={view === "parakeet"
+          ? "Parakeet v3 supports 25 European languages including German and English. v2 is English-only. Language is detected automatically; vocabulary prompts are not supported."
+          : "Moonshine Tiny and Base are compact English-only models. They do not use language or vocabulary hints. Long recordings are processed in bounded chunks."} />}
+        {(view === "parakeet" || view === "moonshine" || onnx) && <Row label={info.onnxRuntimeInstalled ? "ONNX runtime installed" : "ONNX runtime download"}
+          hint={`The first Parakeet or Moonshine download also installs a shared, checksum-verified ONNX Runtime 1.24.4 package (about 119 MiB extra download).${ov.platform === "windows" ? " Windows also needs the Microsoft Visual C++ 2015-2022 x64 redistributable." : " Uses the system C/C++ libraries on x64 GNU/Linux."}`}>
+          {onnx && selected?.installed && !selected.imported && !info.onnxRuntimeInstalled && <button className="btn" disabled={info.downloads.includes(`model:${selected.id}`) || !!local.progress[`model:${selected.id}`]}
+            onClick={() => local.download("model", selected.id, false).catch((e) => toast(String(e)))}>Install runtime</button>}
+        </Row>}
+        {visibleSpeechModels(info.models, view, s.local.model).map((m) => (
+          <DownloadItem key={m.id} local={local} kind="model" item={m}
+            selected={s.local.model === m.id} onSelect={() => save((x) => (x.local.model = m.id))}
+            selectOnDownload={selectOnDownload} recommended={info.recommended[1] === m.id}
+            measured={info.measured[m.id]} toast={toast} />
+        ))}
+      </Section>
+      <ModelImports {...p} local={local} />
+      {!onnx && <Section title="Whisper runs on">
         {info.runtimes.map((r) => (
           <DownloadItem
             key={r.id}
@@ -116,47 +163,22 @@ function LocalEngine({ s, save, toast, ov }: PageProps) {
             recommended={info.recommended[0] === r.id}
             warning={r.wantsGpu && !info.hasNvidia ? "no NVIDIA driver found on this PC" : undefined}
             toast={toast}
+            selectOnDownload={selectOnDownload}
           />
         ))}
-      </Section>
-      <Section title="Model">
-        {info.models
-          // A replaced model shows only while it is still on disk - or still selected.
-          .filter((m) => !m.replaced || m.installed || m.id === s.local.model)
-          .map((m) => (
-            <DownloadItem
-              key={m.id}
-              local={local}
-              kind="model"
-              item={m}
-              selected={s.local.model === m.id}
-              onSelect={() => save((x) => (x.local.model = m.id))}
-              recommended={info.recommended[1] === m.id}
-              measured={info.measured[m.id]}
-              toast={toast}
-            />
-          ))}
-        {info.models.find((m) => m.id === s.local.model)?.replaced && (
-          <div className="row">
-            <div className="note">
-              Your model is an older one that always works through 30 seconds. The tuned models above stop where your speech stops - as accurate and several times faster.
-            </div>
-          </div>
-        )}
+      </Section>}
+      <Section title="Local engine">
+        {!selected && s.local.model.startsWith("import-") && <Row label="Selected import is unavailable" hint="Its files or registry entry are missing. Import the source again or choose another model above; Amber will not silently use a different speech model." />}
+        <Row label={`Selected: ${selected?.label ?? s.local.model}`} hint={onnx ? "Runs on the CPU using ONNX Runtime. The Whisper runtime choice does not apply." : selected?.note} />
         {s.local.runtime === "cpu" && info.models.find((m) => m.id === s.local.model)?.wantsGpu && (
           <div className="row">
             <div className="note">This model is slow on a CPU - expect several seconds per sentence.</div>
           </div>
         )}
-      </Section>
-      <Section title="Local engine">
         <Row label={<StatusLabel status={st} />} hint={st.message ?? undefined}>
-          {st.state !== "ready" && (
-            <button className="btn" disabled={st.state === "starting"} onClick={() => invoke("start_local").catch((e) => toast(String(e)))}>
-              Load now
-            </button>
-          )}
+          <SpeechModelActions status={st} busy={["recording", "transcribing", "inserting"].includes(phase)} toast={toast} />
         </Row>
+        <Row label="Memory and downloads" hint="Load now puts the model in memory. Unload model releases it without deleting downloaded files. The next dictation loads it while you speak; tests load on demand. Otherwise it stays loaded until you unload, switch models or engines, or quit Amber. Delete removes the download from disk." />
         <Row label="Load when Amber starts" hint="The first dictation then does not wait for the model to load. Uses memory while Amber runs.">
           <Switch on={s.local.keepLoaded} onChange={(v) => save((x) => (x.local.keepLoaded = v))} />
         </Row>
@@ -166,7 +188,7 @@ function LocalEngine({ s, save, toast, ov }: PageProps) {
         >
           <Switch on={s.local.chunking} onChange={(v) => save((x) => (x.local.chunking = v))} />
         </Row>
-        <Row label="CPU threads" hint="Automatic uses half of your processor's threads.">
+        {!onnx && <Row label="CPU threads" hint="Automatic uses half of your processor's threads.">
           <select value={s.local.threads} onChange={(e) => save((x) => (x.local.threads = Number(e.target.value)))}>
             <option value={0}>Automatic</option>
             {[2, 4, 6, 8, 10, 12, 16].map((n) => (
@@ -175,50 +197,63 @@ function LocalEngine({ s, save, toast, ov }: PageProps) {
               </option>
             ))}
           </select>
-        </Row>
+        </Row>}
       </Section>
     </>
   );
 }
 
-function ServerEngine({ s, save, ov, go }: PageProps) {
-  const provider = ov.providers.find((p) => p.id === s.server.provider) ?? ov.providers[0];
+function ServerEngine(p: PageProps) {
+  const { s, save, ov, go } = p;
+  const providers = ov.providers.filter((p) => p.supportsSpeech);
+  const connection = s.connections.find((c) => c.id === s.server.connectionId);
+  const provider = providers.find((p) => p.id === (s.server.connectionId ? connection?.provider : s.server.provider));
   const [baseUrl, setBaseUrl] = useState(s.server.baseUrl);
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
+  const testGeneration = useRef(0);
   const [testing, setTesting] = useState(false);
   useEffect(() => setBaseUrl(s.server.baseUrl), [s.server.baseUrl]);
-  useEffect(() => setTest(null), [provider.id, baseUrl]);
+  useEffect(() => {
+    testGeneration.current++; setTest(null); setTesting(false);
+    return () => { testGeneration.current++; };
+  }, [provider?.id, baseUrl, connection]);
+
+  if (!provider) return <Section title="Server"><ConnectionChoice {...p} purpose="speech" /><Row label="Connection unavailable" hint="Select a saved speech connection or Provider default. Amber will not silently use a different provider." /></Section>;
 
   const custom = provider.id === "custom";
 
   const runTest = async () => {
+    const mine = ++testGeneration.current;
     setTesting(true);
     setTest(null);
     try {
-      const ms = await invoke<number>("test_server", { provider: provider.id, baseUrl, key: null });
-      setTest({ ok: true, text: `Model catalog reachable - ${ms} ms. This does not verify inference or keys for public catalogs.` });
+      const ms = connection ? await invoke<number>("test_connection", { connection, key: null })
+        : await invoke<number>("test_server", { provider: provider.id, baseUrl, key: null });
+      if (mine === testGeneration.current) setTest({ ok: true, text: `Model catalog reachable - ${ms} ms. This does not verify inference or keys for public catalogs.` });
     } catch (e) {
-      setTest({ ok: false, text: String(e) });
+      if (mine === testGeneration.current) setTest({ ok: false, text: String(e) });
     }
-    setTesting(false);
+    if (mine === testGeneration.current) setTesting(false);
   };
 
   return (
     <Section title="Server">
-      <Row label="Provider">
-        <Segmented
-          value={provider.id}
-          options={ov.providers.map((p) => [p.id, p.name] as [string, string])}
-          onChange={(id) => {
+      <ConnectionChoice {...p} purpose="speech" />
+      {connection ? <Row label={provider.name} hint={`${connection.name}: ${connection.baseUrl}`} /> : <Row label="Provider">
+        <select aria-label="Speech provider" value={provider.id} onChange={(e) => {
+          const id = e.target.value;
             void save((x) => {
               x.server.provider = id;
-              x.server.model = ov.providers.find((p) => p.id === id)?.models[0]?.id ?? x.server.model;
+              x.server.model = providers.find((p) => p.id === id)?.models[0]?.id ?? x.server.model;
             });
-          }}
-        />
-      </Row>
+          }}>
+          {providers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      </Row>}
       {provider.id === "tinfoil" && <Row label="Tinfoil connection" hint="Uses https://inference.tinfoil.sh/v1 for audio. HTTPS only: unlike Amber for Android, this desktop client does not verify Tinfoil's enclave attestation. The same saved key is available for cleanup." />}
-      {custom && (
+      {provider.id === "elevenlabs" && <Row label="ElevenLabs options" hint="Transcription only, without speaker labels. Vocabulary keyterms are not sent because ElevenLabs charges extra for them. Provider retention and billing policies still apply." />}
+      {provider.id === "deepgram" && <Row label="Deepgram options" hint="Vocabulary keyterms are not sent because Deepgram charges extra for them on recorded audio. Automatic detection is used when more than one language is selected. Provider retention and billing policies still apply." />}
+      {custom && !connection && (
         <Row label="Address" hint="An OpenAI-compatible HTTPS base URL. Plain HTTP is allowed only on a literal loopback address, such as http://127.0.0.1:8000/v1.">
           <input
             type="text"
@@ -230,32 +265,33 @@ function ServerEngine({ s, save, ov, go }: PageProps) {
           />
         </Row>
       )}
-      <Row label="Model" hint={provider.models.find((m) => m.id === s.server.model)?.note}>
+      {connection ? <ConnectionModelPicker key={`${connection.id}:${connection.provider}:${connection.baseUrl}`} connection={connection} purpose="speech" model={s.server.model}
+        presets={provider.models} disabled={p.settingsSaving} onSelect={(id) => void save((x) => { x.server.model = id; })} /> : <Row label="Model" hint={provider.models.find((m) => m.id === s.server.model)?.note}>
         {provider.models.length > 0 ? (
-          <select value={s.server.model} onChange={(e) => save((x) => (x.server.model = e.target.value))}>
-            {provider.models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
+          <select aria-label="Speech model" value={s.server.model} onChange={(e) => save((x) => (x.server.model = e.target.value))}>
+            {provider.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
           </select>
         ) : (
           <input
             type="text"
+            aria-label="Speech model ID"
+            key={`${provider.id}:${s.server.model}`}
             defaultValue={s.server.model}
             placeholder="whisper-1"
-            onBlur={(e) => e.target.value !== s.server.model && save((x) => (x.server.model = e.target.value.trim()))}
+            onBlur={(e) => e.target.value.trim() && e.target.value.trim() !== s.server.model && save((x) => (x.server.model = e.target.value.trim()))}
           />
         )}
-      </Row>
-      <CredentialLink provider={provider} go={go} />
+      </Row>}
+      {!connection && <CredentialLink provider={provider} go={go} />}
       <Row label="Audio upload" hint="WAV is lossless. Ogg Opus uses lossy voice compression at about 32 kbps: smaller uploads, but recognition may change. Only server recognition is compressed; local recognition, fallback and retained test recordings keep the original WAV. No automatic retry with another format.">
         <select aria-label="Audio upload" value={s.server.uploadFormat} onChange={(e) => save((x) => (x.server.uploadFormat = e.target.value as "wav" | "opus"))}>
           <option value="wav">WAV (lossless, default)</option>
           <option value="opus">Ogg Opus (lossy, ~32 kbps)</option>
         </select>
       </Row>
-      {s.server.uploadFormat === "opus" && <Row label="Format compatibility" hint={custom
+      {s.server.uploadFormat === "opus" && <Row label="Format compatibility" hint={["deepgram", "elevenlabs", "mistral"].includes(provider.id)
+        ? "This connector currently sends lossless WAV. The test details report the actual upload and the reason Opus was not used. Amber never retries a rejected paid request with another format."
+        : custom
         ? "Amber servers must advertise Opus; otherwise their supported WAV format is used. Older Amber catalogs without an audio list imply WAV. Other OpenAI-compatible servers receive the requested Ogg Opus format without a guarantee of support. If rejected, select WAV yourself; Amber will not retry a paid request."
         : provider.id === "tinfoil"
           ? s.server.model === "voxtral-small-24b"

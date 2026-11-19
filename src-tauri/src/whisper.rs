@@ -3,12 +3,13 @@
 //! for how it is tied to the app.
 
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::process::{self, Output};
 
 use amber_core::local::{self, Layout};
+use amber_core::imports::{self, SpeechModel};
 use amber_core::engine::{CancellationToken, ErrorKind, SttError, TranscribeOptions, Transcriber, WhisperServerTranscriber};
 use serde::Serialize;
 
@@ -40,26 +41,33 @@ struct Running {
     /// it load a file of their choosing. The random path prefix keeps them out.
     base: String,
     key: Key,
+    model: SpeechModel,
 }
 
 impl Running {
-    fn served(&self) -> Served {
-        Served { url: self.base.clone(), runtime: self.key.runtime.clone(), model: self.key.model.clone(), snapshot_transcriber: None }
+    fn served(&self, running: Arc<Mutex<Option<Running>>>, changes: Arc<Mutex<()>>) -> Served {
+        let slack = self.model.short_context.then_some(self.model.context_slack);
+        let transcriber = Box::new(SnapshotEngine {
+            running, changes, base: self.base.clone(), transcriber: WhisperServerTranscriber::new(&self.base, slack),
+            model: self.model.clone(),
+        });
+        Served { transcriber, runtime: self.key.runtime.clone(), model: self.key.model.clone() }
     }
 }
 
 /// The server a request goes to, and what it runs - which may still be the previous model
 /// while the chosen one downloads, so the request has to fit the running one.
 pub struct Served {
-    pub url: String,
+    pub transcriber: Box<dyn Transcriber>,
     pub runtime: String,
     pub model: String,
-    pub snapshot_transcriber: Option<Box<dyn Transcriber>>,
 }
 
 #[derive(Default)]
 pub struct Whisper {
     running: Arc<Mutex<Option<Running>>>,
+    onnx: OnceLock<Arc<amber_onnx::Speech>>,
+    changes: Arc<Mutex<()>>,
     /// The last lines the server printed - the reason when it dies.
     output: Output,
     status: Mutex<Option<Status>>,
@@ -71,12 +79,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 impl Whisper {
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone().unwrap_or(Status::of("stopped", None))
-    }
-
-    fn status_if(&self, own: bool, app: &tauri::AppHandle, status: Status) {
-        if own {
-            self.set_status(app, status);
-        }
     }
 
     fn set_status(&self, app: &tauri::AppHandle, status: Status) {
@@ -102,33 +104,46 @@ impl Whisper {
     }
 
     pub fn ensure_snapshot(&self, app: &tauri::AppHandle, settings: &amber_core::settings::LocalSettings) -> Result<Served, String> {
-        let mut served = self.ensure_with(app, Some(&settings.model), Some(settings))?;
-        // Both the client's context and its identity come from the model actually served,
-        // including the old installed model retained while the requested one downloads.
-        let slack = local::model(&served.model).filter(|m| m.short_context).map(|m| m.context_slack);
-        served.snapshot_transcriber = Some(Box::new(SnapshotEngine {
-            running: self.running.clone(),
-            base: served.url.clone(),
-            transcriber: WhisperServerTranscriber::new(&served.url, slack),
-        }));
-        Ok(served)
+        self.ensure_with(app, Some(&settings.model), Some(settings))
     }
 
     fn ensure_with(&self, app: &tauri::AppHandle, model: Option<&str>, snapshot: Option<&amber_core::settings::LocalSettings>) -> Result<Served, String> {
+        // Tests and phone requests also change the resident model shown by load/unload UI.
+        let _change = self.changes.lock().unwrap();
+        crate::imports::report_load_failure(self.ensure_locked(app, model, snapshot), |message| {
+            self.set_status(app, Status::of("failed", Some(message.into())));
+        })
+    }
+
+    fn ensure_locked(&self, app: &tauri::AppHandle, model: Option<&str>, snapshot: Option<&amber_core::settings::LocalSettings>) -> Result<Served, String> {
         use tauri::Manager;
-        // The Engine page shows the PC's own model; a phone's switch is not its news.
-        let own = model.is_none();
         let mut running = self.running.lock().unwrap();
         let core = app.state::<crate::state::Core>();
         let layout = &core.paths.layout;
         let settings = snapshot.cloned().unwrap_or_else(|| core.settings().local);
         let key = Key { runtime: settings.runtime.clone(), model: model.unwrap_or(&settings.model).to_string(), threads: settings.threads };
+        let model = imports::resolve(layout, &key.model).map_err(|e| e.to_string())?;
+
+        if model.is_onnx() {
+            if !imports::installed(layout, &model) {
+                let message = format!("The model {} is missing or incomplete. Download or import it in the settings.", model.label);
+                return Err(message);
+            }
+            if let Some(mut r) = running.take() { process::stop(&mut r.child); }
+            let speech = self.onnx.get_or_init(|| Arc::new(amber_onnx::Speech::new(layout.clone())));
+            if !speech.is_ready(&model.id) {
+                self.set_status(app, Status::of("starting", Some(format!("Loading {}...", model.label))));
+            }
+            speech.load(&model.id, &CancellationToken::default()).map_err(|error| error.message)?;
+            let transcriber = Box::new(OnnxEngine { transcriber: speech.engine(&model.id)?, changes: self.changes.clone() });
+            self.set_status(app, Status::of("ready", Some(format!("{} on CPU (ONNX)", model.label))));
+            return Ok(Served { transcriber, runtime: "onnx-cpu".into(), model: model.id.into() });
+        }
 
         let rt = local::runtime(&key.runtime).ok_or("Unknown runtime.")?;
-        let model = local::model(&key.model).ok_or("Unknown model.")?;
         let missing = if !layout.runtime_installed(rt) {
             Some(format!("The local engine ({}) is not installed yet - download it in the settings.", rt.label))
-        } else if !layout.model_installed(model) {
+        } else if !imports::installed(layout, &model) {
             Some(format!("The model {} is not downloaded yet - get it in the settings.", model.label))
         } else {
             None
@@ -136,9 +151,9 @@ impl Whisper {
 
         if let Some(r) = running.as_mut() {
             let alive = matches!(r.child.try_wait(), Ok(None));
-            if alive && (r.key == key || missing.is_some()) {
+            if alive && (r.key == key && !(model.imported && missing.is_some()) || missing.is_some() && !model.imported) {
                 // The configured one, or the previous one while the new one is not there yet.
-                return Ok(r.served());
+                return Ok(r.served(self.running.clone(), self.changes.clone()));
             }
             if !alive {
                 crate::diag::warn(format!("local engine had exited: {}", self.last_output()));
@@ -147,28 +162,29 @@ impl Whisper {
             *running = None;
         }
         if let Some(msg) = missing {
-            self.status_if(own, app, Status::of("failed", Some(msg.clone())));
             return Err(msg);
         }
+        if let Some(speech) = self.onnx.get() { speech.unload(); }
+        if model.imported { imports::verify(layout, &model).map_err(|e| e.to_string())?; }
 
-        self.status_if(own, app, Status::of("starting", Some(format!("Loading {}…", model.label))));
+        self.set_status(app, Status::of("starting", Some(format!("Loading {}...", model.label))));
         // A cleanup model on the graphics card may have taken what is free there; the speech
         // model comes first - without it dictation itself breaks - and the other one reloads
         // after it, fitting itself into what is left.
         let moved = rt.id != "cpu" && core.llm.make_room_on_gpu(app);
         let started = Instant::now();
-        let spawned = self.spawn(layout, rt, model, &key);
+        let spawned = self.spawn(layout, rt, &model, &key);
         if moved {
             core.llm.warm(app, true);
         }
         match spawned {
             Ok(r) => {
-                let served = r.served();
+                let served = r.served(self.running.clone(), self.changes.clone());
                 if model.short_context {
                     // Leaves the server at a short context for its first language detection
                     // (whisper.cpp detects with the previous request's context), and warms the
                     // GPU up.
-                    amber_core::engine::WhisperServerTranscriber::new(&served.url, Some(model.context_slack)).reset_context();
+                    amber_core::engine::WhisperServerTranscriber::new(&r.base, Some(model.context_slack)).reset_context();
                 }
                 crate::diag::info(format!("local engine ready: {} on {} in {} ms", model.label, rt.label, started.elapsed().as_millis()));
                 *running = Some(r);
@@ -183,25 +199,24 @@ impl Whisper {
                     }
                     format!("{} on {}", model.label, rt.label)
                 };
-                self.status_if(own, app, Status::of("ready", Some(message)));
+                self.set_status(app, Status::of("ready", Some(message)));
                 Ok(served)
             }
             Err(e) => {
                 crate::diag::error(format!("local engine failed to start: {e}"));
-                self.status_if(own, app, Status::of("failed", Some(e.clone())));
                 Err(e)
             }
         }
     }
 
-    fn spawn(&self, layout: &Layout, rt: &local::Runtime, model: &local::Model, key: &Key) -> Result<Running, String> {
+    fn spawn(&self, layout: &Layout, rt: &local::Runtime, model: &SpeechModel, key: &Key) -> Result<Running, String> {
         let port = process::free_port().map_err(|e| format!("No free port: {e}"))?;
         let threads = if key.threads == 0 { process::default_threads() } else { key.threads };
         let mut cmd = Command::new(layout.server_exe(rt));
         // whisper-server reads its arguments in the system code page; a user folder with other
         // characters would arrive mangled. So it runs in the models folder and gets only the
         // file name - its DLLs still load from the exe's own folder.
-        let model_path = layout.model_path(model);
+        let model_path = &model.path;
         let path = format!("/{}", amber_core::api::new_key());
         cmd.current_dir(model_path.parent().unwrap_or(&layout.root)).args(server_args(model, port, threads, &path));
         let child = process::spawn(cmd, &self.output).map_err(|e| format!("The local engine could not be started: {e}"))?;
@@ -210,7 +225,7 @@ impl Whisper {
         // answers 503 until then.
         let base = format!("http://127.0.0.1:{port}{path}");
         let deadline = Instant::now() + START_TIMEOUT;
-        let mut running = Running { child, base: base.clone(), key: key.clone() };
+        let mut running = Running { child, base: base.clone(), key: key.clone(), model: model.clone() };
         loop {
             if let Ok(Some(status)) = running.child.try_wait() {
                 return Err(format!("The local engine stopped while loading ({status}). {}", self.explain()));
@@ -261,33 +276,61 @@ impl Whisper {
     }
 
     pub fn stop(&self, app: &tauri::AppHandle) {
+        let _change = self.changes.lock().unwrap();
         if let Some(mut r) = self.running.lock().unwrap().take() {
             process::stop(&mut r.child);
             crate::diag::info("local engine stopped");
         }
+        if let Some(speech) = self.onnx.get() { speech.unload(); }
         self.set_status(app, Status::of("stopped", None));
     }
 
     /// The model the server runs right now, without waiting on a load in progress.
     pub fn running_model(&self) -> Option<String> {
+        let _change = self.changes.try_lock().ok()?;
         self.running.try_lock().ok()?.as_ref().map(|r| r.key.model.clone())
+            .or_else(|| self.onnx.get().and_then(|speech| speech.running_model()))
     }
 
     /// Stops the server only if it runs from [runtime] - before that runtime's files are
     /// replaced or deleted.
     pub fn stop_runtime(&self, app: &tauri::AppHandle, runtime: &str) {
-        let uses = self.running.lock().unwrap().as_ref().is_some_and(|r| r.key.runtime == runtime);
-        if uses {
-            self.stop(app);
+        let _change = self.changes.lock().unwrap();
+        let mut running = self.running.lock().unwrap();
+        if running.as_ref().is_some_and(|r| r.key.runtime == runtime) {
+            if let Some(mut r) = running.take() { process::stop(&mut r.child); }
+            self.set_status(app, Status::of("stopped", None));
+        }
+        if runtime == "onnx-cpu" {
+            if let Some(speech) = self.onnx.get() { speech.unload(); }
+            self.set_status(app, Status::of("stopped", None));
         }
     }
 
     /// Stops the server only if it has [model] loaded - before the file is deleted.
     pub fn stop_model(&self, app: &tauri::AppHandle, model: &str) {
-        let uses = self.running.lock().unwrap().as_ref().is_some_and(|r| r.key.model == model);
-        if uses {
-            self.stop(app);
+        let _change = self.changes.lock().unwrap();
+        let mut running = self.running.lock().unwrap();
+        if running.as_ref().is_some_and(|r| r.key.model == model) {
+            if let Some(mut r) = running.take() { process::stop(&mut r.child); }
+            self.set_status(app, Status::of("stopped", None));
         }
+        if self.onnx.get().is_some_and(|speech| speech.unload_model(model)) {
+            self.set_status(app, Status::of("stopped", None));
+        }
+    }
+
+    pub fn remove_imported(&self, app: &tauri::AppHandle, removal: imports::Removal<'_>) -> Result<(), String> {
+        let _change = self.changes.lock().unwrap();
+        let id = removal.id();
+        let mut running = self.running.lock().unwrap();
+        let mut stopped = false;
+        if running.as_ref().is_some_and(|r| r.key.model == id) {
+            if let Some(mut r) = running.take() { process::stop(&mut r.child); stopped = true; }
+        }
+        if self.onnx.get().is_some_and(|s| s.unload_model(id)) { stopped = true; }
+        if stopped { self.set_status(app, Status::of("stopped", None)); }
+        removal.remove().map_err(|e| e.to_string())
     }
 
     /// The server died and the next dictation will restart it - or it is running fine.
@@ -295,6 +338,8 @@ impl Whisper {
     /// simply "not ready".
     /// Whether a server with [model] runs - not one the phone switched to.
     pub fn is_ready(&self, model: &str) -> bool {
+        let Ok(_change) = self.changes.try_lock() else { return false };
+        if self.onnx.get().is_some_and(|speech| speech.is_ready(model)) { return true; }
         match self.running.try_lock() {
             Ok(mut running) => running.as_mut().map(|r| r.key.model == model && matches!(r.child.try_wait(), Ok(None))).unwrap_or(false),
             Err(_) => false,
@@ -304,8 +349,10 @@ impl Whisper {
 
 struct SnapshotEngine {
     running: Arc<Mutex<Option<Running>>>,
+    changes: Arc<Mutex<()>>,
     base: String,
     transcriber: WhisperServerTranscriber,
+    model: SpeechModel,
 }
 
 impl Transcriber for SnapshotEngine {
@@ -314,9 +361,42 @@ impl Transcriber for SnapshotEngine {
     }
 
     fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        self.transcribe_detecting_cancellable(wav, options, cancel).map(|(text, _)| text)
+    }
+
+    fn transcribe_detecting(&self, wav: &[u8], options: &TranscribeOptions) -> Result<(String, Option<String>), SttError> {
+        self.transcribe_detecting_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        cancel.check()?;
+        let _change = self.changes.lock().unwrap();
         with_snapshot(&self.running, &self.base, |r| &r.base, cancel, || {
-            self.transcriber.transcribe_cancellable(wav, options, cancel)
+            if self.model.imported { self.model.validate_request(options, 0)?; }
+            self.transcriber.transcribe_detecting_cancellable(wav, options, cancel)
         })
+    }
+}
+
+struct OnnxEngine {
+    transcriber: Box<dyn Transcriber>,
+    changes: Arc<Mutex<()>>,
+}
+
+impl Transcriber for OnnxEngine {
+    fn transcribe(&self, wav: &[u8], options: &TranscribeOptions) -> Result<String, SttError> {
+        self.transcribe_cancellable(wav, options, &CancellationToken::default())
+    }
+
+    fn transcribe_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<String, SttError> {
+        cancel.check()?;
+        let _change = self.changes.lock().unwrap();
+        cancel.check()?;
+        self.transcriber.transcribe_cancellable(wav, options, cancel)
+    }
+
+    fn transcribe_detecting_cancellable(&self, wav: &[u8], options: &TranscribeOptions, cancel: &CancellationToken) -> Result<(String, Option<String>), SttError> {
+        self.transcribe_cancellable(wav, options, cancel).map(|text| (text, None))
     }
 }
 
@@ -328,7 +408,7 @@ fn with_snapshot<T, R>(running: &Mutex<Option<T>>, base: &str, identity: impl Fn
     let running = running.lock().unwrap();
     cancel.check()?;
     if !running.as_ref().is_some_and(|r| identity(r) == base) {
-        return Err(SttError::new(ErrorKind::Unreachable, "The local model changed before recognition started. Try the test again.", "snapshot helper replaced"));
+        return Err(SttError::new(ErrorKind::Unreachable, "The local model was unloaded or changed before recognition started. Try again.", "snapshot helper replaced"));
     }
     let result = infer();
     cancel.check()?;
@@ -337,11 +417,11 @@ fn with_snapshot<T, R>(running: &Mutex<Option<T>>, base: &str, identity: impl Fn
 
 /// whisper-server's arguments. It runs in the models folder, so the model is its file name;
 /// a tuned (short-context) model runs without flash attention ([local::flash_attention]).
-fn server_args(model: &local::Model, port: u16, threads: u32, path: &str) -> Vec<String> {
-    let mut args = vec!["--model".to_string(), model.file.to_string()];
+fn server_args(model: &SpeechModel, port: u16, threads: u32, path: &str) -> Vec<String> {
+    let mut args = vec!["--model".to_string(), model.path.file_name().expect("managed model filename").to_string_lossy().into_owned()];
     args.extend(["--host", "127.0.0.1", "--port", &port.to_string(), "--threads", &threads.to_string()].map(String::from));
     args.extend(["--request-path".to_string(), path.to_string()]);
-    if !local::flash_attention(model) {
+    if model.short_context {
         args.push("--no-flash-attn".into());
     }
     args
@@ -354,11 +434,11 @@ mod tests {
     #[test]
     fn a_tuned_model_starts_without_flash_attention() {
         let tuned = local::model("acft-large-v3-turbo-q8_0").unwrap();
-        let args = server_args(tuned, 5000, 8, "/k");
+        let args = server_args(&SpeechModel::whisper(std::path::Path::new("."), tuned), 5000, 8, "/k");
         assert!(args.contains(&"--no-flash-attn".to_string()), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["--model", tuned.file]) && args.windows(2).any(|w| w == ["--port", "5000"]));
         let stock = local::model("large-v3-turbo-q5_0").unwrap();
-        assert!(!server_args(stock, 5000, 8, "/k").contains(&"--no-flash-attn".to_string()), "the full window keeps it");
+        assert!(!server_args(&SpeechModel::whisper(std::path::Path::new("."), stock), 5000, 8, "/k").contains(&"--no-flash-attn".to_string()), "the full window keeps it");
     }
 
     #[test]
@@ -409,8 +489,10 @@ mod tests {
         let base = "http://127.0.0.1:9/test-helper";
         let engine = SnapshotEngine {
             running: Arc::new(Mutex::new(None)),
+            changes: Arc::new(Mutex::new(())),
             base: base.into(),
             transcriber: WhisperServerTranscriber::new(base, None),
+            model: SpeechModel::whisper(std::path::Path::new("."), &local::MODELS[0]),
         };
         let options = TranscribeOptions::new("en", "");
         let cancel = CancellationToken::default();

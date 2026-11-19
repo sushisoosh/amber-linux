@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/inference", "src-tauri", "server"]
+members = ["crates/core", "crates/inference", "crates/onnx", "src-tauri", "server"]
 resolver = "2"
 
 [workspace.package]

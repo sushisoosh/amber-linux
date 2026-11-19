@@ -260,19 +260,24 @@ pub fn info(core: &Core) -> Info {
 /// app (when they can run), the PC's own as the default.
 fn models(core: &Core) -> Vec<api::ModelInfo> {
     use amber_core::local;
-    use amber_core::providers;
     let s = core.settings();
     let layout = &core.paths.layout;
     let rt = local::runtime(&s.local.runtime).filter(|rt| layout.runtime_installed(rt));
     let llm_rt = local::llm_runtime(&s.cleanup.local_runtime).filter(|rt| layout.llm_runtime_installed(rt));
-    let ready = |provider: &str| providers::by_id(provider).is_some_and(|p| !p.needs_key || core.has_key(p.id));
     let installed = amber_core::offer::Installed {
-        speech: if rt.is_some() { local::MODELS.iter().filter(|m| layout.model_installed(m)).map(|m| m.id.to_string()).collect() } else { Vec::new() },
+        speech: local::MODELS.iter().filter(|m| rt.is_some() && layout.model_installed(m)).map(|m| m.id.to_string())
+            .chain(amber_core::onnx::MODELS.iter().filter(|m| amber_core::onnx::runtime_installed(layout) && amber_core::onnx::installed(layout, m)).map(|m| m.id.to_string())).collect(),
+        imported_speech: amber_core::imports::list(layout).unwrap_or_default().iter().filter_map(|m| {
+            let model = amber_core::imports::resolve(layout, &m.id).ok()?;
+            if !amber_core::imports::installed(layout, &model) || (if model.is_onnx() { !amber_core::onnx::runtime_installed(layout) } else { rt.is_none() }) { return None; }
+            Some(api::ModelInfo { id: m.id.clone(), label: m.name.clone(), kind: api::ModelKind::Speech,
+                note: format!("Imported {} on this PC; languages: {}", m.variant.family(), if m.languages.is_empty() { "multilingual".into() } else { m.languages.join(", ") }), default: false })
+        }).collect(),
         speech_runtime: rt.map_or("this PC", |r| r.label).to_string(),
         llms: if llm_rt.is_some() { local::LLM_MODELS.iter().filter(|m| layout.llm_model_installed(m)).map(|m| m.id.to_string()).collect() } else { Vec::new() },
         llm_runtime: llm_rt.map_or("this PC", |r| r.label).to_string(),
-        cloud_speech: ready(&s.server.provider),
-        cloud_cleanup: ready(&s.cleanup.provider),
+        cloud_speech: amber_core::connections::resolve_speech(&s).is_ok_and(|target| crate::connections::key_for(core, &target).is_ok()),
+        cloud_cleanup: amber_core::connections::resolve_cleanup(&s).is_ok_and(|target| crate::connections::key_for(core, &target).is_ok()),
     };
     amber_core::offer::pc_models(&s, &installed)
 }

@@ -1,0 +1,19 @@
+[package]
+name = "amber-onnx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Lazy in-process Parakeet and Moonshine inference for Amber"
+license-file = "../../LICENSE"
+
+[dependencies]
+amber-core = { path = "../core" }
+transcribe-rs = { version = "=0.3.12", default-features = false, features = ["onnx"] }
+# load-dynamic skips ORT's build-time binary download and static linking, including when
+# transcribe-rs enables ORT defaults. A trusted ONNX Runtime 1.24 library is required only
+# when loading an ONNX model. core::onnx installs Microsoft's checksum-pinned runtime
+# on the user's first ONNX model download, never on app launch or during compilation.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
+
+[dev-dependencies]
+tempfile = "3"

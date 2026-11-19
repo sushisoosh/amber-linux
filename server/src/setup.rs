@@ -239,8 +239,9 @@ mod tests {
     fn a_wrong_answer_is_asked_again() {
         let (_d, p) = path();
         let mut out = Vec::new();
-        // 0 and 9 are no speech model, "x" no number, "xx" no language.
-        let c = ask_with(&p, OFFICE_PC, &Stub::default(), &mut "0\n9\nx\n1\n\nxx\nen\n\n".as_bytes(), &mut out).unwrap();
+        // Neither zero nor an index beyond the catalog names a model; "xx" is no language.
+        let answers = format!("0\n{}\nx\n1\n\nxx\nen\n\n", local::MODELS.len() + 1);
+        let c = ask_with(&p, OFFICE_PC, &Stub::default(), &mut answers.as_bytes(), &mut out).unwrap();
         assert_eq!((c.speech.as_str(), c.language.as_str()), ("futo-multilingual-74", "en"));
         assert!(String::from_utf8(out).unwrap().contains("a number from the list"));
     }

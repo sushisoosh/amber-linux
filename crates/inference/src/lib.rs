@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Once};
 
 use amber_core::engine::{CancellationToken, ErrorKind, SttError, TranscribeOptions, Transcriber};
 use amber_core::local::{self, Model};
+use amber_core::imports::{self, SpeechModel};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 pub struct Speech {
@@ -43,6 +44,11 @@ impl Speech {
         if !model_ready(&self.dir, model) {
             return Err(format!("The speech model {id} is not downloaded."));
         }
+        self.engine_model(SpeechModel::whisper(&self.dir, model))
+    }
+
+    pub fn engine_model(self: &Arc<Self>, model: SpeechModel) -> Result<Box<dyn Transcriber>, String> {
+        if model.is_onnx() { return Err("Not a Whisper model.".into()); }
         Ok(Box::new(Engine { speech: self.clone(), model }))
     }
 
@@ -56,20 +62,31 @@ impl Speech {
     pub fn load(&self, id: &str, cancel: &CancellationToken) -> Result<(), SttError> {
         cancel.check()?;
         let model = local::model(id).ok_or_else(|| failure("Unknown speech model.", id))?;
+        self.load_model(&SpeechModel::whisper(&self.dir, model), cancel)
+    }
+
+    pub fn load_model(&self, model: &SpeechModel, cancel: &CancellationToken) -> Result<(), SttError> {
+        cancel.check()?;
+        if model.is_onnx() { return Err(failure("Not a Whisper model.", &model.id)); }
         let threads = params(&TranscribeOptions::default(), 0, model, self.threads.load(Ordering::Relaxed)).threads;
         let mut loaded = self.loaded.lock().map_err(|_| failure("Restart Amber to recover the speech engine.", "model lock poisoned"))?;
         self.load_locked(&mut loaded, model, threads, cancel)?;
         Ok(())
     }
 
-    fn load_locked(&self, loaded: &mut Option<Loaded>, model: &Model, threads: i32, cancel: &CancellationToken) -> Result<(), SttError> {
+    fn load_locked(&self, loaded: &mut Option<Loaded>, model: &SpeechModel, threads: i32, cancel: &CancellationToken) -> Result<(), SttError> {
         cancel.check()?;
         if loaded.as_ref().is_none_or(|l| l.id != model.id) {
+            if model.imported {
+                let layout = local::Layout { root: self.dir.parent().unwrap_or(&self.dir).to_path_buf() };
+                imports::verify(&layout, model).map_err(|e| failure("The imported speech model is missing or damaged.", e.to_string()))?;
+                cancel.check()?;
+            }
             *loaded = None;
             let mut cp = WhisperContextParameters::default();
             cp.use_gpu(self.gpu);
-            cp.flash_attn(self.gpu && local::flash_attention(model));
-            let ctx = WhisperContext::new_with_params(self.dir.join(model.file), cp);
+            cp.flash_attn(self.gpu && !model.short_context);
+            let ctx = WhisperContext::new_with_params(&model.path, cp);
             cancel.check()?;
             let ctx = ctx.map_err(|e| failure("The speech model could not be loaded.", e.to_string()))?;
             let mut state = ctx.create_state().map_err(|e| failure("The speech model could not start.", e.to_string()))?;
@@ -119,7 +136,7 @@ pub fn model_ready(dir: &Path, model: &Model) -> bool {
 
 struct Engine {
     speech: Arc<Speech>,
-    model: &'static Model,
+    model: SpeechModel,
 }
 
 impl Transcriber for Engine {
@@ -152,10 +169,11 @@ impl Transcriber for Engine {
         }
         let samples = amber_core::audio::resample(&samples, rate, amber_core::audio::TARGET_RATE);
         cancel.check()?;
-        let plan = params(options, samples.len(), self.model, self.speech.threads.load(Ordering::Relaxed));
+        if self.model.imported { self.model.validate_request(options, samples.len())?; }
+        let plan = params(options, samples.len(), &self.model, self.speech.threads.load(Ordering::Relaxed));
 
         let mut loaded = self.speech.loaded.lock().map_err(|_| failure("Restart Amber to recover the speech engine.", "model lock poisoned"))?;
-        self.speech.load_locked(&mut loaded, self.model, plan.threads, cancel)?;
+        self.speech.load_locked(&mut loaded, &self.model, plan.threads, cancel)?;
         let state = &mut loaded.as_mut().expect("loaded above").state;
 
         let run = |state: &mut WhisperState, language: Option<&str>| -> Result<String, SttError> {
@@ -292,7 +310,7 @@ struct ParamsPlan {
 /// tokenizer slows down with the square of the length.
 const PROMPT_CHARS: usize = 800;
 
-fn params(options: &TranscribeOptions, samples: usize, m: &Model, threads: u32) -> ParamsPlan {
+fn params(options: &TranscribeOptions, samples: usize, m: &SpeechModel, threads: u32) -> ParamsPlan {
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get() as u32);
     let threads = if threads == 0 { local::default_threads() } else { threads }.min(cores).max(1);
     let prompt = options.prompt.as_deref().map(|p| {
@@ -313,6 +331,8 @@ fn params(options: &TranscribeOptions, samples: usize, m: &Model, threads: u32) 
 
 /// [requested] if it is a downloaded model of the catalog, else [default].
 fn chosen(dir: &Path, requested: Option<&str>, default: &str) -> String {
+    // An explicit custom selection must fail closed, never run the default instead.
+    if let Some(id) = requested.filter(|id| id.starts_with("import-")) { return id.into(); }
     requested.and_then(local::model).filter(|m| model_ready(dir, m)).map_or_else(|| default.to_string(), |m| m.id.to_string())
 }
 
@@ -320,6 +340,10 @@ fn chosen(dir: &Path, requested: Option<&str>, default: &str) -> String {
 mod tests {
     use super::*;
     use amber_core::engine::TranscribeOptions;
+
+    fn params(options: &TranscribeOptions, samples: usize, m: &Model, threads: u32) -> ParamsPlan {
+        super::params(options, samples, &SpeechModel::whisper(Path::new("."), m), threads)
+    }
 
     #[test]
     fn params_follow_the_model_and_the_request() {
@@ -376,6 +400,9 @@ mod tests {
         let other = amber_core::local::model("futo-multilingual-244").unwrap();
         std::fs::write(dir.path().join(other.file), b"x").unwrap();
         assert_eq!(chosen(dir.path(), Some(other.id), default), other.id, "downloaded: taken");
+        let imported = "import-0123456789abcdef0123456789abcdef";
+        assert_eq!(chosen(dir.path(), Some(imported), default), imported, "imports never silently fall back");
+        assert!(Arc::new(Speech::new(dir.path().into(), 0, false)).engine(Some(imported), default).is_err());
     }
 
     #[test]
