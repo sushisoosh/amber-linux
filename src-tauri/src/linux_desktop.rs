@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use amber_core::gesture::{Gesture, Mode};
-use amber_core::settings::{HotkeySettings, Settings};
+use amber_core::settings::{HotkeySettings, InsertSettings, Settings};
 use ashpd::desktop::global_shortcuts::{Activated, Deactivated, GlobalShortcuts, NewShortcut, ShortcutsChanged};
 use ashpd::zbus::{self, zvariant::OwnedValue};
 use futures_util::StreamExt;
@@ -83,7 +83,7 @@ pub fn init(app: &AppHandle) {
         session: session.into(),
         shortcuts: "Not registered.".into(),
         insertion: if session == "x11" {
-            "Opted-in completion copies the result even if the original target is missing or changed. Ctrl+V and explicit XTest paste support single-line text in known native editors only, with unchanged window and focus. Other targets require manual paste; insertion cannot be confirmed."
+            "Opted-in completion copies the result and attempts Ctrl+V for single-line text. Delivery settings control whether any application is eligible and whether to use the focused window at delivery instead of the original target. The selected target must stay unchanged during paste; editable fields and insertion cannot be verified."
         } else {
             "Manual paste only. Copy on completion requires Amber to be focused on Wayland; otherwise open the result and use Copy. Target identity and permission-based RemoteDesktop/Clipboard insertion are not implemented; no automatic paste is attempted."
         }.into(),
@@ -664,24 +664,32 @@ fn to_clipboard_guarded(text: &str, allowed: impl Fn() -> bool + Send + 'static)
     }
 }
 
-fn completion_allowed(cancel: &amber_core::engine::CancellationToken) -> bool {
+fn completion_allowed(cancel: &amber_core::engine::CancellationToken, settings: &InsertSettings) -> bool {
     !cancel.is_cancelled()
         && !session_is_blocked()
-        && DESKTOP.get().is_none_or(|d| amber_core::insertion::paste_on_completion(&d.app.state::<Core>().settings().insert, true, false))
+        && DESKTOP.get().is_none_or(|d| {
+            let current = d.app.state::<Core>().settings();
+            amber_core::insertion::paste_on_completion(&current.insert, true, false)
+                && (!settings.paste_into_any_window || current.insert.paste_into_any_window)
+                && (!settings.paste_into_different_window || current.insert.paste_into_different_window)
+        })
 }
 
-pub fn deliver(text: &str, target: Option<X11Target>, cancel: &amber_core::engine::CancellationToken) -> Result<crate::insert::Outcome, String> {
-    let allowed = || completion_allowed(cancel);
+pub fn deliver(text: &str, settings: &InsertSettings, target: Option<X11Target>, cancel: &amber_core::engine::CancellationToken) -> Result<crate::insert::Outcome, String> {
+    let allowed = || completion_allowed(cancel, settings);
     if !allowed() {
         return Err("Delivery cancelled, consent revoked, or session blocked. The result is still available for review.".into());
     }
+    // Retarget once, before clipboard work. Focus changes during paste still fail closed.
+    let target = if settings.paste_into_different_window { remember_target() } else { target };
     // The bounded X11 owner can be verified immediately before XTest. Large selections use
     // GTK's incremental transfer, just like Copy, but are never injected automatically.
     let owner = if use_x11_shortcuts() && text.len() <= 64 * 1024 {
         Some(x11::own_clipboard_guarded(text, &allowed)?)
     } else {
         let cancel = cancel.clone();
-        to_clipboard_guarded(text, move || completion_allowed(&cancel))?;
+        let settings = settings.clone();
+        to_clipboard_guarded(text, move || completion_allowed(&cancel, &settings))?;
         None
     };
     let Some((target, owner)) = target.zip(owner) else {
@@ -689,7 +697,7 @@ pub fn deliver(text: &str, target: Option<X11Target>, cancel: &amber_core::engin
             "The text is on the clipboard. Automatic paste is unavailable for this result or target; paste manually where you want it.".into(),
         ));
     };
-    match x11::paste_copied(text, target, Some(owner), &allowed) {
+    match x11::paste_copied(text, target, settings.paste_into_any_window, Some(owner), &allowed) {
         Ok(_) => Ok(crate::insert::Outcome::Pasted),
         Err(error) => {
             // Never retry copying after an uncertain paste or overwrite a newer user copy.
@@ -809,10 +817,15 @@ mod x11 {
         String::from_utf8(class.to_vec()).map_err(|e| e.to_string())
     }
 
-    fn paste_program(conn: &RustConnection, target: X11Target, text: &str) -> Result<String, String> {
+    fn paste_program(conn: &RustConnection, target: X11Target, text: &str, any_window: bool) -> Result<Option<String>, String> {
+        if any_window {
+            return amber_core::insertion::allows_explicit_x11_paste("", text, true)
+                .then_some(None)
+                .ok_or_else(|| "X11 paste requires non-empty single-line text without control characters. Use Copy/manual paste.".into());
+        }
         let class = program(conn, target)?;
-        if !amber_core::insertion::allows_explicit_x11_paste(&class, text) {
-            return Err("This target or text requires review and manual paste. X11 paste only supports single-line text in known native editors, not terminals, browsers or unknown fields.".into());
+        if !amber_core::insertion::allows_explicit_x11_paste(&class, text, false) {
+            return Err("This target or text requires review and manual paste. With 'Paste into any window' off, X11 paste only supports single-line text in known native editors.".into());
         }
         let normal = atom(conn, "_NET_WM_WINDOW_TYPE_NORMAL")?;
         let types = property(conn, target.window, "_NET_WM_WINDOW_TYPE", AtomEnum::ATOM)?;
@@ -824,10 +837,10 @@ mod x11 {
         let mut focus = target.focus;
         for _ in 0..64 {
             if focus == target.window {
-                return Ok(class);
+                return Ok(Some(class));
             }
             if property(conn, focus, "WM_CLASS", AtomEnum::STRING)?.type_ != u32::from(AtomEnum::NONE)
-                && !amber_core::insertion::allows_explicit_x11_paste(&program(conn, X11Target { window: focus, ..target })?, text)
+                && !amber_core::insertion::allows_explicit_x11_paste(&program(conn, X11Target { window: focus, ..target })?, text, false)
             {
                 return Err("The focused child application requires Copy/manual paste.".into());
             }
@@ -838,11 +851,12 @@ mod x11 {
 
     /// Explicitly requested or opted-in delivery only. No foreground switching, automatic
     /// retry, synthetic Enter, clipboard restoration, or root/input helper.
-    pub fn paste_explicit(text: &str, target: X11Target) -> Result<Submission, String> {
-        paste_copied(text, target, None, &|| true)
+    pub fn paste_explicit(text: &str, target: X11Target, any_window: bool) -> Result<Submission, String> {
+        let allowed = || !any_window || DESKTOP.get().is_none_or(|d| d.app.state::<Core>().settings().insert.paste_into_any_window);
+        paste_copied(text, target, any_window, None, &allowed)
     }
 
-    pub(super) fn paste_copied(text: &str, target: X11Target, clipboard: Option<(u32, u32)>, allowed: &dyn Fn() -> bool) -> Result<Submission, String> {
+    pub(super) fn paste_copied(text: &str, target: X11Target, any_window: bool, clipboard: Option<(u32, u32)>, allowed: &dyn Fn() -> bool) -> Result<Submission, String> {
         if session_is_blocked() || !allowed() {
             return Err("Paste blocked while the session is locked, suspended, or being checked.".into());
         }
@@ -850,7 +864,7 @@ mod x11 {
         if snapshot(&conn, target.root)? != target {
             return Err("The target window or input focus changed. Nothing was pasted.".into());
         }
-        let class = paste_program(&conn, target, text)?;
+        let class = paste_program(&conn, target, text, any_window)?;
         conn.xtest_get_version(2, 2).map_err(|e| e.to_string())?.reply().map_err(|e| format!("XTest unavailable: {e}"))?;
         let setup = conn.setup();
         let mapping = conn
@@ -885,7 +899,7 @@ mod x11 {
             if snapshot(&conn, target.root)? != target {
                 return Err("The target changed. The result is on the clipboard, but no paste was sent.".into());
             }
-            if paste_program(&conn, target, text)? != class {
+            if paste_program(&conn, target, text, any_window)? != class {
                 return Err("The target application or window type changed. No paste was sent.".into());
             }
             let current = conn
@@ -1248,23 +1262,23 @@ mod x11 {
             assert_ne!(conn.query_tree(target.window).unwrap().reply().unwrap().parent, root);
             let second = editor(&conn, root);
             assert_ne!(second.window, target.window);
-            assert!(paste_explicit("stale window", target).is_err());
+            assert!(paste_explicit("stale window", target, true).is_err());
             let child = create(&conn, second.window);
             conn.map_window(child).unwrap().check().unwrap();
             conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             let leaf = snapshot(&conn, root).unwrap();
             assert_eq!((leaf.window, leaf.focus), (second.window, child));
             assert_eq!(remember_target(), Some(leaf));
-            assert!(paste_explicit("stale focus", second).unwrap_err().contains("changed"));
+            assert!(paste_explicit("stale focus", second, true).unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, second.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(paste_explicit("stale leaf", leaf).unwrap_err().contains("changed"));
+            assert!(paste_explicit("stale leaf", leaf, true).unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(snapshot(&conn, root).is_err(), "Unrelated active window and focus must fail closed");
             conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(remember_target().is_none());
             conn.destroy_window(second.window).unwrap().check().unwrap();
             conn.destroy_window(target.window).unwrap().check().unwrap();
-            assert!(paste_explicit("destroyed", leaf).is_err());
+            assert!(paste_explicit("destroyed", leaf, true).is_err());
             assert!(key_events(&conn).is_empty());
         }
 
@@ -1314,7 +1328,7 @@ mod x11 {
             assert!(to_clipboard_guarded("revoked before GUI publication", || false).is_err());
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             let text = "large completion\n".repeat(5000);
-            assert!(matches!(deliver(&text, None, &amber_core::engine::CancellationToken::default()), Ok(crate::insert::Outcome::OnClipboard(_))));
+            assert!(matches!(deliver(&text, &InsertSettings::default(), None, &amber_core::engine::CancellationToken::default()), Ok(crate::insert::Outcome::OnClipboard(_))));
             let utf8 = atom(&conn, "UTF8_STRING").unwrap();
             assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, text.as_bytes());
             to_clipboard("Explicit Copy still works").unwrap();
@@ -1368,7 +1382,7 @@ mod x11 {
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             for value in [b"Mousepad\0XTerm\0".as_slice(), b"test\0firefox\0", b"test\0unknown\0", b"test\0Mousepad", b"test\0Mousepad\0extra"] {
                 class(&conn, target.window, value);
-                assert!(paste_explicit("not a terminal command", target).is_err());
+                assert!(paste_explicit("not a terminal command", target, false).is_err());
             }
             class(&conn, target.window, b"test\0Mousepad\0");
             for pid in [0, std::process::id(), target.pid + 1] {
@@ -1376,14 +1390,16 @@ mod x11 {
                     .unwrap()
                     .check()
                     .unwrap();
-                assert!(paste_explicit("unknown, own or stale process", target).is_err());
+                assert!(paste_explicit("unknown, own or stale process", target, true).is_err());
             }
             conn.change_property32(PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_PID").unwrap(), AtomEnum::CARDINAL, &[target.pid])
                 .unwrap()
                 .check()
                 .unwrap();
             for text in ["", "line\nline", "line\rline", "line\u{2028}line", "line\u{2029}line", "\u{1b}[31m"] {
-                assert!(paste_explicit(text, target).is_err(), "Should reject {text:?}");
+                for any_window in [false, true] {
+                    assert!(paste_explicit(text, target, any_window).is_err(), "Should reject {text:?}");
+                }
             }
             conn.change_property32(
                 PropMode::REPLACE,
@@ -1395,7 +1411,7 @@ mod x11 {
             .unwrap()
             .check()
             .unwrap();
-            assert!(paste_explicit("dialog", target).is_err());
+            assert!(paste_explicit("dialog", target, false).is_err());
             conn.change_property32(
                 PropMode::REPLACE,
                 target.window,
@@ -1410,7 +1426,7 @@ mod x11 {
             class(&conn, child, b"test\0XTerm\0");
             conn.map_window(child).unwrap().check().unwrap();
             conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(paste_explicit("embedded terminal", snapshot(&conn, root).unwrap()).unwrap_err().contains("child application"));
+            assert!(paste_explicit("embedded terminal", snapshot(&conn, root).unwrap(), false).unwrap_err().contains("child application"));
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             assert!(key_events(&conn).is_empty());
@@ -1422,20 +1438,20 @@ mod x11 {
             let unused = changed.iter().rposition(|&code| code == 0).unwrap();
             changed[unused] = v;
             assert_eq!(conn.set_modifier_mapping(&changed).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
-            assert!(paste_explicit("V mapped as a modifier", target).unwrap_err().contains("modifier mapping"));
+            assert!(paste_explicit("V mapped as a modifier", target, true).unwrap_err().contains("modifier mapping"));
             assert_eq!(conn.set_modifier_mapping(&modifiers).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
             key(&conn, root, control, true);
-            assert!(paste_explicit("held key", target).unwrap_err().contains("Release all keys"));
+            assert!(paste_explicit("held key", target, true).unwrap_err().contains("Release all keys"));
             assert_ne!(conn.query_keymap().unwrap().reply().unwrap().keys[control as usize / 8] & (1 << (control % 8)), 0, "Never release a user's held key");
             key(&conn, root, control, false);
             key(&conn, root, caps, true);
             key(&conn, root, caps, false);
-            assert!(paste_explicit("locked modifier", target).unwrap_err().contains("modifiers"));
+            assert!(paste_explicit("locked modifier", target, true).unwrap_err().contains("modifiers"));
             key(&conn, root, caps, true);
             key(&conn, root, caps, false);
             key_events(&conn);
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
-            let result = paste_explicit("Explicit native paste", target).unwrap();
+            let result = paste_explicit("Explicit native paste", target, false).unwrap();
             assert!(result.submitted && !result.confirmed);
             assert_eq!(
                 key_events(&conn),
@@ -1452,9 +1468,9 @@ mod x11 {
             assert_eq!(remember_target(), Some(target), "Paste never activates Amber or another window");
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
 
-            // The completion path uses the same guard and never chooses a new destination.
+            // Restricted completion keeps the original target and editor allowlist.
             let captured = crate::insert::remember();
-            let mut settings = amber_core::settings::InsertSettings::default();
+            let mut settings = InsertSettings { paste_into_any_window: false, ..Default::default() };
             assert!(crate::insert::insert("not opted in", &settings, captured).is_err());
             assert!(key_events(&conn).is_empty());
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
@@ -1491,6 +1507,101 @@ mod x11 {
 
         #[test]
         #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn configurable_application_and_completion_targets() {
+            let (conn, root) = isolated();
+            let original = editor(&conn, root);
+            let captured = crate::insert::remember();
+            let current = editor(&conn, root);
+            class(&conn, current.window, b"test\0firefox\0");
+            let mut settings = InsertSettings { paste_on_completion: true, ..Default::default() };
+            let utf8 = atom(&conn, "UTF8_STRING").unwrap();
+            let control = keycode(&conn, 0xffe3);
+            let v = keycode(&conn, 0x76);
+            let expected = [
+                (KEY_PRESS_EVENT, control, current.focus, 0),
+                (KEY_PRESS_EVENT, v, current.focus, KeyButMask::CONTROL.into()),
+                (KEY_RELEASE_EVENT, v, current.focus, KeyButMask::CONTROL.into()),
+                (KEY_RELEASE_EVENT, control, current.focus, KeyButMask::CONTROL.into()),
+            ];
+            for any_window in [false, true] {
+                for different_window in [false, true] {
+                    settings.paste_into_any_window = any_window;
+                    settings.paste_into_different_window = different_window;
+                    let outcome = crate::insert::insert("Selected destination", &settings, captured).unwrap();
+                    if any_window && different_window {
+                        assert!(matches!(outcome, crate::insert::Outcome::Pasted));
+                        assert_eq!(key_events(&conn), expected);
+                    } else {
+                        assert!(matches!(outcome, crate::insert::Outcome::OnClipboard(_)));
+                        assert!(key_events(&conn).is_empty());
+                    }
+                    assert_eq!(conversion(&conn, current.window, utf8, utf8).unwrap().value, b"Selected destination");
+                    assert_eq!(remember_target(), Some(current), "Delivery must never refocus the original window");
+                }
+            }
+            // Broad application support alone works in the original, unchanged browser.
+            settings.paste_into_different_window = false;
+            assert!(matches!(crate::insert::insert("Browser original", &settings, crate::insert::remember()), Ok(crate::insert::Outcome::Pasted)));
+            assert_eq!(key_events(&conn), expected);
+            // With retargeting enabled, even a missing/destroyed original target is irrelevant.
+            settings.paste_into_different_window = true;
+            conn.destroy_window(original.window).unwrap().check().unwrap();
+            for target in [captured, None] {
+                assert!(matches!(crate::insert::insert("Current destination", &settings, target), Ok(crate::insert::Outcome::Pasted)));
+                assert_eq!(key_events(&conn), expected);
+            }
+            // Retargeting still needs a real focused destination; it does not reuse the original.
+            conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+            assert!(matches!(crate::insert::insert("No focused destination", &settings, captured), Ok(crate::insert::Outcome::OnClipboard(_))));
+            assert!(key_events(&conn).is_empty());
+            conn.destroy_window(current.window).unwrap().check().unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn any_window_supports_dialogs_and_unknown_classes_but_still_checks_focus() {
+            let (conn, root) = isolated();
+            let target = editor(&conn, root);
+            for value in [b"test\0firefox\0".as_slice(), b"test\0XTerm\0", b"test\0unknown\0", b"malformed"] {
+                class(&conn, target.window, value);
+                assert!(paste_explicit("Broad explicit paste", target, true).unwrap().submitted);
+                assert_eq!(key_events(&conn).len(), 4);
+            }
+            conn.delete_property(target.window, AtomEnum::WM_CLASS.into()).unwrap().check().unwrap();
+            conn.change_property32(
+                PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap(), AtomEnum::ATOM,
+                &[atom(&conn, "_NET_WM_WINDOW_TYPE_DIALOG").unwrap()],
+            ).unwrap().check().unwrap();
+            assert!(paste_explicit("Dialog without an application class", target, true).unwrap().submitted);
+            assert_eq!(key_events(&conn).len(), 4);
+            conn.delete_property(target.window, atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap()).unwrap().check().unwrap();
+            assert!(paste_explicit("Unknown window type", target, true).unwrap().submitted);
+            assert_eq!(key_events(&conn).len(), 4);
+
+            let child = create(&conn, target.window);
+            class(&conn, child, b"test\0XTerm\0");
+            conn.map_window(child).unwrap().check().unwrap();
+            let checks = std::cell::Cell::new(0);
+            let error = paste_copied("Focus race", target, true, None, &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    // Change focus at clipboard publication, before the final server grab.
+                    conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+                }
+                true
+            }).unwrap_err();
+            assert!(error.contains("target changed"), "{error}");
+            assert!(key_events(&conn).is_empty(), "Broad eligibility must not bypass the final target check");
+            let leaf = snapshot(&conn, root).unwrap();
+            assert!(paste_explicit("Embedded application", leaf, true).unwrap().submitted);
+            let events = key_events(&conn);
+            assert_eq!(events.len(), 4);
+            assert!(events.iter().all(|event| event.2 == child));
+            conn.destroy_window(target.window).unwrap().check().unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
         fn completion_revocation_and_newer_clipboard_never_inject_or_recopy() {
             let (conn, root) = isolated();
             let target = editor(&conn, root);
@@ -1503,10 +1614,10 @@ mod x11 {
             assert!(own_clipboard_guarded("revoked at publication", &|| false).is_err());
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             let owner = own_clipboard("published before cancellation").unwrap();
-            assert!(paste_copied("published before cancellation", target, Some(owner), &|| false).is_err());
+            assert!(paste_copied("published before cancellation", target, true, Some(owner), &|| false).is_err());
             assert!(owns_clipboard(owner).unwrap());
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(paste_copied("never overwrite the user's newer copy", target, Some(owner), &|| true).unwrap_err().contains("clipboard changed"));
+            assert!(paste_copied("never overwrite the user's newer copy", target, true, Some(owner), &|| true).unwrap_err().contains("clipboard changed"));
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             assert!(key_events(&conn).is_empty());
             assert_eq!(remember_target(), Some(target));

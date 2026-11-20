@@ -1,4 +1,4 @@
-//! Conservative policy for opted-in X11 paste when editable-field identity is unavailable.
+//! Configurable policy for opted-in X11 paste when editable-field identity is unavailable.
 
 use crate::settings::{InsertMethod, InsertSettings};
 
@@ -25,14 +25,14 @@ pub fn ctrl_v_keycodes(min: u8, width: usize, symbols: &[u32], modifiers: &[u8])
         && !modifiers.contains(&v)).then_some((control, v))
 }
 
-pub fn allows_explicit_x11_paste(class: &str, text: &str) -> bool {
+pub fn allows_explicit_x11_paste(class: &str, text: &str, any_window: bool) -> bool {
     const EDITORS: &[&str] = &[
         "gedit", "org.gnome.gedit", "gnome-text-editor", "org.gnome.texteditor",
         "kate", "org.kde.kate", "kwrite", "org.kde.kwrite", "mousepad", "xed", "pluma", "leafpad",
     ];
     !text.trim().is_empty()
         && !text.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
-        && EDITORS.iter().any(|editor| class.eq_ignore_ascii_case(editor))
+        && (any_window || EDITORS.iter().any(|editor| class.eq_ignore_ascii_case(editor)))
 }
 
 #[cfg(test)]
@@ -71,13 +71,17 @@ mod tests {
 
     #[test]
     fn only_known_editors_and_single_line_text_are_eligible() {
-        assert!(allows_explicit_x11_paste("org.gnome.TextEditor", "Hello, world."));
-        assert!(allows_explicit_x11_paste("Kate", "Gr\u{fc}\u{df}e"));
+        assert!(allows_explicit_x11_paste("org.gnome.TextEditor", "Hello, world.", false));
+        assert!(allows_explicit_x11_paste("Kate", "Gr\u{fc}\u{df}e", false));
         for class in ["firefox", "chromium", "konsole", "gnome-terminal", "", "kate-terminal"] {
-            assert!(!allows_explicit_x11_paste(class, "hello"), "{class}");
+            assert!(!allows_explicit_x11_paste(class, "hello", false), "{class}");
+            assert!(allows_explicit_x11_paste(class, "hello", true), "{class}");
         }
         for text in ["", "  ", "hello\nworld", "hello\u{2028}world", "hello\u{2029}world", "\r", "\t", "\0", "\u{1b}[31m"] {
-            assert!(!allows_explicit_x11_paste("gedit", text));
+            for any_window in [false, true] {
+                assert!(!allows_explicit_x11_paste("gedit", text, any_window));
+                assert!(!allows_explicit_x11_paste("firefox", text, any_window));
+            }
         }
     }
 }

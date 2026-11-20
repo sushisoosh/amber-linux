@@ -230,6 +230,10 @@ pub struct InsertSettings {
     pub method: InsertMethod,
     /// Linux opt-in. Older Linux versions ignored `method`, so it is not consent to paste.
     pub paste_on_completion: bool,
+    /// X11: allow any application/window type instead of only known native editors.
+    pub paste_into_any_window: bool,
+    /// X11 completion: use the focused destination at delivery, not the recording's target.
+    pub paste_into_different_window: bool,
     /// After pasting, put back the text that was on the clipboard before.
     pub restore_clipboard: bool,
     /// A space after the text, so the next dictation does not stick to it.
@@ -238,7 +242,10 @@ pub struct InsertSettings {
 
 impl Default for InsertSettings {
     fn default() -> Self {
-        InsertSettings { method: InsertMethod::Paste, paste_on_completion: false, restore_clipboard: true, trailing_space: true }
+        InsertSettings {
+            method: InsertMethod::Paste, paste_on_completion: false, paste_into_any_window: true,
+            paste_into_different_window: false, restore_clipboard: true, trailing_space: true,
+        }
     }
 }
 
@@ -674,6 +681,34 @@ mod tests {
         s.save(&path).unwrap();
         assert!(Settings::load_linux(&path).0.insert.paste_on_completion);
         assert_eq!(Settings::default().insert.method, InsertMethod::Paste);
+    }
+
+    #[test]
+    fn x11_target_options_default_and_round_trip_independently() {
+        for json in ["{}", r#"{"insert":{}}"#, r#"{"insert":{"pasteOnCompletion":true}}"#] {
+            let s: Settings = serde_json::from_str(json).unwrap();
+            assert!(s.insert.paste_into_any_window);
+            assert!(!s.insert.paste_into_different_window);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::load_linux(&path).0;
+        assert!(settings.insert.paste_into_any_window);
+        assert!(!settings.insert.paste_into_different_window);
+        for any_window in [false, true] {
+            for different_window in [false, true] {
+                settings.insert.paste_into_any_window = any_window;
+                settings.insert.paste_into_different_window = different_window;
+                settings.save(&path).unwrap();
+                let saved = serde_json::to_value(&settings).unwrap();
+                assert_eq!(saved["insert"]["pasteIntoAnyWindow"], any_window);
+                assert_eq!(saved["insert"]["pasteIntoDifferentWindow"], different_window);
+                let (restored, error) = Settings::load_linux(&path);
+                assert!(error.is_none());
+                assert_eq!(restored.insert, settings.insert);
+                assert!(!restored.insert.paste_on_completion);
+            }
+        }
     }
 
     #[test]

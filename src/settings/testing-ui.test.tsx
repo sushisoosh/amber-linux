@@ -108,7 +108,7 @@ function pageProps(phase: Phase, platform: Overview["platform"]): PageProps {
     connections: [], instructions: [],
     hotkey: { dictate: "", mode: "toggle", toggleBubble: "" },
     bubble: { visibility: "hidden", edge: "left", y: 0.5, monitor: "", size: 56, opacity: 1, hiddenIn: [], hideFullscreen: false },
-    insert: { method: "paste", pasteOnCompletion: true, restoreClipboard: false, trailingSpace: true },
+    insert: { method: "paste", pasteOnCompletion: true, pasteIntoAnyWindow: true, pasteIntoDifferentWindow: false, restoreClipboard: false, trailingSpace: true },
     sounds: false, autostart: false, autoUpdate: false, logText: false, onboarded: true,
     phone: { enabled: false, port: 8990, cleanup: false, tunnel: false, publicHost: "", keys: [] },
     profiles: [], history: false, historyDays: 7, statistics: false, snippets: [], discord: { muteWhileDictating: false },

@@ -239,7 +239,7 @@ pub fn insert_last_result(app: &AppHandle) {
             inner.phase = Phase::Inserting;
         }
         announce(&app, Phase::Inserting, None);
-        let message = match insert::paste_explicit(&result.text, target) {
+        let message = match insert::paste_explicit(&result.text, target, core.settings().insert.paste_into_any_window) {
             Ok(_) => "Paste submitted. Check the destination; insertion cannot be verified automatically.".into(),
             Err(e) => format!("Paste was not confirmed: {e} The result is still in the recorder."),
         };
@@ -363,7 +363,7 @@ fn start_for_session(app: &AppHandle, command: bool, expected_session: Option<u6
         inner.session += 1;
         inner.cancel = CancellationToken::default();
         inner.phase = Phase::Recording;
-        // An unobservable launch target stays unknown; never retarget after showing UI.
+        // Keep the original target; only the explicit different-window setting may retarget delivery.
         inner.target = target;
         inner.paste_on_completion = amber_core::insertion::paste_on_completion(&settings.insert, true, false);
         inner.program = inner.target.and_then(|t| t.program());
@@ -766,7 +766,7 @@ fn run(
             announce(app, Phase::Inserting, None);
             result.message = match insert::deliver(&result.text, &core.settings().insert, target, cancel) {
                 Ok(Outcome::OnClipboard(message)) => message,
-                Ok(_) => "Ctrl+V submitted to the original target. Check the destination before pasting again; insertion cannot be verified. The clipboard was replaced.".into(),
+                Ok(_) => "Ctrl+V submitted to the selected destination. Check the destination before pasting again; insertion cannot be verified. The clipboard was replaced.".into(),
                 Err(e) => format!("Paste was not confirmed: {e} The result is still available here. Check the destination before copying or trying again."),
             };
         }

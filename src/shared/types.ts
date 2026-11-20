@@ -77,7 +77,7 @@ export interface Settings {
     hiddenIn: string[];
     hideFullscreen: boolean;
   };
-  insert: { method: InsertMethod; pasteOnCompletion: boolean; restoreClipboard: boolean; trailingSpace: boolean };
+  insert: { method: InsertMethod; pasteOnCompletion: boolean; pasteIntoAnyWindow: boolean; pasteIntoDifferentWindow: boolean; restoreClipboard: boolean; trailingSpace: boolean };
   sounds: boolean;
   autostart: boolean;
   autoUpdate: boolean;

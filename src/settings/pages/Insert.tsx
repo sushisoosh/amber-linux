@@ -26,19 +26,25 @@ export function InsertPage({ s, save, phase, ov, desktop }: PageProps) {
   return (
     <>
       <h1>Delivery</h1>
-      <p className="lead">How completed dictation reaches the window you were in when recording started. The hotkey leaves Amber in the background.</p>
+      <p className="lead">{linux ? "Review and copy completed dictation, or opt in to clipboard delivery and X11 Ctrl+V. The hotkey leaves Amber in the background." : "How completed dictation reaches the window you were in when recording started. The hotkey leaves Amber in the background."}</p>
       <Section>
         {linux ? <>
-          <Row label="Copy and paste completed dictation (Ctrl+V)" hint="Off by default: review the result and copy it yourself. When enabled, completed text goes to the clipboard even when automatic paste is unavailable. Amber attempts one paste into the original target without bringing either window forward.">
+          <Row label="Copy and paste completed dictation (Ctrl+V)" hint="Off by default: review the result and copy it yourself. When enabled, completed text goes to the clipboard even when automatic paste is unavailable. On X11, Amber attempts one paste according to your target options, without bringing either window forward.">
             <Switch on={s.insert.pasteOnCompletion} onChange={(v) => save((x) => {
               x.insert.pasteOnCompletion = v;
               x.insert.method = "paste";
             })} />
           </Row>
-          <Row label={x11 ? "Restricted X11 paste" : "Manual paste on this desktop"} hint={x11
-            ? "Automatic Ctrl+V supports single-line text in native editors such as Gedit, Kate or Mousepad, with unchanged window and input focus. Terminals, browsers, dialogs and unknown targets, changed focus, and multiline text still receive clipboard text for manual paste. Editable fields within a window cannot be verified."
-            : "Wayland and unknown sessions cannot safely identify or paste into the target yet. Background clipboard access can also be restricted: on Wayland, Amber must be focused to copy. Otherwise open Recorder and use Copy."} />
-          <Row label="Clipboard replacement" hint="Opted-in completion replaces clipboard text, images or files; Linux does not restore them. Clipboard managers may retain the text. Keep Amber running until you paste. Interrupted recordings always require review. Results remain in Recorder, even when a paste is blocked or cannot be confirmed. Testing recordings never change the clipboard." />
+          {x11 ? <>
+            <Row label="Paste into any window" hint={<>On by default: allows X11 Ctrl+V in browsers, chat apps, dialogs and other window types, not just known native editors. Applies to completion and <code>--insert-last</code>; this does not enable completion paste. Turn off to restrict targets to known native editors.</>}>
+              <Switch on={s.insert.pasteIntoAnyWindow} onChange={(v) => save((x) => (x.insert.pasteIntoAnyWindow = v))} />
+            </Row>
+            <Row label="Allow pasting into a different window" hint="Off by default: completion requires the window captured at recording start. When enabled, Amber chooses the currently focused window once, when delivery begins, not when recording stops. Focus changes during paste still block it.">
+              <Switch on={s.insert.pasteIntoDifferentWindow} onChange={(v) => save((x) => (x.insert.pasteIntoDifferentWindow = v))} />
+            </Row>
+            <Row label="X11 paste limits" hint="Only single-line text without control characters. The destination must be observable, outside Amber, with stable window and input focus while sending Ctrl+V. Amber never switches focus or presses Enter. Editable fields (including password fields) and paste acceptance cannot be verified. Terminals may need a different paste shortcut." />
+          </> : <Row label="Manual paste on this desktop" hint="Wayland and unknown sessions cannot safely identify or paste into the target yet. Background clipboard access can also be restricted: on Wayland, Amber must be focused to copy. Otherwise open Recorder and use Copy." />}
+          <Row label="Clipboard replacement" hint="Copy, opted-in completion and --insert-last replace clipboard text, images or files; Linux does not restore them. Clipboard managers may retain the text. Keep Amber running until you paste. Interrupted recordings always require review. Results remain in Recorder, even when a paste is blocked or cannot be confirmed. Testing recordings never change the clipboard." />
         </> : <Row
           label="Completed dictation"
           hint={

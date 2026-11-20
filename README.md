@@ -13,15 +13,30 @@ to the repository license and the author's written permission.
 - Dictation shortcuts leave Amber in the background. The Linux Recorder page keeps results
   in memory for review and explicit Copy by default. Under **Delivery**, enable **Copy and
   paste completed dictation (Ctrl+V)** to copy completed text and paste automatically on
-  supported X11 targets. The target must remain unchanged for automatic paste; unsupported
-  or changed targets receive clipboard text for manual paste, without refocusing a window.
-  On X11, `amber-dictation --insert-last` can also submit a single-line
-  result to a supported native editor; a submitted paste is not proof the editor accepted it.
-  Browsers, terminals, dialogs, unknown targets, and multiline text still require manual paste.
+  eligible X11 targets. Completion delivery remains **off by default**. Copy, completion
+  delivery and explicit insertion replace clipboard text, images or files without restoring
+  them; clipboard managers may retain the text. Keep Amber running until you paste.
+- On X11, **Paste into any window** is **on by default**: browsers, chat apps, dialogs,
+  terminals and other window types are eligible, not just known native editors. Turning it
+  off restores the native-editor restriction. This option also applies to
+  `amber-dictation --insert-last`, which captures the currently focused destination when
+  invoked and works independently of completion delivery.
+- X11's **Allow pasting into a different window** is **off by default**: completion requires
+  the window captured at recording start. When enabled, the currently focused destination
+  is chosen once when delivery begins, not when recording stops. Both target options can
+  be configured while completion delivery is off.
+- All X11 paste still requires single-line text without control characters and an observable
+  non-Amber target with stable window and input focus during paste. Amber sends only `Ctrl+V`,
+  never Enter or a focus switch. Terminals may need a different paste shortcut. Editable
+  fields (including password fields) and paste acceptance cannot be verified. Targets that
+  change during paste, unobservable targets and multiline/control-character text require
+  manual paste; completed results remain in Recorder even when automatic paste is blocked
+  or cannot be confirmed.
 - Wayland shortcuts use the desktop portal when available. GNOME 48+ and KDE Plasma
   6 are the primary targets. On older/missing portal backends, configure a desktop
   shortcut for `amber-dictation --toggle`; `amber-dictation --cancel` stops/cancels a dictation. That
-  fallback is toggle-only. On Wayland, clipboard access requires Amber to be focused.
+  fallback is toggle-only. Wayland remains manual-paste-only; clipboard access requires
+  Amber to be focused.
 - Credentials and optional history use authenticated encryption with a key in Secret
   Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
   causes plaintext persistence. Credential-save errors leave keys available only
@@ -90,9 +105,10 @@ Amber's own X11 shortcut is `Ctrl+Alt+Space` by default. Do not register the sam
 combination in both Amber and i3. Bare i3 does not process XDG autostart files:
 use the explicit `exec` line above **or** an XDG launcher such as `dex`, not both.
 A tray host and a notification daemon are optional; the Recorder window and its
-Quit button must remain usable without them. Explicit paste is intentionally
-restricted to supported native editors and single-line text; terminals, browsers
-and other unverified targets use Copy and manual paste.
+Quit button must remain usable without them. The explicit paste shortcut uses Delivery's
+**Paste into any window** option and captures its current destination. Single-line,
+control-free text and stable focus are required; the shortcut never switches windows or
+sends Enter, and cannot confirm that the destination accepted the paste.
 
 For locking, install `i3lock` and optionally `xss-lock`. Direct `i3lock` does not
 reliably announce a login1 lock. The packaged wrapper requests Amber cancellation

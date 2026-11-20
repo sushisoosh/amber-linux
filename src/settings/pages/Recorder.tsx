@@ -17,6 +17,7 @@ export function Recorder({ s, phase, phaseMessage, refresh, toast, go, desktop, 
   const recording = phase === "recording";
   const processing = phase === "transcribing" || phase === "inserting";
   const active = recording || processing;
+  const x11 = desktop.status?.session.toLowerCase() === "x11";
 
   const loadResult = async () => {
     const version = ++resultVersion.current;
@@ -85,7 +86,7 @@ export function Recorder({ s, phase, phaseMessage, refresh, toast, go, desktop, 
     <div className={`recorder ${compact ? "compact" : ""}`}>
       {!compact && <>
         <h1>Recorder</h1>
-        <p className="lead">Record without leaving your active app. Review and copy the result, or enable Ctrl+V on completion in Delivery.</p>
+        <p className="lead">Record without leaving your active app. Review and copy the result, or configure optional clipboard delivery and X11 Ctrl+V in Delivery.</p>
       </>}
       <Section title={compact ? undefined : "Dictation"}>
         <div className="row recorder-controls">
@@ -110,7 +111,11 @@ export function Recorder({ s, phase, phaseMessage, refresh, toast, go, desktop, 
       </Section>
       {!compact && <>
         <Section title="Delivery">
-          <Row label={s.insert.pasteOnCompletion ? "Paste on completion is enabled" : "Review and copy"} hint="The hotkey captures the destination before showing a non-focusing recording indicator. Ctrl+V is optional and restricted to supported X11 editors; Wayland uses manual Copy. Starting from this window does not select another app as a target.">
+          <Row label={s.insert.pasteOnCompletion ? (x11 ? "Paste on completion is enabled" : "Copy on completion is enabled") : "Review and copy"} hint={x11 ? <>
+            {s.insert.pasteIntoDifferentWindow ? "Completion uses the focused window chosen once when delivery begins, not when recording stops." : "Completion requires the destination captured at recording start to be focused when delivery begins. Starting in Amber does not select another app."}
+            {" "}{s.insert.pasteIntoAnyWindow ? "Any-window targeting is enabled; it does not turn on completion paste." : "Targets are restricted to known native editors."}
+            {" "}Only single-line, control-free text; focus must stay stable while sending Ctrl+V. Editable fields and paste acceptance cannot be verified.
+          </> : "Wayland and unknown sessions use manual paste. Completion delivery can copy text, but cannot inject it into another app. On Wayland, focus Amber to copy, then focus your destination and paste manually."}>
             <button className="btn" onClick={() => go("insert")}>Configure delivery</button>
           </Row>
         </Section>

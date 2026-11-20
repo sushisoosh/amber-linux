@@ -17,7 +17,7 @@ import { InsertPage } from "./pages/Insert";
 import { MicrophonePage } from "./pages/Microphone";
 import { Recorder } from "./pages/Recorder";
 import { TestingPage, TestResultDetails } from "./pages/Testing";
-import { phaseLabel } from "./ui";
+import { phaseLabel, Row, Switch } from "./ui";
 import { availableConnections, chooseConnection, eligibleModels } from "./connections";
 import { ConnectionsPage } from "./pages/Connections";
 import { BASH_EXAMPLE, instructionIssue, instructionKeyword, InstructionsPage } from "./pages/Instructions";
@@ -29,7 +29,7 @@ const settings: Settings = {
   connections: [], instructions: [],
   language: "en", vocabulary: "", microphone: "", hotkey: { dictate: "Super+KeyD", mode: "toggle", toggleBubble: "" },
   bubble: { visibility: "hidden", edge: "left", y: 0.5, monitor: "", size: 64, opacity: 1, hiddenIn: [], hideFullscreen: false },
-  insert: { method: "paste", pasteOnCompletion: false, restoreClipboard: false, trailingSpace: false }, sounds: false,
+  insert: { method: "paste", pasteOnCompletion: false, pasteIntoAnyWindow: true, pasteIntoDifferentWindow: false, restoreClipboard: false, trailingSpace: false }, sounds: false,
   autostart: false, autoUpdate: true, logText: false, onboarded: true,
   phone: { enabled: false, port: 8990, cleanup: false, tunnel: false, publicHost: "", keys: [] },
   profiles: [], history: false, historyDays: 7, statistics: false, snippets: [],
@@ -92,7 +92,7 @@ test("Linux microphone and shortcuts hide unsupported Windows integrations", () 
   assert.equal(pretty("Super+KeyD"), "Win + D");
 });
 
-test("Delivery exposes optional Ctrl+V without promising unsupported Linux insertion", () => {
+test("Delivery keeps Wayland manual-only and hides X11 target options on other desktops", () => {
   const linux = render(InsertPage, props());
   assert.match(linux, /Copy and paste completed dictation \(Ctrl\+V\)/);
   assert.match(linux, /Off by default/);
@@ -101,19 +101,131 @@ test("Delivery exposes optional Ctrl+V without promising unsupported Linux inser
   assert.match(linux, /Linux does not restore/);
   assert.match(linux, /completed text goes to the clipboard even when automatic paste is unavailable/);
   assert.match(linux, /Testing recordings never change the clipboard/);
-  assert.doesNotMatch(linux, /Restore the clipboard|Try it|As keystrokes/);
-  const p = props();
-  p.desktop.status!.session = "x11";
-  const x11 = render(InsertPage, p);
-  assert.match(x11, /Restricted X11 paste/);
-  assert.match(x11, /Terminals, browsers, dialogs and unknown targets/);
-  const windows = render(InsertPage, props("windows"));
+  assert.doesNotMatch(linux, /Restore the clipboard|Try it|As keystrokes|Paste into any window|Allow pasting into a different window/);
+  const unknown = props();
+  unknown.desktop.status = null;
+  assert.match(render(InsertPage, unknown), /Manual paste on this desktop/);
+  assert.doesNotMatch(render(InsertPage, unknown), /Paste into any window|Allow pasting into a different window/);
+  const win = props("windows");
+  win.desktop.status!.session = "X11";
+  const windows = render(InsertPage, win);
   assert.match(windows, /Paste \(Ctrl\+V\)/);
   assert.match(windows, /Restore the clipboard/);
   assert.match(windows, /Try it/);
-  assert.doesNotMatch(windows, /Manual paste on this desktop|Off by default/);
+  assert.doesNotMatch(windows, /Manual paste on this desktop|Off by default|Paste into any window|Allow pasting into a different window/);
   assert.match(render(Recorder, props()), /Configure delivery/);
   assert.match(render(HotkeysPage, props()), /does not open or focus Amber/);
+});
+
+test("X11 target switches default to any-window on and different-window off without enabling completion", () => {
+  const p = props();
+  p.desktop.status!.session = "x11";
+  const html = render(InsertPage, p);
+  assert.match(html, /role="switch" aria-checked="false" aria-label="Copy and paste completed dictation \(Ctrl\+V\)"/);
+  assert.match(html, /role="switch" aria-checked="true" aria-label="Paste into any window"/);
+  assert.match(html, /role="switch" aria-checked="false" aria-label="Allow pasting into a different window"/);
+  assert.doesNotMatch(html, /disabled=|Restricted X11 paste/);
+  for (const expected of [/On by default/, /browsers, chat apps, dialogs and other window types/, /--insert-last/, /does not enable completion paste/,
+    /Turn off to restrict targets to known native editors/, /currently focused window once, when delivery begins, not when recording stops/,
+    /Focus changes during paste still block it/, /single-line text without control characters/, /observable, outside Amber/,
+    /stable window and input focus/, /never switches focus or presses Enter/, /password fields/, /paste acceptance cannot be verified/,
+    /Terminals may need a different paste shortcut/, /Clipboard managers may retain/, /Keep Amber running/]) {
+    assert.match(html, expected);
+  }
+  p.s.insert.pasteIntoAnyWindow = false;
+  p.s.insert.pasteIntoDifferentWindow = true;
+  const changed = render(InsertPage, p);
+  assert.match(changed, /role="switch" aria-checked="false" aria-label="Paste into any window"/);
+  assert.match(changed, /role="switch" aria-checked="true" aria-label="Allow pasting into a different window"/);
+  assert.match(changed, /role="switch" aria-checked="false" aria-label="Copy and paste completed dictation \(Ctrl\+V\)"/);
+});
+
+test("X11 target switches save independently while completion is off and retain their values when it changes", async () => {
+  const p = props("linux", { insert: { ...settings.insert, method: "type" } });
+  p.desktop.status!.session = "X11";
+  const saved: Settings[] = [];
+  p.save = async (change) => {
+    const next = structuredClone(p.s);
+    change(next);
+    saved.push(next);
+    p.s = next;
+    p.ov.settings = next;
+    return true;
+  };
+  const switches = new Map<string, ComponentProps<typeof Switch>>();
+  // Capture the actual page callbacks during SSR without mocking its save handlers or hooks.
+  function Probe() {
+    const page = InsertPage(p);
+    const visit = (node: React.ReactNode) => {
+      if (!React.isValidElement<{ label?: string; children?: React.ReactNode }>(node)) return;
+      if (node.type === Row && typeof node.props.label === "string" &&
+        React.isValidElement<ComponentProps<typeof Switch>>(node.props.children) && node.props.children.type === Switch) {
+        switches.set(node.props.label, node.props.children.props);
+      }
+      React.Children.forEach(node.props.children, visit);
+    };
+    visit(page);
+    return page;
+  }
+  const expected = structuredClone(p.s);
+  const changes: [string, Partial<Settings["insert"]>][] = [
+    ["Paste into any window", { pasteIntoAnyWindow: false }],
+    ["Allow pasting into a different window", { pasteIntoDifferentWindow: true }],
+    ["Paste into any window", { pasteIntoAnyWindow: true }],
+    ["Allow pasting into a different window", { pasteIntoDifferentWindow: false }],
+    ["Allow pasting into a different window", { pasteIntoDifferentWindow: true }],
+    ["Copy and paste completed dictation (Ctrl+V)", { pasteOnCompletion: true, method: "paste" }],
+    ["Copy and paste completed dictation (Ctrl+V)", { pasteOnCompletion: false }],
+  ];
+  for (const [index, [label, change]] of changes.entries()) {
+    switches.clear();
+    render(Probe, {});
+    assert.equal(saved.length, index, "Rendering must not save settings");
+    const control = switches.get(label);
+    assert.ok(control, `${label} must remain configurable`);
+    await control.onChange(!control.on);
+    Object.assign(expected.insert, change);
+    assert.equal(saved.length, index + 1, "Each toggle must save exactly once");
+    assert.deepEqual(saved[index], expected, "Only the requested fields should change");
+    assert.deepEqual(p.s, expected);
+  }
+});
+
+test("Recorder distinguishes target timing and eligibility from completion opt-in", () => {
+  const p = props();
+  p.desktop.status!.session = "X11";
+  const defaults = render(Recorder, p);
+  assert.match(defaults, /Review and copy/);
+  assert.match(defaults, /destination captured at recording start to be focused when delivery begins/);
+  assert.match(defaults, /Starting in Amber does not select another app/);
+  assert.match(defaults, /Any-window targeting is enabled; it does not turn on completion paste/);
+  assert.doesNotMatch(defaults, /restricted to supported X11 editors|Paste on completion is enabled/);
+  p.s.insert.pasteIntoAnyWindow = false;
+  p.s.insert.pasteIntoDifferentWindow = true;
+  p.s.insert.pasteOnCompletion = true;
+  const changed = render(Recorder, p);
+  assert.match(changed, /Paste on completion is enabled/);
+  assert.match(changed, /focused window chosen once when delivery begins, not when recording stops/);
+  assert.match(changed, /Targets are restricted to known native editors/);
+  assert.match(changed, /focus must stay stable while sending Ctrl\+V/);
+  assert.doesNotMatch(changed, /Starting in Amber does not select another app|destination captured at recording start to be focused when delivery begins/);
+  p.desktop.status!.session = "Wayland";
+  const wayland = render(Recorder, p);
+  assert.match(wayland, /Copy on completion is enabled/);
+  assert.match(wayland, /Wayland and unknown sessions use manual paste/);
+  assert.match(wayland, /focus Amber to copy/);
+  assert.doesNotMatch(wayland, /Paste on completion is enabled|focused window chosen once|Targets are restricted/);
+});
+
+test("Explicit X11 paste help describes current targeting independently of completion", () => {
+  const html = render(HotkeysPage, props());
+  assert.match(html, /amber-dictation --insert-last/);
+  assert.match(html, /captures the currently focused destination and respects Paste into any window, even with completion off/);
+  assert.match(html, /single-line, control-free text; focus must stay stable/);
+  assert.match(html, /Ctrl\+V only, never Enter or a focus switch/);
+  assert.match(html, /Editable fields and paste acceptance cannot be verified/);
+  assert.match(html, /Terminals may need another shortcut; Wayland requires Copy and manual paste/);
+  assert.doesNotMatch(html, /For supported native editors|Wayland, terminals, multiline text/);
 });
 
 test("Linux keys and history report storage status rather than Windows encryption", () => {
