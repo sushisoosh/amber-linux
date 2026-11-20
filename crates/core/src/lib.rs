@@ -13,6 +13,7 @@ pub mod estimate;
 pub mod gesture;
 pub mod history;
 pub mod imports;
+pub mod indicator;
 pub mod instructions;
 pub mod http;
 pub mod local;

@@ -124,6 +124,6 @@ pub fn toggle_bubble(app: &AppHandle) {
             _ => BubbleVisibility::Hidden,
         }
     });
-    crate::bubble::sync_visibility(app, core.dictation.is_active());
+    crate::bubble::sync_visibility(app);
     let _ = tauri::Emitter::emit(app, "settings-changed", core.settings());
 }

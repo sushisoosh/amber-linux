@@ -1,4 +1,4 @@
-//! The two windows: the bubble at the screen edge and the settings window.
+//! The two windows: the bubble (centered while processing) and the settings window.
 //!
 //! The bubble must never take focus - a click on it would otherwise move the cursor out of
 //! the text field the dictation is meant for. It is a tool window with `WS_EX_NOACTIVATE`,
@@ -15,6 +15,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::state::Core;
+use crate::dictation::Phase;
 
 pub const BUBBLE: &str = "bubble";
 pub const SETTINGS: &str = "settings";
@@ -79,7 +80,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         }
     });
     place(app);
-    sync_visibility(app, false);
+    sync_visibility(app);
     watch_foreground(app);
     Ok(())
 }
@@ -159,7 +160,7 @@ fn watch_foreground(app: &AppHandle) {
                         && crate::insert::program_of_window(fg).is_some_and(|exe| b.hidden_in.contains(&exe)))
             });
             if SUPPRESSED.swap(suppress, Ordering::Relaxed) != suppress {
-                sync_visibility(&app, core.dictation.is_active());
+                sync_visibility(&app);
             }
         });
     }
@@ -176,49 +177,63 @@ pub fn apply(app: &AppHandle) {
     }
     let _ = app.emit_to(BUBBLE, "bubble-config", config(&core));
     place(app);
-    sync_visibility(app, core.dictation.is_active());
+    sync_visibility(app);
 }
 
-/// Shows or hides the bubble for the current setting and whether a dictation runs.
-pub fn sync_visibility(app: &AppHandle, dictating: bool) {
-    let Some(w) = app.get_webview_window(BUBBLE) else { return };
-    #[cfg(not(target_os = "linux"))]
-    let show = match app.state::<Core>().settings().bubble.visibility {
-        BubbleVisibility::Always => true,
-        BubbleVisibility::WhileDictating => dictating,
-        BubbleVisibility::Hidden => false,
-    } && !SUPPRESSED.load(Ordering::Relaxed);
-    #[cfg(target_os = "linux")]
-    let show = dictating && app.state::<Core>().dictation.is_active();
-    #[cfg(windows)]
-    if let Ok(hwnd) = w.hwnd() {
-        win::show(hwnd.0 as isize, show);
-        return;
-    }
-    let _ = if show { w.show() } else { w.hide() };
+/// Follow the current visual phase, not the worker gate that may still be winding down.
+pub fn sync_visibility(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(w) = handle.get_webview_window(BUBBLE) else { return };
+        let core = handle.state::<Core>();
+        let phase = core.dictation.phase();
+        #[cfg(not(target_os = "linux"))]
+        let show = match core.settings().bubble.visibility {
+            BubbleVisibility::Always => true,
+            BubbleVisibility::WhileDictating => phase != Phase::Idle,
+            BubbleVisibility::Hidden => false,
+        } && !SUPPRESSED.load(Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        let show = matches!(phase, Phase::Recording | Phase::Transcribing | Phase::Inserting);
+        if show && !DRAGGING.load(Ordering::SeqCst) { place(&handle); }
+        #[cfg(windows)]
+        if let Ok(hwnd) = w.hwnd() {
+            win::show(hwnd.0 as isize, show);
+            return;
+        }
+        if let Err(e) = if show { w.show() } else { w.hide() } {
+            crate::diag::warn(format!("Could not update recording indicator: {e}"));
+        }
+    });
 }
 
-/// Puts the bubble at its edge, on its monitor, at its height.
+/// Center the processing popup; otherwise keep the recording bubble at its usual edge.
 pub fn place(app: &AppHandle) {
+    let centered = matches!(app.state::<Core>().dictation.phase(), Phase::Transcribing | Phase::Inserting);
     #[cfg(windows)]
     {
         let Some(w) = app.get_webview_window(BUBBLE) else { return };
         let Ok(hwnd) = w.hwnd() else { return };
         let b = app.state::<Core>().settings().bubble;
-        win::place(hwnd.0 as isize, &b.monitor, b.edge, b.y);
+        win::place(hwnd.0 as isize, &b.monitor, b.edge, b.y, centered);
     }
     #[cfg(target_os = "linux")]
     if let Some(w) = app.get_webview_window(BUBBLE) {
-        if let (Ok(Some(monitor)), Ok(size)) = (w.primary_monitor(), w.outer_size()) {
+        if let Ok(Some(monitor)) = w.primary_monitor() {
             let area = monitor.work_area();
-            let _ = w.set_position(tauri::PhysicalPosition::new(
-                area.position.x + area.size.width as i32 - size.width as i32 - 16,
-                area.position.y + area.size.height as i32 - size.height as i32 - 16,
-            ));
+            // Tao's outer_size is not reliable before a hidden window's first configure event.
+            let logical_size = app.state::<Core>().settings().bubble.size + PAD * 2;
+            let size = (logical_size as f64 * monitor.scale_factor()).round() as u32;
+            let (x, y) = amber_core::indicator::popup_position(
+                (area.position.x, area.position.y), (area.size.width, area.size.height), (size, size), centered,
+            );
+            if let Err(e) = w.set_position(tauri::PhysicalPosition::new(x, y)) {
+                crate::diag::warn(format!("Could not position recording indicator: {e}"));
+            }
         }
     }
     #[cfg(not(any(windows, target_os = "linux")))]
-    let _ = app;
+    let _ = (app, centered);
 }
 
 /// The press turned into a drag: follow the mouse until the button comes up, then snap to
@@ -430,7 +445,7 @@ mod win {
         if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 }
     }
 
-    pub fn place(h: isize, monitor: &str, edge: Edge, y: f64) {
+    pub fn place(h: isize, monitor: &str, edge: Edge, y: f64, centered: bool) {
         let Some(m) = monitors().into_iter().find(|m| !monitor.is_empty() && m.name == monitor).or_else(primary) else { return };
         let r = rect(h);
         let (w, ht) = (r.right - r.left, r.bottom - r.top);
@@ -441,6 +456,12 @@ mod win {
         };
         let free = (m.work.bottom - m.work.top - ht).max(0);
         let top = m.work.top + (free as f64 * y.clamp(0.0, 1.0)).round() as i32;
+        let (x, top) = if centered {
+            amber_core::indicator::popup_position(
+                (m.work.left, m.work.top), ((m.work.right - m.work.left) as u32, (m.work.bottom - m.work.top) as u32),
+                (w as u32, ht as u32), true,
+            )
+        } else { (x, top) };
         unsafe {
             let _ = SetWindowPos(hwnd(h), Some(HWND_TOPMOST), x, top, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
         }

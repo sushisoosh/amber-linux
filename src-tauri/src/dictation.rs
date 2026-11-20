@@ -259,9 +259,10 @@ fn announce(app: &AppHandle, phase: Phase, message: Option<String>) {
         let _ = app.emit("dictation-state", StateEvent { state: phase, message, expected_ms: None, command: false });
         inner.program.clone()
     };
+    crate::tray::sync_state(app);
     // Muted in Discord exactly while Amber listens - stop, cancel and a failed microphone alike.
     crate::mute::follow(&core.settings().discord, program.as_deref(), || core.dictation.phase() == Phase::Recording);
-    crate::bubble::sync_visibility(app, !matches!(core.dictation.phase(), Phase::Idle));
+    crate::bubble::sync_visibility(app);
 }
 
 fn progress(app: &AppHandle, session: u64, expected_ms: Option<u64>, command: bool) -> bool {

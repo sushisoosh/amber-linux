@@ -2,7 +2,7 @@
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let dictate = MenuItem::with_id(app, "dictate", "Start / stop dictation", true, None::<&str>)?;
@@ -54,8 +54,29 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+pub fn sync_state(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(tray) = handle.tray_by_id("amber") else { return };
+        let Some(idle) = handle.default_window_icon() else { return };
+        // Read the current state here so a queued update cannot restore a stale color.
+        let recording = handle.state::<crate::state::Core>().dictation.is_recording();
+        let icon = if recording {
+            tauri::image::Image::new_owned(
+                amber_core::indicator::recording_rgba(idle.rgba().to_vec()),
+                idle.width(), idle.height(),
+            )
+        } else {
+            idle.clone()
+        };
+        if let Err(e) = tray.set_icon(Some(icon)) {
+            crate::diag::warn(format!("Could not update tray icon: {e}"));
+        }
+        let _ = tray.set_tooltip(Some(if recording { "Amber - recording" } else { "Amber - dictation" }));
+    });
+}
+
 fn copy_last_dictation(app: &AppHandle) {
-    use tauri::Manager;
     #[cfg(target_os = "linux")]
     if let Some(result) = app.state::<crate::state::Core>().dictation.result() {
         match crate::insert::to_clipboard(&result.text) {
