@@ -200,11 +200,26 @@ test("Built-in runtime has no download or delete action while ordinary models re
   };
   const builtIn = render(DownloadItem, item);
   assert.match(builtIn, /Built into Amber; no download needed/);
-  assert.doesNotMatch(builtIn, />Delete<|>Download<|0 MB/);
+  assert.doesNotMatch(builtIn, />Delete<|>Download<|0 MB|Interrupted downloads/);
   const model: ComponentProps<typeof DownloadItem> = { ...item, kind: "model", item: { ...item.item, sizeMb: 75 } };
   assert.match(render(DownloadItem, model), />Delete</);
   assert.match(render(DownloadItem, { ...model, item: { ...model.item, installed: false } }), />Download &amp; use</);
   assert.match(render(DownloadItem, { ...model, selectOnDownload: false, item: { ...model.item, installed: false } }), />Download</);
+});
+
+test("Download rows explain durable progress and cancellation keeps it for later", () => {
+  const props: ComponentProps<typeof DownloadItem> = {
+    local: { info: null, progress: {}, errors: {}, reload: unexpectedAction, download: unexpectedAction },
+    kind: "model", item: { id: "test", label: "Test model", note: "", sizeMb: 75, installed: false, wantsGpu: false, replaced: false, imported: false },
+    selected: false, onSelect: unexpectedAction, toast: unexpectedAction,
+  };
+  assert.match(render(DownloadItem, props), /Download again to resume, even after restarting Amber/);
+  props.local.progress["model:test"] = { key: "model:test", done: 25, total: 100, state: "running" };
+  const running = render(DownloadItem, props);
+  assert.match(running, /Stop downloading and keep progress for later/);
+  assert.match(running, />Cancel</);
+  assert.match(running, /25%/);
+  assert.doesNotMatch(render(DownloadItem, { ...props, item: { ...props.item, imported: true } }), /Interrupted downloads/);
 });
 
 test("Speech model browsing preserves the selected model and separates backend families", () => {

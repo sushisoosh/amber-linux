@@ -1,8 +1,8 @@
 //! The local engine's parts: built-in CPU inference on Linux, a downloaded whisper.cpp
 //! runtime on Windows, and checksum-pinned model downloads on both platforms.
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -604,7 +604,7 @@ impl Layout {
 pub enum DownloadError {
     #[error("download cancelled")]
     Cancelled,
-    #[error("download failed: {0}")]
+    #[error("download failed: {0}. Progress is saved; try downloading again to resume.")]
     Network(String),
     #[error("the download is damaged (checksum mismatch)")]
     Checksum,
@@ -614,8 +614,19 @@ pub enum DownloadError {
     Package(String),
 }
 
-/// Streams [url] into [dest], hashing on the way. Only a file with the right SHA-256 is moved
-/// into place; anything else is deleted. [progress] gets (bytes so far, total if known).
+/// Saved partial bytes for free-space estimates, not an integrity/installation check.
+/// Do not credit completed destinations: an invalid one needs space for a full replacement.
+pub fn partial_download_bytes(dest: &Path, sha256: &str) -> u64 {
+    if fs::read_to_string(dest.with_extension("part.sha256")).is_ok_and(|s| s.eq_ignore_ascii_case(sha256)) {
+        return fs::metadata(dest.with_extension("part")).ok().filter(|md| md.is_file()).map_or(0, |md| md.len());
+    }
+    0
+}
+
+/// Streams [url] into [dest], keeping interrupted transfers in a checksum-bound .part file.
+/// Retries transient failures and resumes saved bytes, including after an app restart. Only
+/// a complete file with the right SHA-256 is moved into place; corrupt data is discarded.
+/// The caller serializes access to [dest]. [progress] includes reused bytes in its count.
 pub fn download_verified(
     url: &str,
     sha256: &str,
@@ -630,41 +641,143 @@ pub fn download_verified(
         fs::create_dir_all(dir)?;
     }
     let part = dest.with_extension("part");
+    let identity = dest.with_extension("part.sha256");
     let result = (|| {
+        if dest.is_file() && sha256_file(dest)?.eq_ignore_ascii_case(sha256) {
+            let size = fs::metadata(dest)?.len();
+            progress(size, Some(size));
+            return if cancel.load(Ordering::Relaxed) { Err(DownloadError::Cancelled) } else { Ok(()) };
+        }
+        // The expected digest identifies the content even if a redirect URL or ETag changes.
+        // Never append a new catalog revision to bytes saved for a different artifact.
+        if !fs::read_to_string(&identity).is_ok_and(|s| s.eq_ignore_ascii_case(sha256)) {
+            match fs::remove_file(&part) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let mut marker = File::create(&identity)?;
+            marker.write_all(sha256.as_bytes())?;
+            marker.sync_all()?;
+        }
+        // Append-only handles cannot be truncated on Windows when a server ignores Range.
+        let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&part)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut done = 0u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) { return Err(DownloadError::Cancelled); }
+            let n = file.read(&mut buf)?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+            done += n as u64;
+        }
         // In the blocking client the timeout applies to every single read: a connection that
         // stalls ends the download (and lets a cancel through) instead of hanging forever.
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(45))
+            .no_gzip().no_brotli().no_deflate().no_zstd()
             .user_agent(concat!("AmberPC/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| DownloadError::Network(e.to_string()))?;
-        let mut resp = client.get(url).send().map_err(|e| DownloadError::Network(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(DownloadError::Network(format!("HTTP {}", resp.status().as_u16())));
-        }
-        let total = resp.content_length();
-        let mut file = File::create(&part)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut done = 0u64;
-        let mut last_report = 0u64;
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(DownloadError::Cancelled);
+        let mut total = None;
+        let mut retries = 0;
+        let transfer = loop {
+            if cancel.load(Ordering::Relaxed) { break Err(DownloadError::Cancelled); }
+            // A crash/cancel after the last byte must not cause an unnecessary HTTP 416 or GET.
+            if hex(&hasher.clone().finalize()).eq_ignore_ascii_case(sha256) {
+                total = Some(done);
+                break Ok(());
             }
-            let n = resp.read(&mut buf).map_err(|e| DownloadError::Network(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            file.write_all(&buf[..n])?;
-            done += n as u64;
-            if done - last_report >= 1 << 20 {
-                last_report = done;
+            let mut retryable = false;
+            let attempt = (|| {
+                let mut request = client.get(url).header(reqwest::header::ACCEPT_ENCODING, "identity");
+                if done > 0 { request = request.header(reqwest::header::RANGE, format!("bytes={done}-")); }
+                let mut resp = request.send().map_err(|e| {
+                    retryable = !e.is_builder();
+                    DownloadError::Network(e.to_string())
+                })?;
+                if cancel.load(Ordering::Relaxed) { return Err(DownloadError::Cancelled); }
+                let status = resp.status();
+                if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && done > 0 {
+                    // A stale/oversized partial cannot be used; retry once from zero.
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    hasher = Sha256::new();
+                    done = 0;
+                    total = None;
+                    progress(0, total);
+                    return Ok(false);
+                }
+                if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                    retryable = status.is_server_error() || matches!(status.as_u16(), 408 | 429);
+                    return Err(DownloadError::Network(format!("HTTP {}", status.as_u16())));
+                }
+                if resp.headers().get(reqwest::header::CONTENT_ENCODING).is_some_and(|v| v != "identity") {
+                    return Err(DownloadError::Network("unexpected Content-Encoding".into()));
+                }
+                let end = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                    let range = resp.headers().get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok()).and_then(content_range)
+                        .filter(|&(start, end, size)| start == done && end < size
+                            && resp.content_length().is_none_or(|len| len == end - start + 1))
+                        .ok_or_else(|| DownloadError::Network("invalid Content-Range for resumed download".into()))?;
+                    total = Some(range.2);
+                    Some(range.1 + 1)
+                } else {
+                    // Servers may ignore Range and return the whole file. Never append it.
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    hasher = Sha256::new();
+                    done = 0;
+                    total = resp.content_length();
+                    total
+                };
                 progress(done, total);
+                let mut last_report = done;
+                loop {
+                    if cancel.load(Ordering::Relaxed) { return Err(DownloadError::Cancelled); }
+                    let n = resp.read(&mut buf).map_err(|e| {
+                        retryable = true;
+                        DownloadError::Network(e.to_string())
+                    })?;
+                    if n == 0 { break; }
+                    if end.is_some_and(|end| n as u64 > end.saturating_sub(done)) {
+                        return Err(DownloadError::Network("response exceeds its declared range".into()));
+                    }
+                    file.write_all(&buf[..n])?;
+                    hasher.update(&buf[..n]);
+                    done += n as u64;
+                    if done - last_report >= 1 << 20 {
+                        last_report = done;
+                        progress(done, total);
+                    }
+                }
+                if end.is_some_and(|end| done != end) {
+                    retryable = true;
+                    return Err(DownloadError::Network("incomplete response".into()));
+                }
+                Ok(total.is_none_or(|size| done == size))
+            })();
+            file.sync_all()?;
+            progress(done, total);
+            if cancel.load(Ordering::Relaxed) { break Err(DownloadError::Cancelled); }
+            match attempt {
+                Ok(true) => break Ok(()),
+                Ok(false) => continue,
+                Err(_) if retryable && retries < 3 => {
+                    // Bounded exponential backoff, with cancellation checked every 100 ms.
+                    for _ in 0..(10 << retries) {
+                        if cancel.load(Ordering::Relaxed) { return Err(DownloadError::Cancelled); }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    retries += 1;
+                }
+                Err(e) => break Err(e),
             }
-        }
+        };
+        transfer?;
         file.sync_all()?;
         drop(file);
         progress(done, total);
@@ -677,10 +790,19 @@ pub fn download_verified(
         fs::rename(&part, dest)?;
         Ok(())
     })();
-    if result.is_err() {
+    if result.is_ok() || matches!(result, Err(DownloadError::Checksum)) {
         let _ = fs::remove_file(&part);
+        let _ = fs::remove_file(&identity);
     }
     result
+}
+
+/// Only a single, bounded byte range is safe to append to a saved prefix.
+fn content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let (range, size) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let (start, end, size) = (start.parse().ok()?, end.parse().ok()?, size.parse().ok()?);
+    (start <= end && end < size).then_some((start, end, size))
 }
 
 /// Unpacks what the app needs from a whisper.cpp release zip - the server and every DLL,
@@ -859,7 +981,7 @@ mod tests {
             assert!(flash_attention(m), "{} always takes the full window", m.id);
         }
     }
-    use crate::engine::testserver::serve;
+    use crate::engine::testserver::{serve, serve_raw};
 
     #[test]
     fn catalog_is_consistent() {
@@ -1007,19 +1129,372 @@ mod tests {
         assert!(!dest.exists());
     }
 
+    fn seed_partial(dest: &Path, hash: &str, bytes: &[u8]) {
+        fs::write(dest.with_extension("part"), bytes).unwrap();
+        fs::write(dest.with_extension("part.sha256"), hash).unwrap();
+    }
+
+    fn raw_download_response(status: u16, length: usize, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!("HTTP/1.1 {status} X\r\nContent-Length: {length}\r\n{headers}Connection: close\r\n\r\n").into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn assert_download_request(head: &str, offset: Option<u64>) {
+        let head = head.to_ascii_lowercase();
+        assert!(head.starts_with("get / http/1.1\r\n"), "{head}");
+        assert!(head.lines().any(|line| line == "accept-encoding: identity"), "{head}");
+        let range = offset.map(|n| format!("range: bytes={n}-"));
+        assert_eq!(head.lines().find(|line| line.starts_with("range:")), range.as_deref());
+    }
+
+    #[test]
+    fn disk_estimates_only_credit_partial_bytes_for_the_expected_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        let hash = hex(&Sha256::digest(b"model bytes"));
+        assert_eq!(partial_download_bytes(&dest, &hash), 0);
+        fs::write(dest.with_extension("part"), b"model ").unwrap();
+        assert_eq!(partial_download_bytes(&dest, &hash), 0);
+        seed_partial(&dest, &"0".repeat(64), b"model ");
+        assert_eq!(partial_download_bytes(&dest, &hash), 0);
+        seed_partial(&dest, &hash, b"model ");
+        assert_eq!(partial_download_bytes(&dest, &hash), 6);
+        fs::write(&dest, b"old model").unwrap();
+        assert_eq!(partial_download_bytes(&dest, &hash), 6);
+        fs::remove_file(dest.with_extension("part")).unwrap();
+        assert_eq!(partial_download_bytes(&dest, &hash), 0, "unverified destinations still need replacement space");
+    }
+
+    #[test]
+    fn cancellation_while_waiting_for_headers_never_truncates_saved_bytes() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        for status in [200, 416] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let server_cancel = cancel.clone();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                    head.push_str(&line);
+                }
+                assert_download_request(&head, Some(6));
+                // Cancel after the GET but before the response can trigger a destructive reset.
+                server_cancel.store(true, Ordering::Relaxed);
+                let response = raw_download_response(status, 11, "", b"model bytes");
+                let _ = reader.into_inner().write_all(&response);
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("model.bin");
+            let hash = hex(&Sha256::digest(b"model bytes"));
+            seed_partial(&dest, &hash, b"model ");
+            let result = download_verified(&url, &hash, &dest, &cancel, &mut |_, _| {});
+            server.join().unwrap();
+            assert!(matches!(result, Err(DownloadError::Cancelled)), "{status}: {result:?}");
+            assert_eq!(fs::read(dest.with_extension("part")).unwrap(), b"model ");
+            assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+            assert!(!dest.exists());
+        }
+    }
+
+    #[test]
+    fn exhausted_transient_retries_keep_the_partial_for_a_later_attempt() {
+        let hash = hex(&Sha256::digest(b"model bytes"));
+        let (url, rx) = serve_raw(vec![raw_download_response(503, 0, "", b""); 4]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        seed_partial(&dest, &hash, b"model ");
+        assert!(matches!(download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |_, _| {}), Err(DownloadError::Network(_))));
+        let requests: Vec<_> = rx.try_iter().collect();
+        assert_eq!(requests.len(), 4);
+        for request in requests { assert_download_request(&request.head, Some(6)); }
+        assert_eq!(fs::read(dest.with_extension("part")).unwrap(), b"model ");
+        assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn disconnected_download_automatically_resumes_and_reports_full_progress() {
+        let body = b"model bytes";
+        let hash = hex(&Sha256::digest(body));
+        let (url, rx) = serve_raw(vec![
+            // The peer closes after six of the eleven promised bytes.
+            raw_download_response(200, body.len(), "", &body[..6]),
+            raw_download_response(206, 5, "Content-Range: bytes 6-10/11\r\n", &body[6..]),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        let mut seen = Vec::new();
+        download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |d, t| seen.push((d, t))).unwrap();
+
+        assert_download_request(&rx.recv().unwrap().head, None);
+        assert_download_request(&rx.recv().unwrap().head, Some(6));
+        assert!(seen.contains(&(6, Some(11))), "{seen:?}");
+        assert_eq!(seen.first(), Some(&(0, Some(11))));
+        assert_eq!(seen.last(), Some(&(11, Some(11))));
+        assert!(seen.windows(2).all(|pair| pair[0].0 <= pair[1].0), "{seen:?}");
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert!(!dest.with_extension("part").exists());
+        assert!(!dest.with_extension("part.sha256").exists());
+    }
+
+    #[test]
+    fn send_and_server_failures_retry_the_saved_range() {
+        for failure in [Vec::new(), raw_download_response(503, 0, "", b"")] {
+            let body = b"model bytes";
+            let hash = hex(&Sha256::digest(body));
+            let (url, rx) = serve_raw(vec![failure, raw_download_response(206, 5, "Content-Range: bytes 6-10/11\r\n", &body[6..])]);
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("model.bin");
+            seed_partial(&dest, &hash, &body[..6]);
+
+            download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+
+            assert_download_request(&rx.recv().unwrap().head, Some(6));
+            assert_download_request(&rx.recv().unwrap().head, Some(6));
+            assert_eq!(fs::read(&dest).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn saved_download_survives_an_error_and_resumes_on_a_separate_invocation() {
+        let body = b"model bytes";
+        let hash = hex(&Sha256::digest(body));
+        let (url, rx) = serve_raw(vec![
+            raw_download_response(206, 6, "Content-Range: bytes 0-5/11\r\n", &body[..6]),
+            raw_download_response(404, 0, "", b""),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        let cancel = AtomicBool::new(false);
+        let result = download_verified(&url, &hash, &dest, &cancel, &mut |_, _| {});
+        assert!(matches!(result, Err(DownloadError::Network(_))));
+        assert_download_request(&rx.recv().unwrap().head, None);
+        assert_download_request(&rx.recv().unwrap().head, Some(6));
+        assert_eq!(fs::read(dest.with_extension("part")).unwrap(), &body[..6]);
+        assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+        assert!(!dest.exists());
+
+        // A new client and URL still use the saved bytes for the same pinned hash.
+        let (url, rx) = serve_raw(vec![raw_download_response(206, 5, "Content-Range: bytes 6-10/11\r\n", &body[6..])]);
+        let mut seen = Vec::new();
+        download_verified(&url, &hash, &dest, &cancel, &mut |d, t| seen.push((d, t))).unwrap();
+        assert_download_request(&rx.recv().unwrap().head, Some(6));
+        assert_eq!(seen.first(), Some(&(6, Some(11))));
+        assert_eq!(seen.last(), Some(&(11, Some(11))));
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert!(!dest.with_extension("part").exists());
+        assert!(!dest.with_extension("part.sha256").exists());
+    }
+
+    #[test]
+    fn an_ignored_range_restarts_instead_of_appending() {
+        let body = b"model bytes";
+        let hash = hex(&Sha256::digest(body));
+        let (url, rx) = serve_raw(vec![raw_download_response(200, body.len(), "", body)]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        seed_partial(&dest, &hash, &body[..6]);
+        let mut seen = Vec::new();
+
+        download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |d, t| seen.push((d, t))).unwrap();
+
+        assert_download_request(&rx.recv().unwrap().head, Some(6));
+        assert_eq!(seen.first(), Some(&(0, Some(11))));
+        assert_eq!(seen.last(), Some(&(11, Some(11))));
+        assert_eq!(fs::read(&dest).unwrap(), body);
+    }
+
+    #[test]
+    fn invalid_resume_ranges_preserve_the_saved_prefix() {
+        for headers in [
+            "",
+            "Content-Range: invalid\r\n",
+            "Content-Range: items 6-10/11\r\n",
+            "Content-Range: bytes 0-4/11\r\n",
+            "Content-Range: bytes 7-10/11\r\n",
+            "Content-Range: bytes 6-5/11\r\n",
+            "Content-Range: bytes 6-11/11\r\n",
+            "Content-Range: bytes 6-10/*\r\n",
+            "Content-Range: bytes 6-9/11\r\n", // Four declared bytes, but Content-Length is five.
+        ] {
+            let body = b"model bytes";
+            let hash = hex(&Sha256::digest(body));
+            let (url, rx) = serve_raw(vec![raw_download_response(206, 5, headers, &body[6..])]);
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("model.bin");
+            seed_partial(&dest, &hash, &body[..6]);
+
+            let result = download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |_, _| {});
+
+            assert!(matches!(result, Err(DownloadError::Network(_))), "{headers}: {result:?}");
+            assert_download_request(&rx.recv().unwrap().head, Some(6));
+            assert_eq!(fs::read(dest.with_extension("part")).unwrap(), &body[..6], "{headers}");
+            assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+            assert!(!dest.exists());
+        }
+    }
+
+    #[test]
+    fn encoded_responses_neither_append_nor_discard_the_saved_prefix() {
+        for (status, headers) in [
+            (200, "Content-Encoding: gzip\r\n"),
+            (206, "Content-Encoding: gzip\r\nContent-Range: bytes 6-10/11\r\n"),
+        ] {
+            let body = b"model bytes";
+            let hash = hex(&Sha256::digest(body));
+            let (url, rx) = serve_raw(vec![raw_download_response(status, 5, headers, &body[6..])]);
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("model.bin");
+            seed_partial(&dest, &hash, &body[..6]);
+
+            let result = download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |_, _| {});
+
+            assert!(matches!(result, Err(DownloadError::Network(_))), "{status}: {result:?}");
+            assert_download_request(&rx.recv().unwrap().head, Some(6));
+            assert_eq!(fs::read(dest.with_extension("part")).unwrap(), &body[..6]);
+            assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+            assert!(!dest.exists());
+        }
+    }
+
+    #[test]
+    fn an_unsatisfiable_range_discards_the_partial_and_retries_without_range() {
+        let body = b"model bytes";
+        let hash = hex(&Sha256::digest(body));
+        let (url, rx) = serve_raw(vec![
+            raw_download_response(416, 0, "Content-Range: bytes */11\r\n", b""),
+            raw_download_response(200, body.len(), "", body),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        // The right length alone must not qualify a corrupt partial for promotion.
+        seed_partial(&dest, &hash, b"wrong bytes");
+        let mut seen = Vec::new();
+
+        download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |d, t| seen.push((d, t))).unwrap();
+
+        assert_download_request(&rx.recv().unwrap().head, Some(11));
+        assert_download_request(&rx.recv().unwrap().head, None);
+        assert!(seen.contains(&(0, None)), "{seen:?}");
+        assert_eq!(seen.last(), Some(&(11, Some(11))));
+        assert_eq!(fs::read(&dest).unwrap(), body);
+    }
+
+    #[test]
+    fn a_changed_or_missing_hash_discards_stale_partial_data() {
+        for missing_identity in [false, true] {
+            let body = b"new model";
+            let hash = hex(&Sha256::digest(body));
+            let (url, rx) = serve_raw(vec![raw_download_response(200, body.len(), "", body)]);
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("model.bin");
+            fs::write(&dest, b"old model").unwrap();
+            seed_partial(&dest, &hex(&Sha256::digest(b"old model")), b"old model");
+            if missing_identity { fs::remove_file(dest.with_extension("part.sha256")).unwrap(); }
+
+            download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+
+            assert_download_request(&rx.recv().unwrap().head, None);
+            assert_eq!(fs::read(&dest).unwrap(), body);
+            assert!(!dest.with_extension("part").exists());
+            assert!(!dest.with_extension("part.sha256").exists());
+        }
+    }
+
+    #[test]
+    fn a_resumed_checksum_mismatch_removes_partial_data_but_keeps_the_installed_model() {
+        let hash = hex(&Sha256::digest(b"model bytes"));
+        let (url, rx) = serve_raw(vec![raw_download_response(206, 5, "Content-Range: bytes 6-10/11\r\n", b"wrong")]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        fs::write(&dest, b"existing model").unwrap();
+        seed_partial(&dest, &hash, b"model ");
+
+        let result = download_verified(&url, &hash, &dest, &AtomicBool::new(false), &mut |_, _| {});
+
+        assert!(matches!(result, Err(DownloadError::Checksum)));
+        assert_download_request(&rx.recv().unwrap().head, Some(6));
+        assert_eq!(fs::read(&dest).unwrap(), b"existing model");
+        assert!(!dest.with_extension("part").exists());
+        assert!(!dest.with_extension("part.sha256").exists());
+    }
+
+    #[test]
+    fn cancelling_before_or_at_resumed_progress_preserves_the_prefix() {
+        let hash = hex(&Sha256::digest(b"model bytes"));
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        seed_partial(&dest, &hash, b"model ");
+        let cancel = AtomicBool::new(true);
+        let result = download_verified("not an HTTP URL", &hash, &dest, &cancel, &mut |_, _| panic!("already cancelled"));
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert_eq!(fs::read(dest.with_extension("part")).unwrap(), b"model ");
+        assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+
+        cancel.store(false, Ordering::Relaxed);
+        let (url, rx) = serve_raw(vec![raw_download_response(206, 5, "Content-Range: bytes 6-10/11\r\n", b"bytes")]);
+        let result = download_verified(&url, &hash, &dest, &cancel, &mut |d, t| {
+            assert_eq!((d, t), (6, Some(11)));
+            cancel.store(true, Ordering::Relaxed);
+        });
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert_download_request(&rx.recv().unwrap().head, Some(6));
+        assert_eq!(fs::read(dest.with_extension("part")).unwrap(), b"model ");
+        assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_verified_destination_is_reused_without_http() {
+        let body = b"model bytes";
+        let hash = hex(&Sha256::digest(body));
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        fs::write(&dest, body).unwrap();
+        let mut seen = Vec::new();
+
+        download_verified("not an HTTP URL", &hash, &dest, &AtomicBool::new(false), &mut |d, t| seen.push((d, t))).unwrap();
+
+        assert_eq!(seen, vec![(11, Some(11))]);
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert!(!dest.with_extension("part").exists());
+        assert!(!dest.with_extension("part.sha256").exists());
+    }
+
     #[test]
     fn cancelling_a_finished_download_does_not_replace_an_existing_model() {
         let body = b"new model".to_vec();
         let hash = hex(&Sha256::digest(&body));
-        let (url, _rx) = serve(vec![(200, "application/octet-stream", body)]);
+        let (url, _rx) = serve(vec![(200, "application/octet-stream", body.clone())]);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("model.bin");
         fs::write(&dest, b"existing model").unwrap();
         let cancel = AtomicBool::new(false);
-        let result = download_verified(&url, &hash, &dest, &cancel, &mut |_, _| cancel.store(true, Ordering::Relaxed));
+        let result = download_verified(&url, &hash, &dest, &cancel, &mut |d, _| {
+            if d > 0 { cancel.store(true, Ordering::Relaxed); }
+        });
         assert!(matches!(result, Err(DownloadError::Cancelled)));
         assert_eq!(fs::read(&dest).unwrap(), b"existing model");
+        assert_eq!(fs::read(dest.with_extension("part")).unwrap(), body);
+        assert_eq!(fs::read_to_string(dest.with_extension("part.sha256")).unwrap(), hash);
+
+        cancel.store(false, Ordering::Relaxed);
+        let mut seen = Vec::new();
+        download_verified("not an HTTP URL", &hash, &dest, &cancel, &mut |d, t| seen.push((d, t))).unwrap();
+        assert_eq!(seen, vec![(9, Some(9))]);
+        assert_eq!(fs::read(&dest).unwrap(), body);
         assert!(!dest.with_extension("part").exists());
+        assert!(!dest.with_extension("part.sha256").exists());
     }
 
     #[cfg(not(target_os = "linux"))]

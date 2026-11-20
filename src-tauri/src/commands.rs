@@ -575,7 +575,7 @@ fn plan(core: &Core, kind: Kind, id: &str) -> Result<(Vec<Fetch>, Option<Install
                 // A runtime in use cannot be replaced while its server runs.
                 app.state::<Core>().whisper.stop_runtime(app, rt.id);
                 let r = local::install_runtime(&zip, &layout.runtime_dir(rt), rt);
-                let _ = std::fs::remove_file(&zip);
+                if r.is_ok() { let _ = std::fs::remove_file(&zip); }
                 r
             });
             (vec![fetch], Some(install))
@@ -606,8 +606,8 @@ fn plan(core: &Core, kind: Kind, id: &str) -> Result<(Vec<Fetch>, Option<Install
                 app.state::<Core>().llm.stop_runtime(app, rt.id);
                 let paths: Vec<&std::path::Path> = zips.iter().map(|z| z.as_path()).collect();
                 let r = local::install_llm_runtime(&paths, &layout.llm_runtime_dir(rt), rt);
-                for z in &zips {
-                    let _ = std::fs::remove_file(z);
+                if r.is_ok() {
+                    for z in &zips { let _ = std::fs::remove_file(z); }
                 }
                 r
             });
@@ -629,9 +629,17 @@ pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, selec
     let onnx_model = if kind == Kind::Model { amber_core::onnx::model(&id) } else { None };
     let (fetches, install) = if onnx_model.is_some() { (Vec::new(), None) } else { plan(&core, kind, &id)? };
     #[cfg(target_os = "linux")]
-    check_download_space(&core.paths.layout.root, onnx_model.map_or_else(
-        || fetches.iter().map(|f| f.size).sum(), |m| m.files.iter().map(|f| f.size).sum()
-    ), install.is_some() || onnx_model.is_some())?;
+    {
+        let (bytes, saved) = if let Some(model) = onnx_model {
+            let staging = amber_core::onnx::model_dir(&core.paths.layout, model).with_extension("new");
+            (model.files.iter().map(|f| f.size).sum(), model.files.iter()
+                .map(|f| local::partial_download_bytes(&staging.join(f.name), f.sha256).min(f.size)).sum())
+        } else {
+            (fetches.iter().map(|f| f.size).sum(), fetches.iter()
+                .map(|f| local::partial_download_bytes(&f.file, f.sha256).min(f.size)).sum())
+        };
+        check_download_space(&core.paths.layout.root, bytes, saved, install.is_some() || onnx_model.is_some())?;
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut downloads = core.downloads.lock().unwrap();
@@ -670,16 +678,12 @@ pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, selec
             }
             result
         };
-        let unpacks = install.is_some();
+        if result.is_ok() && cancel.load(Ordering::Relaxed) {
+            result = Err(DownloadError::Cancelled);
+        }
         if result.is_ok() {
             if let Some(install) = install {
                 result = install(&app);
-            }
-        }
-        if result.is_err() && unpacks {
-            // A runtime's archives are useless alone: an earlier one that did arrive goes too.
-            for f in &fetches {
-                let _ = std::fs::remove_file(&f.file);
             }
         }
         app.state::<Core>().downloads.lock().unwrap().remove(&key);
@@ -721,7 +725,7 @@ pub fn download(app: AppHandle, core: State<Core>, kind: Kind, id: String, selec
 }
 
 #[cfg(target_os = "linux")]
-fn check_download_space(root: &std::path::Path, bytes: u64, unpack: bool) -> Result<(), String> {
+fn check_download_space(root: &std::path::Path, bytes: u64, saved: u64, unpack: bool) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|_| "Invalid model directory.")?;
     let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -730,7 +734,7 @@ fn check_download_space(root: &std::path::Path, bytes: u64, unpack: bool) -> Res
     }
     let info = unsafe { info.assume_init() };
     let free = (info.f_bavail as u64).saturating_mul(info.f_frsize as u64);
-    let needed = bytes.saturating_mul(if unpack { 3 } else { 1 }).saturating_add(256 * 1024 * 1024);
+    let needed = bytes.saturating_mul(if unpack { 3 } else { 1 }).saturating_sub(saved).saturating_add(256 * 1024 * 1024);
     if free < needed {
         return Err(format!("Not enough disk space. This download needs about {} MiB including installation headroom; {} MiB is available.", needed / (1 << 20), free / (1 << 20)));
     }

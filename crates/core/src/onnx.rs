@@ -209,9 +209,8 @@ pub fn download(layout: &Layout, model: &Model, cancel: &AtomicBool, progress: &
     if needs_runtime {
         let archive = layout.root.join("downloads").join("onnxruntime-1.24.4.nupkg");
         local::download_verified(RUNTIME_URL, RUNTIME_SHA256, &archive, cancel, &mut |done, _| progress(done, Some(total)))?;
-        let result = install_runtime(&archive, layout, cancel);
+        install_runtime(&archive, layout, cancel)?;
         let _ = fs::remove_file(archive);
-        result?;
     }
     if cancel.load(Ordering::Relaxed) { return Err(DownloadError::Cancelled); }
     if model_verified {
@@ -231,9 +230,9 @@ pub fn setup_runtime(layout: &Layout, cancel: &AtomicBool, progress: &mut dyn Fn
     if !runtime_supported() { return Err(DownloadError::Package("ONNX models currently require x64 Windows or x64 GNU/Linux.".into())); }
     let archive = layout.root.join("downloads").join("onnxruntime-1.24.4.nupkg");
     local::download_verified(RUNTIME_URL, RUNTIME_SHA256, &archive, cancel, progress)?;
-    let result = install_runtime(&archive, layout, cancel);
+    install_runtime(&archive, layout, cancel)?;
     let _ = fs::remove_file(archive);
-    result
+    Ok(())
 }
 
 pub const RUNTIME_VERSION: &str = "1.24.4";
@@ -335,10 +334,9 @@ fn download_with(
     }
     let dest = model_dir(layout, model);
     let staging = dest.with_extension("new");
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
     fs::create_dir_all(&staging)?;
+    let marker = staging.join(".installed");
+    if marker.exists() { fs::remove_file(&marker)?; }
     let result = (|| {
         let total = model.files.iter().map(|f| f.size).sum();
         let mut done = 0;
@@ -346,21 +344,29 @@ fn download_with(
             if cancel.load(Ordering::Relaxed) {
                 return Err(DownloadError::Cancelled);
             }
-            fetch(file, &staging.join(file.name), &mut |bytes, _| progress(done + bytes, Some(total)))?;
+            let path = staging.join(file.name);
+            let complete = fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == file.size)
+                && local::sha256_file(&path)? == file.sha256;
+            if !complete {
+                // Only discard invalid completed files; the downloader owns resumable partials.
+                if path.exists() { fs::remove_file(&path)?; }
+                fetch(file, &path, &mut |bytes, _| progress(done + bytes, Some(total)))?;
+            }
             done += file.size;
+            progress(done, Some(total));
         }
         // Recheck the complete set, including lengths, before writing the installation marker.
         verify_files(&staging, model)?;
         if cancel.load(Ordering::Relaxed) {
             return Err(DownloadError::Cancelled);
         }
-        fs::write(staging.join(".installed"), model.marker())?;
+        fs::write(&marker, model.marker())?;
         local::replace_dir(&staging, &dest)?;
         progress(total, Some(total));
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(staging);
+        let _ = fs::remove_file(marker);
     }
     result
 }
@@ -416,13 +422,16 @@ mod tests {
         }).unwrap();
         assert!(installed(&layout, &model));
         verify(&layout, &model).unwrap();
-        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |_, path, _| {
-            fs::write(path, b"bad")?;
+        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            fs::write(path, if file.name == "one.onnx" { b"abc" } else { b"bad" })?;
             Ok(())
         });
         assert!(matches!(result, Err(DownloadError::Checksum)));
         verify(&layout, &model).unwrap();
-        assert!(!dest.with_extension("new").exists());
+        let staging = dest.with_extension("new");
+        assert_eq!(fs::read(staging.join("one.onnx")).unwrap(), b"abc");
+        assert_eq!(fs::read(staging.join("two.json")).unwrap(), b"bad");
+        assert!(!staging.join(".installed").exists());
         fs::write(dest.join("one.onnx"), b"bad").unwrap();
         assert!(installed(&layout, &model), "status only checks lengths");
         assert!(matches!(verify(&layout, &model), Err(DownloadError::Checksum)));
@@ -431,19 +440,169 @@ mod tests {
     }
 
     #[test]
+    fn failed_second_file_reuses_completed_and_partial_staging_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout { root: dir.path().into() };
+        let model = fixture();
+        let cancel = AtomicBool::new(false);
+        let dest = model_dir(&layout, &model);
+        let staging = dest.with_extension("new");
+        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, report| {
+            if file.name == "two.json" {
+                fs::write(path.with_extension("part"), b"a")?;
+                report(1, Some(file.size));
+                return Err(DownloadError::Network("connection lost".into()));
+            }
+            fs::write(path, b"abc")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(DownloadError::Network(_))));
+        assert!(!dest.exists());
+        assert_eq!(fs::read(staging.join("one.onnx")).unwrap(), b"abc");
+        assert_eq!(fs::read(staging.join("two.part")).unwrap(), b"a");
+        assert!(!staging.join(".installed").exists());
+
+        let mut fetched = Vec::new();
+        let mut progress = Vec::new();
+        download_with(&layout, &model, &cancel, &mut |done, total| progress.push((done, total)), &mut |file, path, report| {
+            fetched.push(file.name);
+            assert_eq!(fs::read(path.with_extension("part"))?, b"a");
+            report(1, Some(file.size));
+            fs::write(path, b"abc")?;
+            fs::remove_file(path.with_extension("part"))?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(fetched, ["two.json"]);
+        assert_eq!(progress.first(), Some(&(3, Some(6))));
+        assert!(progress.contains(&(4, Some(6))));
+        assert_eq!(progress.last(), Some(&(6, Some(6))));
+        verify(&layout, &model).unwrap();
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn file_checksum_failure_keeps_completed_staging_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout { root: dir.path().into() };
+        let model = fixture();
+        let cancel = AtomicBool::new(false);
+        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            if file.name == "two.json" { return Err(DownloadError::Checksum); }
+            fs::write(path, b"abc")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(DownloadError::Checksum)));
+        assert!(!installed(&layout, &model));
+        download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            assert_eq!(file.name, "two.json");
+            fs::write(path, b"abc")?;
+            Ok(())
+        }).unwrap();
+        verify(&layout, &model).unwrap();
+    }
+
+    #[test]
+    fn corrupt_staged_files_are_refetched_and_stale_marker_is_removed() {
+        for bad in [b"bad".as_slice(), b"ab", b"abcd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = Layout { root: dir.path().into() };
+            let model = fixture();
+            let staging = model_dir(&layout, &model).with_extension("new");
+            fs::create_dir_all(&staging).unwrap();
+            fs::write(staging.join(".installed"), model.marker()).unwrap();
+            fs::write(staging.join("one.onnx"), bad).unwrap();
+            fs::write(staging.join("one.part"), b"a").unwrap();
+            fs::write(staging.join("two.json"), b"abc").unwrap();
+            let mut fetched = Vec::new();
+            download_with(&layout, &model, &AtomicBool::new(false), &mut |_, _| {}, &mut |file, path, _| {
+                fetched.push(file.name);
+                assert!(!staging.join(".installed").exists());
+                assert!(!path.exists());
+                assert_eq!(fs::read(path.with_extension("part"))?, b"a");
+                fs::write(path, b"abc")?;
+                fs::remove_file(path.with_extension("part"))?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(fetched, ["one.onnx"]);
+            verify(&layout, &model).unwrap();
+        }
+    }
+
+    #[test]
+    fn final_checksum_rechecks_reused_files_before_replacing_existing_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout { root: dir.path().into() };
+        let model = fixture();
+        let cancel = AtomicBool::new(false);
+        download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |_, path, _| {
+            fs::write(path, b"abc")?;
+            Ok(())
+        }).unwrap();
+        let staging = model_dir(&layout, &model).with_extension("new");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("one.onnx"), b"abc").unwrap();
+        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            assert_eq!(file.name, "two.json");
+            fs::write(path, b"abc")?;
+            fs::write(staging.join("one.onnx"), b"bad")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(DownloadError::Checksum)));
+        verify(&layout, &model).unwrap();
+        assert_eq!(fs::read(staging.join("two.json")).unwrap(), b"abc");
+        assert!(!staging.join(".installed").exists());
+        download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            assert_eq!(file.name, "one.onnx");
+            fs::write(path, b"abc")?;
+            Ok(())
+        }).unwrap();
+        verify(&layout, &model).unwrap();
+    }
+
+    #[test]
     fn cancellation_never_installs_a_partial_set() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout { root: dir.path().into() };
         let model = fixture();
         let cancel = AtomicBool::new(false);
-        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |_, path, _| {
+        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            if file.name == "two.json" {
+                fs::write(path.with_extension("part"), b"a")?;
+                cancel.store(true, Ordering::Relaxed);
+                return Err(DownloadError::Cancelled);
+            }
             fs::write(path, b"abc")?;
-            cancel.store(true, Ordering::Relaxed);
             Ok(())
         });
         assert!(matches!(result, Err(DownloadError::Cancelled)));
         let dest = model_dir(&layout, &model);
-        assert!(!dest.exists() && !dest.with_extension("new").exists());
+        let staging = dest.with_extension("new");
+        assert!(!dest.exists());
+        assert_eq!(fs::read(staging.join("one.onnx")).unwrap(), b"abc");
+        assert!(!staging.join("two.json").exists());
+        assert_eq!(fs::read(staging.join("two.part")).unwrap(), b"a");
+        assert!(!staging.join(".installed").exists());
+        assert!(matches!(download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |_, _, _| {
+            panic!("cancelled download must not fetch");
+        }), Err(DownloadError::Cancelled)));
+
+        cancel.store(false, Ordering::Relaxed);
+        let result = download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |file, path, _| {
+            assert_eq!(file.name, "two.json");
+            assert_eq!(fs::read(path.with_extension("part"))?, b"a");
+            fs::write(path, b"abc")?;
+            fs::remove_file(path.with_extension("part"))?;
+            cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(!dest.exists() && !staging.join(".installed").exists());
+        assert_eq!(fs::read(staging.join("two.json")).unwrap(), b"abc");
+        cancel.store(false, Ordering::Relaxed);
+        download_with(&layout, &model, &cancel, &mut |_, _| {}, &mut |_, _, _| {
+            panic!("completed staged files must be reused");
+        }).unwrap();
+        verify(&layout, &model).unwrap();
     }
 
     #[test]

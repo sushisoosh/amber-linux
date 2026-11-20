@@ -113,12 +113,15 @@ export function DownloadItem({
           {measured !== undefined && ` · ${(measured / 1000).toFixed(1)} s for 10 s of speech here`}
           {warning && ` · ${warning}`}
         </div>
+        {!included && !item.installed && !item.imported && <div className="hint">
+          Interrupted downloads keep their progress. Download again to resume, even after restarting Amber.
+        </div>}
         {errors[key] && <div className="note error">{errors[key]}</div>}
       </div>
       {included ? <span className="tag ok">built-in</span> : running ? (
         <>
           <Progress done={running.done} total={running.total} />
-          <button className="btn" onClick={() => invoke("cancel_download", { kind, id: item.id })}>
+          <button className="btn" title="Stop downloading and keep progress for later" onClick={() => invoke("cancel_download", { kind, id: item.id })}>
             Cancel
           </button>
         </>
