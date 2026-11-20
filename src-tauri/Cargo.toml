@@ -39,7 +39,7 @@ amber-inference = { path = "../crates/inference" }
 ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 gtk = "0.18"
-x11rb = { version = "0.13", features = ["xtest"] }
+x11rb = { version = "0.13", features = ["xtest", "xkb"] }
 secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }
 chacha20poly1305 = "0.10"
 getrandom = "0.2"

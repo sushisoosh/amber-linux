@@ -726,7 +726,7 @@ mod x11 {
         AtomEnum, ConnectionExt, CreateWindowAux, EventMask, MapState, PropMode, SelectionNotifyEvent, WindowClass, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
         SELECTION_NOTIFY_EVENT,
     };
-    use x11rb::protocol::{xtest::ConnectionExt as _, Event};
+    use x11rb::protocol::{xkb::{self, ConnectionExt as _}, xtest::ConnectionExt as _, Event};
     use x11rb::rust_connection::RustConnection;
     use x11rb::wrapper::ConnectionExt as _;
 
@@ -849,6 +849,63 @@ mod x11 {
         Err("Cannot establish X11 target ancestry".into())
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct PasteKeyboard {
+        min: u8,
+        group: u8,
+        keys: Vec<amber_core::insertion::X11Key>,
+        types: Vec<amber_core::insertion::X11KeyType>,
+        modifiers: Vec<u8>,
+    }
+
+    fn paste_keyboard_group(conn: &RustConnection) -> Result<u8, String> {
+        let state = conn.xkb_get_state(u16::from(xkb::ID::USE_CORE_KBD)).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
+        if [state.mods, state.base_mods, state.latched_mods, state.locked_mods, state.lookup_mods].iter().any(|&m| u16::from(m) != 0) {
+            return Err("Active, latched or locked keyboard modifiers require manual paste. Nothing was pasted.".into());
+        }
+        if state.base_group != 0 || state.latched_group != 0 {
+            return Err("A temporary keyboard layout switch is active. Release it before pasting.".into());
+        }
+        Ok(state.group.into())
+    }
+
+    fn paste_keyboard(conn: &RustConnection) -> Result<PasteKeyboard, String> {
+        let group = paste_keyboard_group(conn)?;
+        let device = u16::from(xkb::ID::USE_CORE_KBD);
+        let controls = conn.xkb_get_controls(device).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
+        if u16::from(controls.internal_mods_mask) & 4 != 0
+            || u32::from(controls.enabled_controls & (xkb::BoolCtrl::SLOW_KEYS | xkb::BoolCtrl::BOUNCE_KEYS | xkb::BoolCtrl::STICKY_KEYS)) != 0
+        {
+            return Err("Keyboard accessibility controls require manual paste; Amber will not change them.".into());
+        }
+        let map = conn.xkb_get_map(
+            device, xkb::MapPart::KEY_TYPES | xkb::MapPart::KEY_SYMS, xkb::MapPart::default(),
+            0, 0, 0, 0, 0, 0, 0, 0, xkb::VMod::default(), 0, 0, 0, 0, 0, 0,
+        ).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
+        let types = map.map.types_rtrn.ok_or("XKB key types are unavailable")?;
+        let keys = map.map.syms_rtrn.ok_or("XKB key symbols are unavailable")?;
+        if map.first_type != 0 || types.len() != usize::from(map.n_types) || keys.len() != usize::from(map.n_key_syms) {
+            return Err("The XKB keyboard mapping is incomplete; use manual paste".into());
+        }
+        let types = types.into_iter().map(|kind| {
+            if kind.has_preserve && kind.preserve.len() != kind.map.len() {
+                return Err("XKB modifier preservation data is incomplete".to_owned());
+            }
+            Ok(amber_core::insertion::X11KeyType {
+                modifiers: u16::from(kind.mods_mask) as u8,
+                num_levels: kind.num_levels,
+                levels: kind.map.iter().enumerate().filter(|(_, entry)| entry.active).map(|(i, entry)| {
+                    (u16::from(entry.mods_mask) as u8, entry.level, if kind.has_preserve { u16::from(kind.preserve[i].mask) as u8 } else { 0 })
+                }).collect(),
+            })
+        }).collect::<Result<_, String>>()?;
+        let keys = keys.into_iter().map(|key| amber_core::insertion::X11Key {
+            group_info: key.group_info, width: key.width, types: key.kt_index, symbols: key.syms,
+        }).collect();
+        let modifiers = conn.get_modifier_mapping().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.keycodes;
+        Ok(PasteKeyboard { min: map.first_key_sym, group, keys, types, modifiers })
+    }
+
     /// Explicitly requested or opted-in delivery only. No foreground switching, automatic
     /// retry, synthetic Enter, clipboard restoration, or root/input helper.
     pub fn paste_explicit(text: &str, target: X11Target, any_window: bool) -> Result<Submission, String> {
@@ -866,25 +923,18 @@ mod x11 {
         }
         let class = paste_program(&conn, target, text, any_window)?;
         conn.xtest_get_version(2, 2).map_err(|e| e.to_string())?.reply().map_err(|e| format!("XTest unavailable: {e}"))?;
-        let setup = conn.setup();
-        let mapping = conn
-            .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
-            .map_err(|e| e.to_string())?
-            .reply()
-            .map_err(|e| e.to_string())?;
-        let width = usize::from(mapping.keysyms_per_keycode);
-        if width == 0 {
-            return Err("The keyboard mapping is unavailable".into());
+        if !conn.xkb_use_extension(1, 0).map_err(|e| e.to_string())?.reply().map_err(|e| format!("XKB unavailable: {e}"))?.supported {
+            return Err("XKB keyboard lookup is unavailable; use manual paste".into());
         }
-        let modifiers = conn.get_modifier_mapping().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
-        let (control, v) = amber_core::insertion::ctrl_v_keycodes(setup.min_keycode, width, &mapping.keysyms, &modifiers.keycodes)
-            .ok_or("No unambiguous Ctrl+V keyboard/modifier mapping; use manual paste")?;
         if conn.query_keymap().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.keys.iter().any(|&k| k != 0) {
             return Err("Release all keys before explicit paste. Nothing was pasted.".into());
         }
         if u16::from(conn.query_pointer(target.root).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.mask) & 0xff != 0 {
             return Err("Active or locked keyboard modifiers require manual paste. Nothing was pasted.".into());
         }
+        let keyboard = paste_keyboard(&conn)?;
+        let (control, v) = amber_core::insertion::ctrl_v_keycodes(keyboard.min, &keyboard.keys, &keyboard.types, keyboard.group, &keyboard.modifiers)
+            .ok_or("No Ctrl+V keyboard/modifier mapping in the active XKB layout; use manual paste")?;
         let (owner, selection) = match clipboard {
             Some(owner) => owner,
             None => own_clipboard_guarded(text, allowed)?,
@@ -902,17 +952,8 @@ mod x11 {
             if paste_program(&conn, target, text, any_window)? != class {
                 return Err("The target application or window type changed. No paste was sent.".into());
             }
-            let current = conn
-                .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
-                .map_err(|e| e.to_string())?
-                .reply()
-                .map_err(|e| e.to_string())?;
-            let current_modifiers = conn.get_modifier_mapping().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
-            if current.keysyms_per_keycode != mapping.keysyms_per_keycode
-                || current.keysyms != mapping.keysyms
-                || current_modifiers.keycodes != modifiers.keycodes
-            {
-                return Err("The keyboard mapping changed. The result is on the clipboard, but no paste was sent.".into());
+            if paste_keyboard(&conn)? != keyboard {
+                return Err("The keyboard mapping or active layout changed. The result is on the clipboard, but no paste was sent.".into());
             }
             if conn.get_selection_owner(selection).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.owner != owner {
                 return Err("The clipboard changed. No paste was sent and the newer clipboard was not overwritten.".into());
@@ -925,6 +966,10 @@ mod x11 {
             }
             if session_is_blocked() || !allowed() {
                 return Err("Delivery cancelled or consent revoked. No paste was sent.".into());
+            }
+            // A server grab stops other clients, not physical keyboard/layout changes.
+            if paste_keyboard_group(&conn)? != keyboard.group {
+                return Err("The active keyboard layout changed. No paste was sent.".into());
             }
             let mut failure = None;
             for (event, key) in [(KEY_PRESS_EVENT, control), (KEY_PRESS_EVENT, v), (KEY_RELEASE_EVENT, v), (KEY_RELEASE_EVENT, control)] {
@@ -1043,6 +1088,7 @@ mod x11 {
         use std::os::unix::fs::MetadataExt;
         use std::time::Instant;
         use x11rb::protocol::xproto::{GetPropertyReply, InputFocus, KeyButMask, MappingStatus};
+        use x11rb::x11_utils::Serialize;
 
         fn own_clipboard(text: &str) -> Result<(u32, u32), String> {
             own_clipboard_guarded(text, &|| true)
@@ -1191,6 +1237,115 @@ mod x11 {
 
         fn key(conn: &RustConnection, root: u32, code: u8, down: bool) {
             conn.xtest_fake_input(if down { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT }, code, 0, root, 0, 0, 0).unwrap().check().unwrap();
+        }
+
+        struct IsolatedKeyboard {
+            conn: RustConnection,
+            root: u32,
+            display: String,
+            auth: std::ffi::OsString,
+        }
+
+        impl IsolatedKeyboard {
+            fn new() -> Self {
+                let (conn, root) = isolated();
+                assert!(conn.xkb_use_extension(1, 0).unwrap().reply().unwrap().supported);
+                conn.xkb_select_events(
+                    xkb::ID::USE_CORE_KBD.into(), 0u16.into(),
+                    xkb::EventType::NEW_KEYBOARD_NOTIFY | xkb::EventType::MAP_NOTIFY | xkb::EventType::STATE_NOTIFY,
+                    0xffu16.into(), 0xffu16.into(), &xkb::SelectEventsAux::default(),
+                ).unwrap().check().unwrap();
+                Self {
+                    conn, root,
+                    display: std::env::var("AMBER_X11_TEST_DISPLAY").unwrap(),
+                    auth: std::env::var_os("XAUTHORITY").unwrap(),
+                }
+            }
+
+            fn layout(&self, layout: &str, variant: &str) -> Result<(), String> {
+                // Only this guard, constructed after isolated(), can launch the map editor.
+                let output = std::process::Command::new("setxkbmap")
+                    .env_clear()
+                    .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+                    .env("DISPLAY", &self.display).env("XAUTHORITY", &self.auth)
+                    .args(["-display", &self.display, "-rules", "evdev", "-model", "pc105", "-layout", layout, "-variant", variant, "-option", ""])
+                    .output().map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    return Err(format!("setxkbmap failed: {}", String::from_utf8_lossy(&output.stderr)));
+                }
+                Ok(())
+            }
+
+            fn group(&self, group: u8) -> Result<(), String> {
+                self.conn.xkb_latch_lock_state(
+                    xkb::ID::USE_CORE_KBD.into(), 0xffu8.into(), 0u8.into(), true, group.into(), 0xffu8.into(), true, 0,
+                ).map_err(|e| e.to_string())?.check().map_err(|e| e.to_string())
+            }
+
+            fn map(&self) -> xkb::GetMapReply {
+                let mut map = self.conn.xkb_get_map(
+                    xkb::ID::USE_CORE_KBD.into(), 0xffu16.into(), 0u16.into(),
+                    0, 0, 0, 0, 0, 0, 0, 0, 0u16.into(), 0, 0, 0, 0, 0, 0,
+                ).unwrap().reply().unwrap();
+                map.sequence = 0;
+                map
+            }
+
+            fn state(&self, group: u8) -> [u8; 32] {
+                let mut state = self.conn.xkb_get_state(xkb::ID::USE_CORE_KBD.into()).unwrap().reply().unwrap();
+                assert_eq!((u8::from(state.group), u8::from(state.locked_group), state.base_group, state.latched_group), (group, group, 0, 0));
+                for modifiers in [state.mods, state.base_mods, state.latched_mods, state.locked_mods, state.lookup_mods] {
+                    assert_eq!(u16::from(modifiers), 0, "Paste must not leave active, locked or latched modifiers");
+                }
+                assert!(self.conn.query_keymap().unwrap().reply().unwrap().keys.iter().all(|&k| k == 0));
+                assert_eq!(u16::from(self.conn.query_pointer(self.root).unwrap().reply().unwrap().mask) & 0xff, 0);
+                state.sequence = 0;
+                state.serialize()
+            }
+
+            fn paste_events(&self) -> Vec<(u8, u8, u32, u16)> {
+                self.conn.get_input_focus().unwrap().reply().unwrap();
+                let mut keys = Vec::new();
+                while let Some(event) = self.conn.poll_for_event().unwrap() {
+                    match event {
+                        Event::KeyPress(e) => keys.push((KEY_PRESS_EVENT, e.detail, e.event, e.state.into())),
+                        Event::KeyRelease(e) => keys.push((KEY_RELEASE_EVENT, e.detail, e.event, e.state.into())),
+                        Event::MappingNotify(_) | Event::XkbMapNotify(_) | Event::XkbNewKeyboardNotify(_) => panic!("Paste must never remap the keyboard"),
+                        Event::XkbStateNotify(e) => {
+                            let groups = xkb::StatePart::GROUP_STATE | xkb::StatePart::GROUP_BASE | xkb::StatePart::GROUP_LATCH | xkb::StatePart::GROUP_LOCK;
+                            assert_eq!(u16::from(e.changed & groups), 0, "Paste must never switch groups, even temporarily");
+                        }
+                        _ => {}
+                    }
+                }
+                keys
+            }
+        }
+
+        impl Drop for IsolatedKeyboard {
+            fn drop(&mut self) {
+                // A failed key-release assertion must not poison later isolated tests.
+                let release = (|| -> Result<(), String> {
+                    let held = self.conn.query_keymap().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.keys;
+                    for code in self.conn.setup().min_keycode..=self.conn.setup().max_keycode {
+                        if held[usize::from(code) / 8] & (1 << (code % 8)) != 0 {
+                            self.conn.xtest_fake_input(KEY_RELEASE_EVENT, code, 0, self.root, 0, 0, 0)
+                                .map_err(|e| e.to_string())?.check().map_err(|e| e.to_string())?;
+                        }
+                    }
+                    Ok(())
+                })();
+                // Run both resets even during unwinding, without a second panic.
+                let layout = self.layout("us", "");
+                let group = self.group(0);
+                if let Err(error) = release.and(layout).and(group) {
+                    if std::thread::panicking() {
+                        eprintln!("Could not reset isolated X11 keyboard: {error}");
+                    } else {
+                        panic!("Could not reset isolated X11 keyboard: {error}");
+                    }
+                }
+            }
         }
 
         // Query the server's actual bounding/input shapes without enabling another runtime
@@ -1503,6 +1658,80 @@ mod x11 {
             assert!(key_events(&conn).is_empty());
             assert_eq!(conversion(&conn, target.window, utf8, utf8).unwrap().value, b"stale completion target");
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn colemak_altgr_and_active_groups_paste_without_remapping() {
+            let keyboard = IsolatedKeyboard::new();
+            let conn = &keyboard.conn;
+            let target = editor(conn, keyboard.root);
+            for (layout, variant, group, v) in [("us", "colemak", 0, 55), ("us,us", "colemak,dvorak", 0, 55), ("us,us", "colemak,dvorak", 1, 60)] {
+                keyboard.layout(layout, variant).unwrap();
+                keyboard.group(group).unwrap();
+                assert_eq!(keycode(conn, 0xffe3), 37);
+                assert_eq!(keycode(conn, 0xffe4), 105);
+                if layout == "us" {
+                    let core = conn.get_keyboard_mapping(55, 1).unwrap().reply().unwrap();
+                    assert_eq!(&core.keysyms[..2], &[0x76, 0x56]);
+                    assert!(core.keysyms.contains(&0x13bd) && core.keysyms.contains(&0x13bc), "Real Colemak V must include AltGr oe/OE: {:?}", core.keysyms);
+                }
+                let map = keyboard.map();
+                let symbols = map.map.syms_rtrn.as_ref().unwrap();
+                let active = &symbols[usize::from(v - map.first_key_sym)];
+                assert_eq!(active.syms[usize::from(group) * usize::from(active.width)], 0x76);
+                if group == 1 {
+                    let inactive = &symbols[usize::from(55 - map.first_key_sym)];
+                    assert_eq!(inactive.syms[usize::from(inactive.width)], 0x6b, "Colemak's V key is K in Dvorak");
+                }
+                let before = (map.serialize(), keyboard.state(group));
+                key_events(conn); // Discard only fixture setup notifications, before paste.
+                let result = paste_explicit("Colemak and active layout regression", target, true).unwrap();
+                assert!(result.submitted && !result.confirmed);
+                let group_mask = u16::from(group) << 13;
+                let control_mask = group_mask | u16::from(KeyButMask::CONTROL);
+                assert_eq!(keyboard.paste_events(), [
+                    (KEY_PRESS_EVENT, 37, target.focus, group_mask),
+                    (KEY_PRESS_EVENT, v, target.focus, control_mask),
+                    (KEY_RELEASE_EVENT, v, target.focus, control_mask),
+                    (KEY_RELEASE_EVENT, 37, target.focus, control_mask),
+                ]);
+                assert_eq!((keyboard.map().serialize(), keyboard.state(group)), before, "Paste must preserve the entire XKB map and state");
+                assert_eq!(remember_target(), Some(target));
+            }
+            conn.destroy_window(target.window).unwrap().check().unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn active_group_change_before_paste_sends_nothing_and_is_not_restored() {
+            let keyboard = IsolatedKeyboard::new();
+            let conn = &keyboard.conn;
+            keyboard.layout("us,us", "colemak,dvorak").unwrap();
+            keyboard.group(0).unwrap();
+            let target = editor(conn, keyboard.root);
+            keyboard.state(0);
+            let before = keyboard.map().serialize();
+            let switched = std::cell::Cell::new(None);
+            let checks = std::cell::Cell::new(0);
+            key_events(conn);
+            let error = paste_copied("Active group changed during publication", target, true, None, &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    // Roundtrip only before the server grab, at clipboard publication.
+                    keyboard.group(1).unwrap();
+                    switched.set(Some(keyboard.state(1)));
+                }
+                true
+            }).unwrap_err();
+            assert!(checks.get() >= 2, "The regression must reach clipboard publication: {error}");
+            assert!(error.contains("changed"), "Expected a final keyboard race rejection: {error}");
+            assert!(key_events(conn).is_empty(), "A group race must not submit any key events");
+            assert_eq!(keyboard.state(1), switched.get().unwrap(), "Never undo the user's group switch");
+            assert_eq!(keyboard.map().serialize(), before, "A group race must not remap the keyboard");
+            let utf8 = atom(conn, "UTF8_STRING").unwrap();
+            assert_eq!(conversion(conn, target.window, utf8, utf8).unwrap().value, b"Active group changed during publication");
+            conn.destroy_window(target.window).unwrap().check().unwrap();
         }
 
         #[test]

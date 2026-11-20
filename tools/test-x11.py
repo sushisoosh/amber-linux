@@ -2,8 +2,8 @@
 """Run native tests or an application smoke test on authenticated, disposable Xvfb+i3.
 
 Requires the normal Linux build dependencies plus Python 3, Xvfb, xauth,
-xdpyinfo, i3 and i3-msg. Native mode tests GTK window hints without WebKit,
-a user bus or audio.
+xdpyinfo, i3 and i3-msg. Native mode also requires setxkbmap and tests GTK
+window hints and real keyboard layouts without WebKit, a user bus or audio.
 Run from any directory: python3 tools/test-x11.py
 Use --app /absolute/path/to/amber to test a built application without running Cargo;
 this mode also requires dbus-run-session and uses a private, activation-free bus.
@@ -144,7 +144,8 @@ def main():
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
         raise OSError(ctypes.get_errno(), "Could not become a child subreaper")
-    for tool in ("Xvfb", "xauth", "xdpyinfo", "i3", "i3-msg", "dbus-run-session" if args.app else "cargo"):
+    tools = ("Xvfb", "xauth", "xdpyinfo", "i3", "i3-msg") + (("dbus-run-session",) if args.app else ("cargo", "setxkbmap"))
+    for tool in tools:
         if shutil.which(tool) is None:
             raise RuntimeError(f"Required executable is missing: {tool}")
     repo = Path(__file__).resolve().parent.parent
