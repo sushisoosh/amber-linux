@@ -239,7 +239,7 @@ pub fn insert_last_result(app: &AppHandle) {
             inner.phase = Phase::Inserting;
         }
         announce(&app, Phase::Inserting, None);
-        let message = match insert::paste_explicit(&result.text, target, core.settings().insert.paste_into_any_window) {
+        let message = match insert::paste_explicit(&result.text, target, &core.settings().insert) {
             Ok(_) => "Paste submitted. Check the destination; insertion cannot be verified automatically.".into(),
             Err(e) => format!("Paste was not confirmed: {e} The result is still in the recorder."),
         };
@@ -766,7 +766,7 @@ fn run(
             announce(app, Phase::Inserting, None);
             result.message = match insert::deliver(&result.text, &core.settings().insert, target, cancel) {
                 Ok(Outcome::OnClipboard(message)) => message,
-                Ok(_) => "Ctrl+V submitted to the selected destination. Check the destination before pasting again; insertion cannot be verified. The clipboard was replaced.".into(),
+                Ok(_) => "Paste shortcut submitted to the selected destination. Check the destination before pasting again; insertion cannot be verified. The clipboard was replaced.".into(),
                 Err(e) => format!("Paste was not confirmed: {e} The result is still available here. Check the destination before copying or trying again."),
             };
         }

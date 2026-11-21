@@ -49,7 +49,7 @@ export function HotkeysPage({ s, save, ov, desktop, go }: PageProps) {
         <Section title="Custom desktop shortcuts">
           <Row label="Start / stop recording" hint={<>Add a desktop or i3 shortcut for <code>amber-dictation --toggle</code>. Press once to start, again to stop. This fallback is toggle-only. Do not assign the same binding in both i3 and Amber.</>} />
           <Row label="Cancel dictation" hint={<>Assign a second shortcut to <code>amber-dictation --cancel</code>. Cancellation stops dictation and microphone testing, not a previously completed result.</>} />
-          <Row label="Optional explicit X11 paste" hint={<>Assign <code>amber-dictation --insert-last</code> to a desktop shortcut. Review the result and focus its destination before invoking. It captures the currently focused destination and respects Paste into any window, even with completion off. Only single-line, control-free text; focus must stay stable. Amber sends Ctrl+V only, never Enter or a focus switch. Editable fields and paste acceptance cannot be verified. Terminals may need another shortcut; Wayland requires Copy and manual paste.</>} />
+          <Row label="Optional explicit X11 paste" hint={<>Assign <code>amber-dictation --insert-last</code> to a desktop shortcut. Review the result and focus its destination before invoking. It captures the currently focused destination and respects Paste into any window, even with completion off. Only single-line, control-free text; focus must stay stable. Amber sends the paste shortcut configured in Delivery, never Enter or a focus switch. Choose the binding your target application actually uses; the same binding applies to all targets and completion paste. Editable fields and paste acceptance cannot be verified. Wayland requires Copy and manual paste.</>} />
           <Row label="If a shortcut is denied or unavailable" hint="Keep the recorder window available. Portal support and permissions vary by desktop version; a tray icon or extension is not required." />
         </Section>
         <DesktopDiagnostics desktop={desktop} />
@@ -59,6 +59,12 @@ export function HotkeysPage({ s, save, ov, desktop, go }: PageProps) {
 }
 
 const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "OSLeft", "OSRight"]);
+export const DEFAULT_PASTE_SHORTCUT = "Ctrl+KeyV";
+const PASTE_KEYS = new Set(["Insert", "Home", "End", "PageUp", "PageDown", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space", "Tab", "Backspace", "Delete"]);
+const PUNCTUATION: Record<string, string> = {
+  ";": "Semicolon", "=": "Equal", ",": "Comma", "-": "Minus", ".": "Period", "/": "Slash",
+  "`": "Backquote", "[": "BracketLeft", "\\": "Backslash", "]": "BracketRight", "'": "Quote",
+};
 
 /** Windows' own key codes of the letter, digit and punctuation keys, as the hotkey library
  *  names them - it turns those names back into the same codes. Not e.code: that is the key's
@@ -76,13 +82,28 @@ function keyName(e: KeyboardEvent): string {
 }
 
 /** Turns a key press into Tauri's accelerator syntax: "Ctrl+Alt+Space", "Ctrl+Shift+KeyD". */
-export function accelerator(e: KeyboardEvent): string | null {
+export function accelerator(e: KeyboardEvent, paste = false): string | null {
   if (MODIFIER_CODES.has(e.code)) return null;
   const mods: string[] = [];
   if (e.ctrlKey) mods.push("Ctrl");
   if (e.altKey) mods.push("Alt");
   if (e.shiftKey) mods.push("Shift");
   if (e.metaKey) mods.push("Super");
+  if (paste) {
+    if (e.isComposing || e.getModifierState?.("AltGraph") || /^(Enter|Return|NumpadEnter)$/.test(e.key) || /^(Enter|Return|NumpadEnter)$/.test(e.code)) return null;
+    // Use the logical letter, not its physical position (e.g. V on Colemak/Dvorak).
+    const key = /^[a-z]$/i.test(e.key) ? `Key${e.key.toUpperCase()}`
+      : /^[0-9]$/.test(e.key) ? `Digit${e.key}`
+      : e.key === " " ? "Space" : PUNCTUATION[e.key] ?? e.key;
+    const fkey = /^F([1-9]|1[0-9]|2[0-4])$/.test(key);
+    const punctuation = Object.values(PUNCTUATION).includes(key);
+    // Shifted symbols do not reveal their logical base key across keyboard layouts.
+    if (e.shiftKey && (/^Digit[0-9]$/.test(key) || punctuation)) return null;
+    const typing = /^(Key[A-Z]|Digit[0-9]|Space)$/.test(key) || punctuation;
+    if (!fkey && !typing && !PASTE_KEYS.has(key)) return null;
+    if (!fkey && mods.length === 0) return null;
+    return [...mods, key].join("+");
+  }
   const fkey = /^F([1-9]|1[0-9]|2[0-4])$/.test(e.code);
   // Function keys may stand alone; anything else needs Ctrl, Alt or Win - with Shift alone,
   // Shift+letter would swallow every capital letter typed anywhere.
@@ -97,7 +118,7 @@ export function pretty(acc: string, linux = false) {
     .join(" + ");
 }
 
-function HotkeyInput({ value, onChange, linux = false }: { value: string; onChange: (v: string) => void; linux?: boolean }) {
+export function HotkeyInput({ value, onChange, linux = false, paste = false }: { value: string; onChange: (v: string) => void; linux?: boolean; paste?: boolean }) {
   const [recording, setRecording] = useState(false);
 
   useEffect(() => {
@@ -105,11 +126,11 @@ function HotkeyInput({ value, onChange, linux = false }: { value: string; onChan
     const onKey = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      if (e.code === "Escape") {
+      if (e.code === "Escape" || (paste && e.key === "Escape")) {
         setRecording(false);
         return;
       }
-      const acc = accelerator(e);
+      const acc = accelerator(e, paste);
       if (acc) {
         setRecording(false);
         onChange(acc);
@@ -117,16 +138,16 @@ function HotkeyInput({ value, onChange, linux = false }: { value: string; onChan
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [recording, onChange]);
+  }, [recording, onChange, paste]);
 
   return (
     <>
-      <button className={`btn hotkey ${recording ? "recording" : ""}`} onClick={() => setRecording(!recording)} onBlur={() => setRecording(false)}>
+      <button className={`btn hotkey ${recording ? "recording" : ""}`} aria-label={paste ? "Record custom paste shortcut" : undefined} title={paste ? value : undefined} onClick={() => setRecording(!recording)} onBlur={() => setRecording(false)}>
         {recording ? "Press the keys…" : value ? pretty(value, linux) : "Not set"}
       </button>
-      {value && !recording && (
-        <button className="btn" onClick={() => onChange("")}>
-          Clear
+      {!recording && (paste || value) && (
+        <button className="btn" onClick={() => onChange(paste ? DEFAULT_PASTE_SHORTCUT : "")}>
+          {paste ? "Reset to Ctrl+V" : "Clear"}
         </button>
       )}
     </>

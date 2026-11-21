@@ -1,18 +1,70 @@
-# Amber for Windows
+# Amber for Linux
 
-## Linux Desktop Preview
+An independent Linux desktop port of [Amber for Windows](https://github.com/EinFabo/amberpc),
+originally created by [EinFabo](https://github.com/EinFabo). Speak into a microphone,
+recognize speech locally or through a provider, review the result, and copy or paste it
+into another application.
 
-This worktree also contains a Linux desktop port targeting Arch/i3, GNOME and KDE. It is a
-preview until the real-desktop integration matrix has passed, not a claim of
-Windows feature parity. Upstream source, artwork, and redistribution remain subject
-to the repository license and the author's written permission.
+This is a derivative port, not a clean-room rewrite or an official Linux release from
+the original creator. The original application, design, artwork, and retained source
+come from Amber; this tree adds Linux desktop integration, packaging, and further
+model, provider, and workflow features. The original Git history is preserved, with
+Linux development following upstream commit
+[`64d67e3`](https://github.com/EinFabo/amberpc/commit/64d67e308511cb922e1de957d7896b1cdd56e42d).
+
+## License and Publication Status
+
+**Amber is not Apache-licensed.** The original [LICENSE](LICENSE) says
+`Copyright (c) 2026 EinFabo. All rights reserved.` It requires prior written
+permission from the copyright holder to modify or redistribute the source, artwork,
+or a modified version. Its limited allowance for GitHub forks is not a general
+license to publish this port. Attribution alone does not grant those rights.
+
+No permission or endorsement is asserted by this README. Obtain written permission
+before publishing modified source or packages, and retain the original license and
+copyright notices. The license directs permission requests to the
+[original project's issues](https://github.com/EinFabo/amberpc/issues).
+Third-party libraries, runtimes, and models retain their separate licenses; those
+licenses do not relicense Amber itself.
+
+For maintainers, [Publishing to GitHub](docs/github-publishing.md) explains the
+permission gate, creating a linked fork, preserving the existing local remote,
+reviewing files, and pushing deliberately. Build instructions below describe the
+checkout; they do not grant modification or redistribution permission.
+
+## Features
+
+- Local CPU speech recognition with Whisper, Parakeet, or Moonshine, plus hosted
+  transcription with your own credentials.
+- A model library, checksum-verified downloads, and offline imports of supported
+  local speech models.
+- Rule-based cleanup, optional local or hosted smart cleanup, saved provider
+  connections, and opt-in keyword instructions.
+- A Recorder for reviewing results and a Testing page for comparing engines and
+  cleanup settings using the same recording.
+- X11 shortcuts and guarded clipboard paste; desktop-portal shortcuts and manual
+  paste on Wayland.
+- Optional encrypted history and saved testing tables, with encrypted credentials
+  backed by the desktop's Secret Service wallet.
+
+Start with [Build and Install](#build-and-install), then [First Run](#first-run).
+Read [Linux Desktop Support](#linux-desktop-support) before enabling automatic paste
+and [Privacy and History](#privacy-and-history) before choosing hosted services.
+
+## Linux Desktop Support
+
+The desktop port targets x86_64 Linux on Arch/i3, GNOME, and KDE. It remains a preview
+until the real-desktop integration matrix has passed, not a claim of Windows feature
+parity or support for every distribution. GPU acceleration, ARM, Flatpak, and AppImage
+support are deferred. Windows and standalone-server code remain in this repository;
+this README describes the Linux desktop, not those separate applications.
 
 - Local CPU Whisper inference is built in; only its model weights need downloading.
   Parakeet and Moonshine additionally download a verified ONNX Runtime on first setup.
   Hosted recognition and optional local/server cleanup are supported.
 - Dictation shortcuts leave Amber in the background. The Linux Recorder page keeps results
   in memory for review and explicit Copy by default. Under **Delivery**, enable **Copy and
-  paste completed dictation (Ctrl+V)** to copy completed text and paste automatically on
+  paste completed dictation** to copy completed text and paste automatically on
   eligible X11 targets. Completion delivery remains **off by default**. Copy, completion
   delivery and explicit insertion replace clipboard text, images or files without restoring
   them; clipboard managers may retain the text. Keep Amber running until you paste.
@@ -25,10 +77,26 @@ to the repository license and the author's written permission.
   the window captured at recording start. When enabled, the currently focused destination
   is chosen once when delivery begins, not when recording stops. Both target options can
   be configured while completion delivery is off.
+- Under **Delivery > Paste shortcut** on X11, choose `Ctrl+V` (the unchanged default,
+  stored as `insert.pasteShortcut: "Ctrl+KeyV"`), `Ctrl+Shift+V` (common in terminals),
+  or `Shift+Insert`, or record a custom combination. Choose the binding the target
+  application actually uses for clipboard paste: the same binding applies to **all targets**,
+  for both automatic completion and explicit `--insert-last`. This setting is available with
+  completion off; it does not enable completion or change either target option.
+  It is sent to the destination, not registered as a global shortcut; avoid the recording
+  hotkey or other globally bound commands. Some X11 apps use `Shift+Insert` to paste the
+  primary selection, not the clipboard; Amber leaves that selection unchanged. The recorder
+  uses logical letters, so V remains V on Colemak/Dvorak. Escape cancels recording;
+  Enter/Return/NumpadEnter, unmodified typing and modifier-only bindings are not allowed.
+  F1-F24 can stand alone. Shifted numbers/punctuation and AltGr are not recorded because
+  their logical base key cannot be determined reliably across layouts.
+  **Reset to Ctrl+V** restores the default binding only.
+  Invalid imported bindings are not silently replaced; invalid saves are rejected.
+  Windows still uses Ctrl+V, and Wayland still requires manual paste.
 - All X11 paste still requires single-line text without control characters and an observable
-  non-Amber target with stable window and input focus during paste. Amber sends only `Ctrl+V`,
-  never Enter or a focus switch. Terminals may need a different paste shortcut. Editable
-  fields (including password fields) and paste acceptance cannot be verified. Targets that
+  non-Amber target with stable window and input focus during paste. Amber sends the configured
+  paste shortcut, never Enter or a focus switch. Changing the binding does not relax these
+  safeguards. Editable fields (including password fields) and paste acceptance cannot be verified. Targets that
   change during paste, unobservable targets and multiline/control-character text require
   manual paste; completed results remain in Recorder even when automatic paste is blocked
   or cannot be confirmed.
@@ -39,17 +107,23 @@ to the repository license and the author's written permission.
   Amber to be focused.
 - Credentials and optional history use authenticated encryption with a key in Secret
   Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
-  causes plaintext persistence. Credential-save errors leave keys available only
-  for the current session. History, statistics, and login startup are opt-in.
+  causes plaintext persistence. After a credential-save error, changes remain active
+  in the current session, but persistence may have failed or be unconfirmed; do not
+  rely on them surviving a restart. History, statistics, and login startup are opt-in.
 - Phone/tunnel/control servers, automatic terminal-command mode, Discord mute, automatic
   per-app profiles, the Windows updater, and the Windows floating bubble are disabled
   in the Linux desktop. Updates are installed from Linux packages.
 
+## Build and Install
+
+Run these commands from the repository root. Package generation does not demonstrate
+compatibility with every distribution; test installation on the intended desktop.
+
 ### Arch/i3
 
-Build a native package from this checkout, after transferring the port through your
-own repository. The helper includes current uncommitted source files; it does **not**
-clone the unported upstream repository or require a hardcoded fork URL.
+Build a native package from this checkout, subject to the license requirements above.
+The helper includes current uncommitted source files; it does **not** clone the
+unported upstream repository or require a hardcoded fork URL.
 
 ```bash
 sudo pacman -Syu --needed base-devel nodejs npm
@@ -105,9 +179,9 @@ Amber's own X11 shortcut is `Ctrl+Alt+Space` by default. Do not register the sam
 combination in both Amber and i3. Bare i3 does not process XDG autostart files:
 use the explicit `exec` line above **or** an XDG launcher such as `dex`, not both.
 A tray host and a notification daemon are optional; the Recorder window and its
-Quit button must remain usable without them. The explicit paste shortcut uses Delivery's
-**Paste into any window** option and captures its current destination. Single-line,
-control-free text and stable focus are required; the shortcut never switches windows or
+Quit button must remain usable without them. The explicit paste command uses Delivery's
+**Paste shortcut** and **Paste into any window** option and captures its current destination.
+Single-line, control-free text and stable focus are required; the shortcut never switches windows or
 sends Enter, and cannot confirm that the destination accepted the paste.
 
 For locking, install `i3lock` and optionally `xss-lock`. Direct `i3lock` does not
@@ -130,6 +204,7 @@ Reproducible checks (X11 tests create a disposable authenticated Xvfb/i3 session
 never use the current desktop):
 
 ```bash
+npm ci
 npm run test:ui
 python tools/test-arch.py
 python tools/test-x11.py
@@ -145,6 +220,7 @@ all terminal/password fields, or replace a microphone test on the destination PC
 Build on Ubuntu 24.04 with current stable Rust, Node.js 22, and:
 
 ```bash
+sudo apt-get update
 sudo apt-get install build-essential cmake pkg-config clang libclang-dev \
   libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev \
   librsvg2-dev libxdo-dev libxtst-dev libssl-dev libdbus-1-dev rpm
@@ -152,7 +228,6 @@ npm ci
 npm run build
 npm run test:ui
 cargo test -p amber-core -p amber-inference -p amber-server -p amber-pc --locked
-npm run app
 npm run app:build -- --bundles deb,rpm
 ```
 
@@ -164,64 +239,49 @@ focus, suspend/revocation, native Wayland/XWayland, and clean-install testing on
 GNOME/KDE sessions. Wayland automatic text injection is not implemented; use review,
 Copy, and manual paste. GPU/ARM/Flatpak/AppImage support is deferred.
 
-The remainder of this README describes the upstream Windows application.
+For development, `npm run app` starts the complete Tauri application and keeps running
+until stopped with `Ctrl+C`. `npm run dev` starts only the frontend, not the desktop
+backend. Run these commands from the repository root after installing the prerequisites
+and running `npm ci`. The upstream Windows installers do not contain this Linux port;
+no published Linux download is assumed here.
 
-Dictation into **any** window - Amber's Android dictation, on the PC. Speak, and the text
-appears where your cursor is: in Notepad, the browser, Discord, VS Code, Word.
+For the disposable X11 integration tests on Ubuntu, also install their desktop-test
+dependencies and run the harness with Python 3:
 
-Local-first: your voice is recognized on this PC by whisper.cpp (CPU or NVIDIA GPU),
-Parakeet or Moonshine (CPU), or by a server with your own API key. Local model setup
-downloads files; recognition itself stays offline.
+```bash
+sudo apt-get install xvfb i3-wm xauth x11-utils x11-xkb-utils fonts-dejavu-core
+python3 tools/test-x11.py
+```
 
-## Installing
+## First Run
 
-Download `Amber_<version>_x64-setup.exe` from the
-[latest release](https://github.com/EinFabo/amberpc/releases/latest) and run it. It installs
-for your Windows account only - no administrator rights - into
-`%LOCALAPPDATA%\Amber`, with a Start menu entry. Windows SmartScreen may warn on first run
-because the installer is not code-signed: *More info → Run anyway*.
+1. Launch `amber-dictation` after installation, or use `npm run app` for development.
+2. Choose and test a microphone. On bare i3, check the audio and keyring notes above.
+3. In **Engine**, download a local speech model, import a supported model, or choose a
+   hosted provider and add its key in **Credentials** or **Connections**.
+4. Record a short phrase in **Recorder**. Review the result and use **Copy**, then paste
+   manually into a test document.
+5. Set a dictation shortcut. On X11, enable automatic completion delivery only after
+   reviewing the clipboard and focus safeguards above. Wayland requires manual paste.
 
-On first start a short setup guide picks the engine and downloads what it needs. Amber
-then starts with Windows (in the tray, without a window - switch it off under
-*Settings → App*) and updates itself from the releases. Uninstall it under *Windows
-Settings → Apps*; that also removes the autostart entry, and optionally the downloaded
-models.
+Start with local speech and no hosted cleanup if you want recognition to stay on your
+machine. Initial model/runtime downloads need a network connection; recognition with
+downloaded local models can run offline.
 
-## Using it
-
-- **Hotkey** (default `Ctrl+Alt+Space`), in three modes: *tap or hold* (a tap starts, the
-  next tap stops; holding dictates until you let go), *tap to toggle*, *hold to talk*.
-- **The bubble** at the screen edge: click to start and stop, hold to talk, drag to move it
-  (it settles at the nearer edge of whichever monitor you drop it on), right-click for the
-  settings. It never takes the focus from the window you are writing in.
-- **Tray icon**: settings, start/stop, show/hide the bubble, copy the last dictation,
-  recognize a failed recording again, updates, quit.
-- **Stream Deck** key: hold to talk (see below).
-
-The look is Amber's fire: a flat amber disc with a flame at rest, level bars and sparks
-while listening, a rim that fills against the expected wait while recognizing, a tick when
-the text is in, red when something failed. The bubble keeps out of full-screen programs
-(games, videos) and out of the programs you list; the hotkey works there anyway.
-
-Say "neue Zeile", "neuer Absatz", "Komma", "Fragezeichen", "Punkt" (at a sentence end) - or
-"new line", "comma", "question mark" - and the marks go in. A **snippet** phrase on its own
-("meine Adresse") inserts its saved text.
-
-## Engines
+## Speech Engines
 
 | Engine | Where your voice goes | Notes |
 |---|---|---|
-| Local, CPU | nowhere | whisper.cpp `b5454`, 8 MB |
-| Local, NVIDIA GPU | nowhere | CUDA 12.4 build with cuBLAS, 653 MB |
+| Whisper, CPU | stays on this PC | Built-in inference; download or import model weights |
 | Parakeet, CPU | nowhere | v3 int8: 25 languages including German; v2 int8: English only |
 | Moonshine, CPU | nowhere | Tiny/Base int8, English only; long recordings are chunked |
-| Groq | Groq | Whisper large-v3(-turbo), about $0.04 per hour of speech |
+| Groq | Groq | Whisper presets; provider account and API key required |
 | OpenAI | OpenAI | GPT-4o (mini) Transcribe, Whisper |
 | Tinfoil.sh | Tinfoil | Voxtral Small 24B (default), Whisper large-v3-turbo; HTTPS without client enclave verification |
 | Mistral | Mistral | Voxtral Mini Transcribe |
 | Deepgram | Deepgram | Nova-3; native transcription API |
 | ElevenLabs | ElevenLabs | Scribe v2; no speaker labels or paid vocabulary add-on |
-| Own server | your server | anything with `POST /v1/audio/transcriptions`; plain `http://` only inside your network |
+| Own server | your configured endpoint | Compatible `POST /v1/audio/transcriptions` API; HTTPS required except for literal loopback IPs |
 
 For Tinfoil on either desktop platform, save an inference API key from
 [its dashboard](https://dash.tinfoil.sh) on the **Credentials** page. Keys can be managed
@@ -234,22 +294,17 @@ Unlike Android, the desktop client does not verify enclave attestation. The conn
 test only fetches the public model catalog; a successful test does not validate the key
 or prove that inference works.
 
-The recommended Whisper models are the ones Amber for Android uses: **FUTO Base** and **FUTO Small**
-(keyboard.futo.org) and **ACFT Large v3 Turbo q8_0** (DeadBranches on Hugging Face, from
-MahmoudAshraf's Apache-2.0 fine-tune). All three are tuned so the encoder stops where the
-speech stops - Amber sends whisper-server a matching `audio_ctx` per request instead of a
-30-second window; on Android that made the large model 4x faster under 8 s of speech, and
-more accurate. Amber suggests one by hardware (NVIDIA → Large v3 Turbo, a CPU with room →
-Small, an old office PC → Base) and learns how long recognition takes on this PC.
+The default Whisper catalog includes **FUTO Base**, **FUTO Small**, and **ACFT Large v3
+Turbo q8_0**. Model licenses are separate from Amber's license. Larger models require
+more memory and CPU time; choose one that fits your machine.
 
-Long dictations are **recognized while you speak**: cut at real pauses, each finished part
-recognized while you keep talking, so only the last part is left after you stop.
+With streaming chunking active, long dictations are **recognized while you speak**:
+finished parts are recognized at pauses while you continue recording. Testing and
+enabled keyword instructions process complete recordings instead.
 
-Runtimes and models are downloaded on demand from those sources, each pinned by URL (Hugging
-Face at a fixed commit) and SHA-256 in `crates/core/src/local.rs`; a runtime archive missing
-a required DLL is refused. A file with the wrong checksum is deleted, never run. The local
-engine runs as `whisper-server.exe` on `127.0.0.1` only, in a Windows job object, so it never
-outlives Amber.
+Catalog downloads are pinned by URL and SHA-256 in `crates/core/src/local.rs` and
+`crates/core/src/onnx.rs`. Mismatched checksums are rejected. Linux Whisper inference
+runs inside the application, not as a Windows executable or an external speech server.
 
 The **Engine > Model library** also offers stock Whisper Tiny, Base, Small, Medium,
 Large v3 and Turbo variants, including compact Q5, Q8 and F16 weights and selected
@@ -260,9 +315,9 @@ changing the selected model. Downloads remain cancellable and checksum-verified.
 Parakeet and Moonshine use `transcribe-rs` with CPU ONNX Runtime 1.24.4. Their first download
 also fetches a checksum-pinned Microsoft native runtime package (about 119 MiB); only the
 platform libraries and license notices are installed. No Python or .NET setup is needed.
-Windows additionally requires the Microsoft Visual C++ 2015-2022 x64 redistributable.
-The supplied Linux runtime targets x64 GNU/Linux with glibc 2.27 or newer and a compatible
-system C++ runtime. Parakeet v3 detects its 25 supported languages automatically; v2 and
+The supplied ONNX runtime targets x64 GNU/Linux with glibc 2.27 or newer and a compatible
+system C++ runtime; that is not a compatibility guarantee for the whole desktop app.
+Parakeet v3 detects its 25 supported languages automatically; v2 and
 these Moonshine variants only recognize English. Neither engine uses the vocabulary prompt
 or forces the selected language. Long ONNX recordings use bounded chunks, which can affect
 words near chunk boundaries. Model manifests and runtime hashes live in `crates/core/src/onnx.rs`.
@@ -297,11 +352,12 @@ The importer reclaims its own abandoned staging/unregistered copies before a sub
 import. Failed deletions remain visible and retryable. **Select after import** is persisted
 by the backend, so closing the settings window does not lose that preference.
 
-With a server engine, a server that cannot be reached (offline, down) hands the recording to
-the downloaded local model with a notice - never the other way round.
+If local fallback is enabled and the selected local model/runtime is installed,
+Amber can attempt local recognition when the speech server is unavailable. Fallback
+can itself fail; local recognition never silently falls back to a hosted provider.
 
-API keys are encrypted with Windows DPAPI for your account (`secrets.bin`), never written
-to the settings file or the log.
+On Linux, API keys are stored in an encrypted vault backed by Secret Service. A locked
+or unavailable wallet does not cause a fallback to plaintext credential storage.
 
 ### Audio Uploads
 
@@ -348,7 +404,7 @@ Give the table an optional name and choose **Save table & start new** to keep it
 configuration and timings across restarts and start an empty table. Up to 10 saved tables
 appear in separate sections below; they can be collapsed or explicitly deleted. Saving and
 deleting use encrypted local storage (`testing-tables.bin`), not plaintext. Linux requires an
-unlocked Secret Service wallet; Windows uses account-bound DPAPI encryption. A failed save
+unlocked Secret Service wallet. A failed save
 leaves the current table intact. Unlock the wallet and **Reload saved tables** to recover
 from storage errors. Saved tables are not silently overwritten when the limit is reached.
 
@@ -362,39 +418,24 @@ to that provider, including when replaying; Testing is not a privacy bypass.
 
 ## Cleanup
 
-Between recognition and inserting (*Settings → Cleanup*):
+Under **Cleanup**, rule-based processing handles spoken punctuation, layout, and
+filler words locally. Optional smart cleanup uses a language model to repair
+self-corrections and punctuation, with checks intended to preserve meaning. Review
+important text: those checks do not guarantee a correct transcript.
 
-- **By rule** - local, instant, nothing invented: spoken punctuation and layout; filler words
-  (äh, ähm, öhm, hm, uh, erm …; German words that look like English fillers, "um" and "eh",
-  stay); German commas before "dass", "weil", "wenn", "um … zu", "sondern" (Amber for
-  Android's rules, 98.5 % right on 4,200 sentences).
-- **Smart cleanup** (optional): a language model resolves self-corrections ("um drei, nee
-  stopp, um vier" → "um vier"), false starts and punctuation. Locally with llama.cpp
-  `b11981` and Qwen3 4B Instruct 2507 (Apache 2.0; CUDA 641 MB + model 2.4 GB, ~3 GB of
-   graphics memory), or through Groq, OpenAI, Tinfoil.sh, Mistral, OpenRouter, Google Gemini,
-   DeepSeek, Anthropic, local Ollama or an own server. Keys are managed in Credentials.
-  The prompt puts hard rules first - the dictation's language (named when one is chosen or
-  clear from its words), every negation, number, name and condition kept, never an answer -
-  then what to fix, self-corrections ("um drei, nee, um vier" → "um vier"), the style with
-  what it may not change, and the program's own instruction, fenced: tone and form only. A
-  few example dictations go before the real one. A reply is thrown away and the text goes
-  in as recognized when it is cut off, empty, of implausible length, made of words that were
-  not dictated, in another language, or has lost or gained a negation or a number (what a
-  spoken self-correction took back may go) - the log names the reason. Measured with
-  `tools/cleanup-eval` (76 cases, Qwen3 4B): the prompt of 0.4.6 got 7 wrong and 5 of them
-  through; this one gets 1 wrong and none through. A dictation never waits for a model that
-  is still loading.
-- **Per program** (*Settings → Programs*): a writing style - as spoken, casual (chats),
-  formal (mail), concise (notes) - an own instruction, and the smart cleanup as set, always
-  or never. The program is the window the dictation started in.
+Local smart cleanup uses a separately downloaded Linux CPU llama.cpp runtime and
+Qwen3 4B Instruct 2507 model, not the Whisper speech model. It runs an authenticated
+server on `127.0.0.1`. Alternatively, select a hosted cleanup provider or an existing
+local Ollama instance. Hosted cleanup sends recognized text to that provider even
+when speech recognition itself is local. Automatic per-application profiles and the
+Windows terminal-command mode are disabled on Linux.
 
 Provider lists distinguish speech recognition from cleanup. Named providers offer curated
 model presets; Own server accepts a model ID, but compatibility with arbitrary model
 parameters is not guaranteed. The Ollama preset connects to `http://127.0.0.1:11434/v1` without a key;
 install Ollama and pull the chosen model separately. Use Own server for a different address.
 Connection checks do not submit inference requests and do not prove that a selected model
-or API key can perform paid inference. Anthropic uses its native Messages protocol while
-Amber's phone API remains OpenAI-compatible.
+or API key can perform paid inference. Anthropic uses its native Messages protocol.
 
 ### Connections and Discovery
 
@@ -429,209 +470,78 @@ bash list all files modified today
 ```
 
 The chosen cleanup model can turn that into command text such as `find . -type f -mtime -1`.
-Shell output is always review/copy-only, never automatically pasted or executed, even if
-terminal auto-run is enabled. Choose Text output for transformations meant for normal
+Shell output is always review/copy-only, never automatically pasted or executed.
+Choose Text output for transformations meant for normal
 delivery, such as drafting an email. Rule prompts are ordinary settings, not secret storage.
 
-Rules require both their own Enabled switch and global smart cleanup; a program's Never
-setting still prevents them. Matching happens before filler cleanup: `please bash...`,
+Rules require both their own Enabled switch and global smart cleanup.
+Matching happens before filler cleanup: `please bash...`,
 `bashful...` and quoted keywords do not trigger the Bash rule. Failure keeps the original
 request, including its keyword. Enabled rules defer streaming chunks so they apply once to
-the complete utterance. Testing/replay and the explicit preview support them; phone API
-cleanup does not apply desktop instruction rules. Ordinary cleanup retains its existing
+the complete utterance. Testing/replay and the explicit preview support them.
+Ordinary cleanup retains its existing
 meaning-preservation checks.
 
-## Terminal commands
+## Privacy and History
 
-In a terminal, what is said can be a request instead of text (*Settings → Programs*): "such
-mir alle Dateien, die mit CL anfangen" becomes `find . -name 'CL*'`, "list the five biggest
-files in my downloads folder" becomes `Get-ChildItem ~\Downloads -File | Sort-Object Length
--Descending | Select-Object -First 5`. Amber **types the command at the prompt and never runs
-it** - no Enter, no line break; you read it and press Enter (unless the danger zone below
-says otherwise).
+- Local speech recognition stays on this machine after setup. Hosted speech sends
+  audio to the selected endpoint; hosted cleanup sends text. A local fallback cannot
+  undo an upload already attempted against a server.
+- Credentials, optional history, and explicitly saved Testing tables use encrypted
+  storage with a key in Secret Service. Unlock the wallet for persistence; missing
+  wallet access never enables plaintext credential/history storage.
+- History, statistics, and login startup are opt-in on Linux. Ordinary settings,
+  diagnostics, timing estimates, and optional statistics are not all encrypted.
+  Instruction prompts and custom endpoint URLs should not contain secrets.
+- Copying or pasting replaces the clipboard without restoring its old content.
+  Other applications and clipboard managers may read or retain the copied text.
+- Testing audio is held in memory, not saved with comparison tables. Saved tables
+  contain transcripts and settings; delete them explicitly when no longer needed.
 
-- **When**: automatically in terminal programs (Windows Terminal, PowerShell, Git Bash,
-  PuTTY, WSL - per program on, off, or a fixed shell; or not automatically at all); anywhere
-  with the command hotkey (*Settings → Hotkeys*); or for one dictation that starts with a
-  start word ("Befehl: ...", "Command: ...").
-- **Which shell**: bash or PowerShell, told by the program and the window title
-  ("fabi@pc: ~/projects", "Windows PowerShell", "Ubuntu"); cmd is not supported. The title is
-  the only context - nothing of the terminal's content is read.
-- **The model**: the cleanup's (local Qwen3 4B, or the provider's), also while the smart
-  cleanup is off; examples of each shell in the prompt. When what was said is no command - a
-  message to Claude Code or an editor running in the terminal - it is dictated as usual;
-  titles of Claude Code and Vim skip the model.
-- **Risky commands** (deleting, overwriting, `sudo`, a script piped into a shell, forcing
-  git, disks, shutting down) come commented out in *safe mode* (the default: `# rm -rf build`
-  - Enter does nothing, remove the `#` to run it); without it they come as they are, with a
-  warning. Amber never runs a risky command by itself.
-- **Danger zone** (red, on the Programs page): *safe mode* off, and running commands by
-  themselves (off by default, switched on only after a confirmation) - Amber presses Enter
-  itself, so a harmless command runs at once. A risky one never does.
-- The bubble shows `>_`; the history keeps "request → command".
-
-## History and statistics
-
-The last dictations - text, program, engine - are kept on this PC, encrypted for the
-Windows account, for 7 days by default (*Settings → History*); copy one to put it where it
-should have gone. Switching the history off deletes it. A recording whose recognition failed
-stays in memory for ten minutes: *Recognize again* (tray or History page) puts the text on
-the clipboard. The statistics count words and timings only, never the text: today, the
-streak, time saved against typing at 40 words a minute, programs, the wait per engine.
-
-History supports text/program search and combined program, local-date and insertion-status
-filters. Search terms stay in memory only. **Delete all history** always clears the entire
-history, including entries hidden by the current filters; the UI makes this scope explicit.
-
-## Stream Deck
-
-`com.einfabo.amber.streamDeckPlugin` (attached to every release; double-click installs it)
-adds a *Dictate* key: hold it while you speak, let go to insert - or tap to start and stop.
-The key shows the state (flame, listening, working, failed; grey while Amber is not
-running). It talks to Amber through a control port on 127.0.0.1 only, with a fresh token
-every start, handed over in `%APPDATA%\app.amber.pc\streamdeck.json`.
-
-**Muted in Discord while dictating** (Microphone page; any dictation, not only the Stream
-Deck): while Amber listens it presses Discord's own microphone switch - found through UI
-Automation, pressed with a click sent to Discord's window as a message, which cannot take
-the focus from the game or program in front - and presses it again at the stop. Amber only
-takes back its own mute: not one the user set, not while they are deafened; an unmute that
-does not take (Discord minimized, closed) is tried again until it does. Nothing to set up
-in Discord. Not while Discord is minimized or in the tray, not for dictations into Discord
-itself, and only with Discord in English or German (the switch is found by its name).
-
-```bash
-cd streamdeck && npm run setup && npm test && npm run pack   # -> dist/
-```
-
-## Phone API (optional)
-
-Amber on the Android phone can use this PC as its server - same network, the PC's GPU,
-no change to the phone app. Turn it on under *Settings → Phone*; it shows what to enter in
-the phone's *Engine → Own server*, as with OpenAI: the **address** (e.g.
-`http://192.168.178.30:8765/v1`) and, apart, the **API key** (hidden until *Show*), each with
-a copy button - or both at once as a pairing link in a QR code
-(`amber://server?url=…&key=…`, Amber for Android 0.30.0 or newer).
-
-- OpenAI-compatible: `POST /v1/audio/transcriptions` (multipart, WAV or Ogg Opus) answers
-  `{"text": …}`; `GET /v1/models` lists every downloaded speech and cleanup model and the
-  cloud models set in the app, the PC's own as the default - the phone picks among them, and
-  the PC loads the one it names (one local model at a time). See `docs/phone-api.md`.
-- `POST /v1/chat/completions` answers the phone's own cleanup (Amber for Android 0.17 and
-  later asks for it separately, with its styles per app) with the cleanup model it names -
-  local or the provider under Cleanup - or the PC's own.
-- The key goes as `Authorization: Bearer`; the older form with the key in the path
-  (`/<key>/v1`, Amber for Android up to 0.29.0) is still accepted, and never logged. Several
-  keys, one per device or person, each with the models it may use and its requests a day
-  (*Phone → Access keys*); a new key or removing one locks out only its devices.
-- Only devices in the private network (192.168/16, 10/8, 172.16/12, Tailscale's 100.64/10,
-  loopback) are answered. Off by default; Windows asks once to let Amber through its
-  firewall.
-- Silence answers `{"text": ""}`, which the phone's *Test connection* counts as success.
-- The PC's cleanup applies to the phone's dictations too (switch on the Phone page): fillers
-  out, and the smart cleanup if it is on - for phone apps without their own cleanup. Off when
-  the phone cleans up through the PC itself, or the text is cleaned twice.
-- **From anywhere**: a Cloudflare Tunnel on the user's own domain. The user creates the
-  tunnel in Cloudflare (public hostname -> `http://localhost:<port>`) and pastes its token;
-  Amber downloads cloudflared (pinned, checksum-verified), keeps it running with the token in
-  its environment (never on the command line), and shows the address `https://<host>/v1` and
-  the pairing link as a QR code. Requests arrive from 127.0.0.1 through cloudflared; the access key keeps strangers
-  out, and refusals are logged at most every 10 s with the sender Cloudflare names.
-  One command does all of it from WSL: `tools/setup-tunnel.sh amber-x7k2.example.com` logs
-  in to Cloudflare (browser, once), creates the tunnel, routes the hostname, and hands token
-  and hostname to Amber (`amber.exe --import-tunnel <file>`, the file deleted on reading)
-  with a new access key.
-
-## Amber Server
-
-The same phone API without the desktop app, for a PC, a NAS or a small Linux box: one
-command installs it (Linux or Windows, CPU or Vulkan GPU), sets it up with the model that
-suits the machine and starts it as a service; every setting and model has a command, and the
-phone chooses among the models it has downloaded.
-
-Linux:
-
-```sh
-curl -fsSL https://github.com/EinFabo/amberpc/releases/download/server-latest/install-server.sh | sh
-```
-
-Windows (PowerShell, no admin rights needed):
-
-```powershell
-irm https://github.com/EinFabo/amberpc/releases/download/server-latest/install-server.ps1 | iex
-```
-
-Run either again to update. Then `amber-server url` shows the phone's address and QR code;
-`amber-server key add <name>` gives another device its own key (with its models and requests a
-day), and `amber-server tunnel setup <hostname>` reaches the server from anywhere through a
-Cloudflare Tunnel. Every command and setting: [server/README.md](server/README.md).
-
-## Inserting
-
-The text goes into the window the dictation started in. If another program is in front by
-the time the text is ready, Amber does not type into it: the text goes on the clipboard with
-a notice. Amber waits until the hotkey's modifier keys are released, then:
-
-- **Paste** (default): clipboard + `Ctrl+V`, the previous clipboard text restored after
-  400 ms. Dictations are kept out of the clipboard history (`Win+V`).
-- **Type**: Unicode keystrokes via `SendInput`; the clipboard stays untouched. A line break
-  is Shift+Enter, so a chat does not send it.
-
-Windows blocks synthetic input into windows running as administrator. Amber checks for that
-up front and leaves the text on the clipboard with a note, instead of pretending it typed.
+History supports text/program search and combined program, local-date, and insertion-status
+filters. Search terms stay in memory only. **Delete all history** clears the entire
+history, including entries hidden by the current filters.
 
 ## Layout
 
-```
-crates/core/   pure Rust: audio maths, engines, cleanup, settings, downloads, gestures,
-               the hardened HTTP server behind the phone API and the control port  → tests
-streamdeck/    the Stream Deck plugin (TypeScript, Elgato SDK v2)
-src-tauri/     the Windows app: capture, dictation, insertion, whisper process, bubble
-src/           web UI: settings window (React), bubble (canvas)
-tools/win.sh   mirrors the tree to %USERPROFILE%\build\amberpc and builds there
-```
-
-Same rule as Amber on Android: **whatever can go wrong without a platform API belongs in
-`core`**, where it is tested without Windows.
-
-## Building
-
-Release builds started from the build folder (`target\release`) never register themselves for
-autostart - only the installed app does.
-
-```bash
-cargo test -p amber-core        # anywhere, also in WSL
-tools/win.sh install            # npm ci on the Windows side
-tools/win.sh check              # cargo check against the real Windows APIs
-tools/win.sh test               # all tests on Windows
-tools/win.sh build              # signed NSIS installer in target/release/bundle/nsis
-tools/win.sh dev                # tauri dev
+```text
+crates/core/      platform-independent settings, providers, cleanup, downloads, tests
+crates/inference/ shared local Whisper inference
+crates/onnx/      shared Parakeet and Moonshine inference
+src-tauri/        desktop application and platform-specific integration
+src/             React settings, Recorder, Testing, and indicator UI
+packaging/arch/   native Arch package recipe and desktop entry
+tools/            build, packaging, and integration-test helpers
+server/           separate standalone server, not the Linux desktop phone API
+streamdeck/       retained upstream Windows Stream Deck integration
 ```
 
-The updater key lives outside the repo in `~/.amberpc/` (`updater.key`,
-`updater.password`); `tools/win.sh build` passes it to the build.
+Keep platform-independent logic in `crates/core` and platform API work in `src-tauri`.
+Keep `package.json` and the workspace version in `Cargo.toml` equal. The build and
+test commands above cover source checks; real microphone, clipboard, wallet, focus,
+lock/resume, Wayland, and clean-install tests remain necessary on target desktops.
 
-Data: `%APPDATA%\app.amber.pc\` (settings, keys), `%LOCALAPPDATA%\app.amber.pc\` (runtimes,
-models, `history.bin`, `stats.jsonl`, `estimates.json`, `logs\amber.log`).
+## Updates and Related Projects
 
-## Releases and updates
+Linux updates are installed through rebuilt/replacement Linux packages, not the
+Windows updater. Review the publication guide before enabling GitHub Actions: the
+inherited CI can upload Linux package artifacts, and the server workflow can publish
+releases when matching tags are pushed. Source publication and binary redistribution
+both need the appropriate permission.
 
-`tools/release.sh "notes"` runs the tests, builds and signs the installer on this PC and
-publishes it as a GitHub release together with `latest.json`. The signing key stays in
-`~/.amberpc/` and never goes to GitHub. Bump `version` in `package.json` and `Cargo.toml`
-first.
+Do not use `tools/release.sh` to release this Linux port: it still targets the
+original creator's Windows repository. The inherited server-release workflow instead
+publishes to the repository where it runs, but its installer scripts still default
+to upstream downloads. Neither workflow is a ready-to-use Linux desktop release
+process. Upstream Windows updater and server-download URLs are not download links
+for this port.
 
-Installed copies check
-`github.com/EinFabo/amberpc/releases/latest/download/latest.json` at start and every six
-hours, download in the background, and install once no dictation has run for a minute.
-GitHub Actions (`.github/workflows/ci.yml`) runs the tests and a Windows build on every push.
+- [Original Amber for Windows, by EinFabo](https://github.com/EinFabo/amberpc): original
+  application, Windows installation instructions, releases, and upstream development.
+- [Standalone server documentation](server/README.md): retained server functionality,
+  separate from this Linux desktop; its upstream download links do not install this port.
+- [Publishing to GitHub](docs/github-publishing.md): progressive maintainer instructions.
 
-## System requirements
-
-Windows 10 1809 or newer, x64. WebView2 (the installer fetches it if missing). For the GPU
-engine an NVIDIA card from the GTX 900 series on with a current driver.
-
-## Not in yet
-
-Tinfoil's enclave verification, configurable idle model unloading, and GPU acceleration for
-the new ONNX speech engines are not implemented. The roadmap is `docs/PLAN.md`.
+Tinfoil enclave verification and configurable idle model unloading are not implemented.
+The inherited [roadmap](docs/PLAN.md) also includes Windows/server plans; it is not a
+promise that those features work on Linux.

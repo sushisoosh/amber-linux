@@ -4,7 +4,7 @@
 //! (clipboard + Ctrl+V) or typed (Unicode keystrokes).
 //! Linux defaults to review/Copy. Opted-in completion copies even without a usable target;
 //! X11 application eligibility and retargeting at delivery are configurable. The selected
-//! target must remain unchanged while Ctrl+V is prepared and submitted.
+//! target must remain unchanged while the configured paste shortcut is prepared and submitted.
 
 #[cfg(not(target_os = "linux"))]
 use amber_core::settings::InsertMethod;
@@ -470,8 +470,8 @@ pub fn deliver(
 /// Shared guarded delivery for explicit paste and opted-in completion. The caller captures
 /// the target before any UI. Success means submitted, never confirmed; no focus switching.
 #[cfg(target_os = "linux")]
-pub fn paste_explicit(text: &str, target: Target, any_window: bool) -> Result<crate::linux_desktop::Submission, String> {
-    crate::linux_desktop::paste_explicit(text, target.x11, any_window)
+pub fn paste_explicit(text: &str, target: Target, settings: &InsertSettings) -> Result<crate::linux_desktop::Submission, String> {
+    crate::linux_desktop::paste_explicit(text, target.x11, settings.paste_into_any_window, &settings.paste_shortcut)
 }
 
 #[cfg(target_os = "linux")]

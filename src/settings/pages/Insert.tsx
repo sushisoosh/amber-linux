@@ -4,11 +4,16 @@ import { listen } from "@tauri-apps/api/event";
 import type { DictationEvent, InsertMethod } from "../../shared/types";
 import type { PageProps } from "../App";
 import { Row, Section, Segmented, Switch } from "../ui";
-import { pretty } from "./Hotkeys";
+import { DEFAULT_PASTE_SHORTCUT, HotkeyInput, pretty } from "./Hotkeys";
 
 const METHODS: [InsertMethod, string][] = [
   ["paste", "Paste (Ctrl+V)"],
   ["type", "Type"],
+];
+const PASTE_PRESETS = [
+  [DEFAULT_PASTE_SHORTCUT, "Ctrl+V (default)"],
+  ["Ctrl+Shift+KeyV", "Ctrl+Shift+V (terminals)"],
+  ["Shift+Insert", "Shift+Insert"],
 ];
 
 export function InsertPage({ s, save, phase, ov, desktop }: PageProps) {
@@ -26,23 +31,32 @@ export function InsertPage({ s, save, phase, ov, desktop }: PageProps) {
   return (
     <>
       <h1>Delivery</h1>
-      <p className="lead">{linux ? "Review and copy completed dictation, or opt in to clipboard delivery and X11 Ctrl+V. The hotkey leaves Amber in the background." : "How completed dictation reaches the window you were in when recording started. The hotkey leaves Amber in the background."}</p>
+      <p className="lead">{linux ? "Review and copy completed dictation, or opt in to clipboard delivery and X11 paste with your chosen shortcut. The hotkey leaves Amber in the background." : "How completed dictation reaches the window you were in when recording started. The hotkey leaves Amber in the background."}</p>
       <Section>
         {linux ? <>
-          <Row label="Copy and paste completed dictation (Ctrl+V)" hint="Off by default: review the result and copy it yourself. When enabled, completed text goes to the clipboard even when automatic paste is unavailable. On X11, Amber attempts one paste according to your target options, without bringing either window forward.">
+          <Row label="Copy and paste completed dictation" hint="Off by default: review the result and copy it yourself. When enabled, completed text goes to the clipboard even when automatic paste is unavailable. On X11, Amber attempts one paste according to your target options and paste shortcut, without bringing either window forward.">
             <Switch on={s.insert.pasteOnCompletion} onChange={(v) => save((x) => {
               x.insert.pasteOnCompletion = v;
               x.insert.method = "paste";
             })} />
           </Row>
           {x11 ? <>
-            <Row label="Paste into any window" hint={<>On by default: allows X11 Ctrl+V in browsers, chat apps, dialogs and other window types, not just known native editors. Applies to completion and <code>--insert-last</code>; this does not enable completion paste. Turn off to restrict targets to known native editors.</>}>
+            <Row label="Paste shortcut" hint={<>Choose the clipboard-paste binding your target application actually uses. The same binding applies to all targets, for both completion and <code>--insert-last</code>. Configuring it does not enable completion paste. Shift+Insert pastes the primary selection instead of the clipboard in some apps; Amber leaves that selection unchanged.</>}>
+              <select aria-label="Paste shortcut preset" value={PASTE_PRESETS.some(([value]) => value === s.insert.pasteShortcut) ? s.insert.pasteShortcut : ""} onChange={(e) => save((x) => (x.insert.pasteShortcut = e.target.value))}>
+                <option value="" disabled>Custom / imported binding</option>
+                {PASTE_PRESETS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </Row>
+            <Row label="Custom paste shortcut" hint="Click the binding, then press your keys. Use Ctrl, Alt, Shift or Super with a supported key, or F1-F24 alone. Enter and unmodified typing are not allowed; Escape cancels. Shifted numbers, shifted punctuation and AltGr cannot be recorded reliably across layouts. This shortcut is sent to the target, not registered globally. Avoid your recording hotkey or other global shortcuts.">
+              <HotkeyInput value={s.insert.pasteShortcut} linux paste onChange={(v) => save((x) => (x.insert.pasteShortcut = v))} />
+            </Row>
+            <Row label="Paste into any window" hint={<>On by default: allows X11 paste in browsers, chat apps, dialogs and other window types, not just known native editors. Applies to completion and <code>--insert-last</code>; this does not enable completion paste. Turn off to restrict targets to known native editors.</>}>
               <Switch on={s.insert.pasteIntoAnyWindow} onChange={(v) => save((x) => (x.insert.pasteIntoAnyWindow = v))} />
             </Row>
             <Row label="Allow pasting into a different window" hint="Off by default: completion requires the window captured at recording start. When enabled, Amber chooses the currently focused window once, when delivery begins, not when recording stops. Focus changes during paste still block it.">
               <Switch on={s.insert.pasteIntoDifferentWindow} onChange={(v) => save((x) => (x.insert.pasteIntoDifferentWindow = v))} />
             </Row>
-            <Row label="X11 paste limits" hint="Only single-line text without control characters. The destination must be observable, outside Amber, with stable window and input focus while sending Ctrl+V. Amber never switches focus or presses Enter. Editable fields (including password fields) and paste acceptance cannot be verified. Terminals may need a different paste shortcut." />
+            <Row label="X11 paste limits" hint="Only single-line text without control characters. The destination must be observable, outside Amber, with stable window and input focus while sending the configured paste shortcut. Amber never switches focus or presses Enter. Editable fields (including password fields) and paste acceptance cannot be verified. Changing the shortcut does not relax these safeguards." />
           </> : <Row label="Manual paste on this desktop" hint="Wayland and unknown sessions cannot safely identify or paste into the target yet. Background clipboard access can also be restricted: on Wayland, Amber must be focused to copy. Otherwise open Recorder and use Copy." />}
           <Row label="Clipboard replacement" hint="Copy, opted-in completion and --insert-last replace clipboard text, images or files; Linux does not restore them. Clipboard managers may retain the text. Keep Amber running until you paste. Interrupted recordings always require review. Results remain in Recorder, even when a paste is blocked or cannot be confirmed. Testing recordings never change the clipboard." />
         </> : <Row

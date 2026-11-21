@@ -61,7 +61,7 @@ const PAGES: { id: PageId; label: string; value: (o: Overview) => string }[] = [
   { id: "microphone", label: "Microphone", value: (o) => o.settings.microphone || "Default" },
   { id: "hotkeys", label: "Hotkeys", value: (o) => o.settings.hotkey.dictate || "None" },
   { id: "bubble", label: "Bubble", value: (o) => ({ always: "Shown", whileDictating: "When used", hidden: "Hidden" })[o.settings.bubble.visibility] },
-  { id: "insert", label: "Delivery", value: (o) => o.platform === "linux" && !o.settings.insert.pasteOnCompletion ? "Review" : o.settings.insert.method === "paste" ? "Ctrl+V" : "Type" },
+  { id: "insert", label: "Delivery", value: (o) => o.platform === "linux" ? (o.settings.insert.pasteOnCompletion ? "Clipboard" : "Review") : o.settings.insert.method === "paste" ? "Ctrl+V" : "Type" },
   { id: "phone", label: "Phone", value: (o) => (o.settings.phone.enabled ? "On" : "Off") },
   { id: "history", label: "History", value: (o) => (o.settings.history ? `${o.settings.historyDays} days` : "Off") },
   { id: "statistics", label: "Statistics", value: (o) => (o.settings.statistics ? "" : "Off") },

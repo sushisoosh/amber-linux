@@ -83,7 +83,7 @@ pub fn init(app: &AppHandle) {
         session: session.into(),
         shortcuts: "Not registered.".into(),
         insertion: if session == "x11" {
-            "Opted-in completion copies the result and attempts Ctrl+V for single-line text. Delivery settings control whether any application is eligible and whether to use the focused window at delivery instead of the original target. The selected target must stay unchanged during paste; editable fields and insertion cannot be verified."
+            "Opted-in completion copies the result and sends the configured paste shortcut for single-line text. Delivery settings control the shortcut, eligible applications, and whether to use the focused window at delivery instead of the original target. The selected target must stay unchanged during paste; editable fields and insertion cannot be verified."
         } else {
             "Manual paste only. Copy on completion requires Amber to be focused on Wayland; otherwise open the result and use Copy. Target identity and permission-based RemoteDesktop/Clipboard insertion are not implemented; no automatic paste is attempted."
         }.into(),
@@ -672,6 +672,7 @@ fn completion_allowed(cancel: &amber_core::engine::CancellationToken, settings: 
             amber_core::insertion::paste_on_completion(&current.insert, true, false)
                 && (!settings.paste_into_any_window || current.insert.paste_into_any_window)
                 && (!settings.paste_into_different_window || current.insert.paste_into_different_window)
+                && settings.paste_shortcut == current.insert.paste_shortcut
         })
 }
 
@@ -697,7 +698,7 @@ pub fn deliver(text: &str, settings: &InsertSettings, target: Option<X11Target>,
             "The text is on the clipboard. Automatic paste is unavailable for this result or target; paste manually where you want it.".into(),
         ));
     };
-    match x11::paste_copied(text, target, settings.paste_into_any_window, Some(owner), &allowed) {
+    match x11::paste_copied(text, target, settings.paste_into_any_window, &settings.paste_shortcut, Some(owner), &allowed) {
         Ok(_) => Ok(crate::insert::Outcome::Pasted),
         Err(error) => {
             // Never retry copying after an uncertain paste or overwrite a newer user copy.
@@ -869,11 +870,11 @@ mod x11 {
         Ok(state.group.into())
     }
 
-    fn paste_keyboard(conn: &RustConnection) -> Result<PasteKeyboard, String> {
+    fn paste_keyboard(conn: &RustConnection, requested_modifiers: u8) -> Result<PasteKeyboard, String> {
         let group = paste_keyboard_group(conn)?;
         let device = u16::from(xkb::ID::USE_CORE_KBD);
         let controls = conn.xkb_get_controls(device).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
-        if u16::from(controls.internal_mods_mask) & 4 != 0
+        if u16::from(controls.internal_mods_mask) & u16::from(requested_modifiers) != 0
             || u32::from(controls.enabled_controls & (xkb::BoolCtrl::SLOW_KEYS | xkb::BoolCtrl::BOUNCE_KEYS | xkb::BoolCtrl::STICKY_KEYS)) != 0
         {
             return Err("Keyboard accessibility controls require manual paste; Amber will not change them.".into());
@@ -908,15 +909,19 @@ mod x11 {
 
     /// Explicitly requested or opted-in delivery only. No foreground switching, automatic
     /// retry, synthetic Enter, clipboard restoration, or root/input helper.
-    pub fn paste_explicit(text: &str, target: X11Target, any_window: bool) -> Result<Submission, String> {
-        let allowed = || !any_window || DESKTOP.get().is_none_or(|d| d.app.state::<Core>().settings().insert.paste_into_any_window);
-        paste_copied(text, target, any_window, None, &allowed)
+    pub fn paste_explicit(text: &str, target: X11Target, any_window: bool, shortcut: &str) -> Result<Submission, String> {
+        let allowed = || DESKTOP.get().is_none_or(|d| {
+            let current = d.app.state::<Core>().settings();
+            (!any_window || current.insert.paste_into_any_window) && current.insert.paste_shortcut == shortcut
+        });
+        paste_copied(text, target, any_window, shortcut, None, &allowed)
     }
 
-    pub(super) fn paste_copied(text: &str, target: X11Target, any_window: bool, clipboard: Option<(u32, u32)>, allowed: &dyn Fn() -> bool) -> Result<Submission, String> {
+    pub(super) fn paste_copied(text: &str, target: X11Target, any_window: bool, shortcut: &str, clipboard: Option<(u32, u32)>, allowed: &dyn Fn() -> bool) -> Result<Submission, String> {
         if session_is_blocked() || !allowed() {
             return Err("Paste blocked while the session is locked, suspended, or being checked.".into());
         }
+        let shortcut = amber_core::insertion::PasteShortcut::parse(shortcut)?;
         let (conn, _) = connect()?;
         if snapshot(&conn, target.root)? != target {
             return Err("The target window or input focus changed. Nothing was pasted.".into());
@@ -932,14 +937,14 @@ mod x11 {
         if u16::from(conn.query_pointer(target.root).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.mask) & 0xff != 0 {
             return Err("Active or locked keyboard modifiers require manual paste. Nothing was pasted.".into());
         }
-        let keyboard = paste_keyboard(&conn)?;
-        let (control, v) = amber_core::insertion::ctrl_v_keycodes(keyboard.min, &keyboard.keys, &keyboard.types, keyboard.group, &keyboard.modifiers)
-            .ok_or("No Ctrl+V keyboard/modifier mapping in the active XKB layout; use manual paste")?;
+        let keyboard = paste_keyboard(&conn, shortcut.modifiers)?;
+        let keys = amber_core::insertion::paste_keycodes(keyboard.min, &keyboard.keys, &keyboard.types, keyboard.group, &keyboard.modifiers, &shortcut)
+            .ok_or("No matching keyboard/modifier mapping for the configured paste shortcut in the active XKB layout; use manual paste")?;
         let (owner, selection) = match clipboard {
             Some(owner) => owner,
             None => own_clipboard_guarded(text, allowed)?,
         };
-        // Freeze other clients only for the final target/ownership checks and four events.
+        // Freeze other clients only for the final target/ownership checks and shortcut events.
         // No sleeps or clipboard transfer while grabbed. The server releases on disconnect.
         conn.grab_server().map_err(|e| e.to_string())?.check().map_err(|e| e.to_string())?;
         let result = (|| {
@@ -952,7 +957,7 @@ mod x11 {
             if paste_program(&conn, target, text, any_window)? != class {
                 return Err("The target application or window type changed. No paste was sent.".into());
             }
-            if paste_keyboard(&conn)? != keyboard {
+            if paste_keyboard(&conn, shortcut.modifiers)? != keyboard {
                 return Err("The keyboard mapping or active layout changed. The result is on the clipboard, but no paste was sent.".into());
             }
             if conn.get_selection_owner(selection).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.owner != owner {
@@ -972,15 +977,20 @@ mod x11 {
                 return Err("The active keyboard layout changed. No paste was sent.".into());
             }
             let mut failure = None;
-            for (event, key) in [(KEY_PRESS_EVENT, control), (KEY_PRESS_EVENT, v), (KEY_RELEASE_EVENT, v), (KEY_RELEASE_EVENT, control)] {
-                // Always attempt the releases, including after a partial submission failure.
-                if failure.is_some() && event == KEY_PRESS_EVENT {
-                    continue;
-                }
-                if let Err(e) =
-                    conn.xtest_fake_input(event, key, 0, target.root, 0, 0, 0).map_err(|e| e.to_string()).and_then(|c| c.check().map_err(|e| e.to_string()))
-                {
+            let mut attempted = 0;
+            for &key in &keys {
+                attempted += 1;
+                if let Err(e) = conn.xtest_fake_input(KEY_PRESS_EVENT, key, 0, target.root, 0, 0, 0)
+                    .map_err(|e| e.to_string()).and_then(|c| c.check().map_err(|e| e.to_string())) {
                     failure = Some(e);
+                    break;
+                }
+            }
+            // Release every attempted key, including an uncertain press, but no untouched keys.
+            for &key in keys[..attempted].iter().rev() {
+                if let Err(e) = conn.xtest_fake_input(KEY_RELEASE_EVENT, key, 0, target.root, 0, 0, 0)
+                    .map_err(|e| e.to_string()).and_then(|c| c.check().map_err(|e| e.to_string())) {
+                    failure.get_or_insert(e);
                 }
             }
             if let Some(e) = failure {
@@ -1417,23 +1427,23 @@ mod x11 {
             assert_ne!(conn.query_tree(target.window).unwrap().reply().unwrap().parent, root);
             let second = editor(&conn, root);
             assert_ne!(second.window, target.window);
-            assert!(paste_explicit("stale window", target, true).is_err());
+            assert!(paste_explicit("stale window", target, true, "Ctrl+KeyV").is_err());
             let child = create(&conn, second.window);
             conn.map_window(child).unwrap().check().unwrap();
             conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             let leaf = snapshot(&conn, root).unwrap();
             assert_eq!((leaf.window, leaf.focus), (second.window, child));
             assert_eq!(remember_target(), Some(leaf));
-            assert!(paste_explicit("stale focus", second, true).unwrap_err().contains("changed"));
+            assert!(paste_explicit("stale focus", second, true, "Ctrl+KeyV").unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, second.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(paste_explicit("stale leaf", leaf, true).unwrap_err().contains("changed"));
+            assert!(paste_explicit("stale leaf", leaf, true, "Ctrl+KeyV").unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(snapshot(&conn, root).is_err(), "Unrelated active window and focus must fail closed");
             conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(remember_target().is_none());
             conn.destroy_window(second.window).unwrap().check().unwrap();
             conn.destroy_window(target.window).unwrap().check().unwrap();
-            assert!(paste_explicit("destroyed", leaf, true).is_err());
+            assert!(paste_explicit("destroyed", leaf, true, "Ctrl+KeyV").is_err());
             assert!(key_events(&conn).is_empty());
         }
 
@@ -1537,7 +1547,7 @@ mod x11 {
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             for value in [b"Mousepad\0XTerm\0".as_slice(), b"test\0firefox\0", b"test\0unknown\0", b"test\0Mousepad", b"test\0Mousepad\0extra"] {
                 class(&conn, target.window, value);
-                assert!(paste_explicit("not a terminal command", target, false).is_err());
+                assert!(paste_explicit("not a terminal command", target, false, "Ctrl+KeyV").is_err());
             }
             class(&conn, target.window, b"test\0Mousepad\0");
             for pid in [0, std::process::id(), target.pid + 1] {
@@ -1545,7 +1555,7 @@ mod x11 {
                     .unwrap()
                     .check()
                     .unwrap();
-                assert!(paste_explicit("unknown, own or stale process", target, true).is_err());
+                assert!(paste_explicit("unknown, own or stale process", target, true, "Ctrl+KeyV").is_err());
             }
             conn.change_property32(PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_PID").unwrap(), AtomEnum::CARDINAL, &[target.pid])
                 .unwrap()
@@ -1553,7 +1563,7 @@ mod x11 {
                 .unwrap();
             for text in ["", "line\nline", "line\rline", "line\u{2028}line", "line\u{2029}line", "\u{1b}[31m"] {
                 for any_window in [false, true] {
-                    assert!(paste_explicit(text, target, any_window).is_err(), "Should reject {text:?}");
+                    assert!(paste_explicit(text, target, any_window, "Ctrl+KeyV").is_err(), "Should reject {text:?}");
                 }
             }
             conn.change_property32(
@@ -1566,7 +1576,7 @@ mod x11 {
             .unwrap()
             .check()
             .unwrap();
-            assert!(paste_explicit("dialog", target, false).is_err());
+            assert!(paste_explicit("dialog", target, false, "Ctrl+KeyV").is_err());
             conn.change_property32(
                 PropMode::REPLACE,
                 target.window,
@@ -1581,7 +1591,7 @@ mod x11 {
             class(&conn, child, b"test\0XTerm\0");
             conn.map_window(child).unwrap().check().unwrap();
             conn.set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(paste_explicit("embedded terminal", snapshot(&conn, root).unwrap(), false).unwrap_err().contains("child application"));
+            assert!(paste_explicit("embedded terminal", snapshot(&conn, root).unwrap(), false, "Ctrl+KeyV").unwrap_err().contains("child application"));
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             assert!(key_events(&conn).is_empty());
@@ -1593,20 +1603,20 @@ mod x11 {
             let unused = changed.iter().rposition(|&code| code == 0).unwrap();
             changed[unused] = v;
             assert_eq!(conn.set_modifier_mapping(&changed).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
-            assert!(paste_explicit("V mapped as a modifier", target, true).unwrap_err().contains("modifier mapping"));
+            assert!(paste_explicit("V mapped as a modifier", target, true, "Ctrl+KeyV").unwrap_err().contains("modifier mapping"));
             assert_eq!(conn.set_modifier_mapping(&modifiers).unwrap().reply().unwrap().status, MappingStatus::SUCCESS);
             key(&conn, root, control, true);
-            assert!(paste_explicit("held key", target, true).unwrap_err().contains("Release all keys"));
+            assert!(paste_explicit("held key", target, true, "Ctrl+KeyV").unwrap_err().contains("Release all keys"));
             assert_ne!(conn.query_keymap().unwrap().reply().unwrap().keys[control as usize / 8] & (1 << (control % 8)), 0, "Never release a user's held key");
             key(&conn, root, control, false);
             key(&conn, root, caps, true);
             key(&conn, root, caps, false);
-            assert!(paste_explicit("locked modifier", target, true).unwrap_err().contains("modifiers"));
+            assert!(paste_explicit("locked modifier", target, true, "Ctrl+KeyV").unwrap_err().contains("modifiers"));
             key(&conn, root, caps, true);
             key(&conn, root, caps, false);
             key_events(&conn);
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
-            let result = paste_explicit("Explicit native paste", target, false).unwrap();
+            let result = paste_explicit("Explicit native paste", target, false, "Ctrl+KeyV").unwrap();
             assert!(result.submitted && !result.confirmed);
             assert_eq!(
                 key_events(&conn),
@@ -1686,7 +1696,7 @@ mod x11 {
                 }
                 let before = (map.serialize(), keyboard.state(group));
                 key_events(conn); // Discard only fixture setup notifications, before paste.
-                let result = paste_explicit("Colemak and active layout regression", target, true).unwrap();
+                let result = paste_explicit("Colemak and active layout regression", target, true, "Ctrl+KeyV").unwrap();
                 assert!(result.submitted && !result.confirmed);
                 let group_mask = u16::from(group) << 13;
                 let control_mask = group_mask | u16::from(KeyButMask::CONTROL);
@@ -1704,6 +1714,67 @@ mod x11 {
 
         #[test]
         #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
+        fn configured_shortcuts_apply_to_explicit_and_completion_paste() {
+            let keyboard = IsolatedKeyboard::new();
+            keyboard.layout("us", "colemak").unwrap();
+            let conn = &keyboard.conn;
+            let target = editor(conn, keyboard.root);
+            let clipboard = atom(conn, "CLIPBOARD").unwrap();
+            let utf8 = atom(conn, "UTF8_STRING").unwrap();
+            let control = keycode(conn, 0xffe3);
+            let shift = keycode(conn, 0xffe1);
+            let alt = keycode(conn, 0xffe9);
+            let super_key = keycode(conn, 0xffeb);
+            let v = keycode(conn, 0x76);
+            let insert = keycode(conn, 0xff63);
+            let p = keycode(conn, 0x70);
+            let f8 = keycode(conn, 0xffc5);
+            let before = (keyboard.map().serialize(), keyboard.state(0));
+            key_events(conn);
+            for (shortcut, keys) in [
+                ("Ctrl+KeyV", vec![(control, 4), (v, 0)]),
+                ("Ctrl+Shift+KeyV", vec![(control, 4), (shift, 1), (v, 0)]),
+                ("Shift+Insert", vec![(shift, 1), (insert, 0)]),
+                ("Alt+KeyP", vec![(alt, 8), (p, 0)]),
+                ("Super+KeyV", vec![(super_key, 64), (v, 0)]),
+                ("Ctrl+Alt+Shift+Super+KeyV", vec![(control, 4), (alt, 8), (shift, 1), (super_key, 64), (v, 0)]),
+                ("F8", vec![(f8, 0)]),
+            ] {
+                let mut expected = Vec::new();
+                let mut modifiers = 0;
+                for &(key, mask) in &keys {
+                    expected.push((KEY_PRESS_EVENT, key, target.focus, modifiers));
+                    modifiers |= mask;
+                }
+                for &(key, mask) in keys.iter().rev() {
+                    expected.push((KEY_RELEASE_EVENT, key, target.focus, modifiers));
+                    modifiers &= !mask;
+                }
+                assert!(paste_explicit("Configured explicit paste", target, true, shortcut).unwrap().submitted, "{shortcut}");
+                assert_eq!(keyboard.paste_events(), expected, "Explicit {shortcut}");
+                assert_eq!(conversion(conn, target.window, utf8, utf8).unwrap().value, b"Configured explicit paste");
+                let settings = InsertSettings { paste_on_completion: true, paste_shortcut: shortcut.into(), ..Default::default() };
+                assert!(matches!(crate::insert::insert("Configured completion paste", &settings, crate::insert::remember()), Ok(crate::insert::Outcome::Pasted)), "{shortcut}");
+                assert_eq!(keyboard.paste_events(), expected, "Completion {shortcut}");
+                assert_eq!(conversion(conn, target.window, utf8, utf8).unwrap().value, b"Configured completion paste");
+                assert_eq!((keyboard.map().serialize(), keyboard.state(0)), before, "{shortcut} must not remap or leave modifiers held");
+                assert_eq!(remember_target(), Some(target));
+            }
+            for shortcut in ["", "Ctrl+Enter", "Ctrl+V+V", "KeyV", "Ctrl+Unknown"] {
+                conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+                assert!(paste_explicit("Invalid explicit binding", target, true, shortcut).is_err(), "{shortcut}");
+                assert!(key_events(conn).is_empty());
+                assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
+                let settings = InsertSettings { paste_on_completion: true, paste_shortcut: shortcut.into(), ..Default::default() };
+                assert!(matches!(crate::insert::insert("Invalid completion binding", &settings, crate::insert::remember()), Ok(crate::insert::Outcome::OnClipboard(_))), "{shortcut}");
+                assert!(key_events(conn).is_empty(), "Invalid bindings must never fall back to Ctrl+V");
+                assert_eq!(conversion(conn, target.window, utf8, utf8).unwrap().value, b"Invalid completion binding");
+            }
+            conn.destroy_window(target.window).unwrap().check().unwrap();
+        }
+
+        #[test]
+        #[ignore = "Requires the disposable authenticated Xvfb+i3 from tools/test-x11.py"]
         fn active_group_change_before_paste_sends_nothing_and_is_not_restored() {
             let keyboard = IsolatedKeyboard::new();
             let conn = &keyboard.conn;
@@ -1715,7 +1786,7 @@ mod x11 {
             let switched = std::cell::Cell::new(None);
             let checks = std::cell::Cell::new(0);
             key_events(conn);
-            let error = paste_copied("Active group changed during publication", target, true, None, &|| {
+            let error = paste_copied("Active group changed during publication", target, true, "Ctrl+KeyV", None, &|| {
                 checks.set(checks.get() + 1);
                 if checks.get() == 2 {
                     // Roundtrip only before the server grab, at clipboard publication.
@@ -1793,7 +1864,7 @@ mod x11 {
             let target = editor(&conn, root);
             for value in [b"test\0firefox\0".as_slice(), b"test\0XTerm\0", b"test\0unknown\0", b"malformed"] {
                 class(&conn, target.window, value);
-                assert!(paste_explicit("Broad explicit paste", target, true).unwrap().submitted);
+                assert!(paste_explicit("Broad explicit paste", target, true, "Ctrl+KeyV").unwrap().submitted);
                 assert_eq!(key_events(&conn).len(), 4);
             }
             conn.delete_property(target.window, AtomEnum::WM_CLASS.into()).unwrap().check().unwrap();
@@ -1801,17 +1872,17 @@ mod x11 {
                 PropMode::REPLACE, target.window, atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap(), AtomEnum::ATOM,
                 &[atom(&conn, "_NET_WM_WINDOW_TYPE_DIALOG").unwrap()],
             ).unwrap().check().unwrap();
-            assert!(paste_explicit("Dialog without an application class", target, true).unwrap().submitted);
+            assert!(paste_explicit("Dialog without an application class", target, true, "Ctrl+KeyV").unwrap().submitted);
             assert_eq!(key_events(&conn).len(), 4);
             conn.delete_property(target.window, atom(&conn, "_NET_WM_WINDOW_TYPE").unwrap()).unwrap().check().unwrap();
-            assert!(paste_explicit("Unknown window type", target, true).unwrap().submitted);
+            assert!(paste_explicit("Unknown window type", target, true, "Ctrl+KeyV").unwrap().submitted);
             assert_eq!(key_events(&conn).len(), 4);
 
             let child = create(&conn, target.window);
             class(&conn, child, b"test\0XTerm\0");
             conn.map_window(child).unwrap().check().unwrap();
             let checks = std::cell::Cell::new(0);
-            let error = paste_copied("Focus race", target, true, None, &|| {
+            let error = paste_copied("Focus race", target, true, "Ctrl+KeyV", None, &|| {
                 checks.set(checks.get() + 1);
                 if checks.get() == 2 {
                     // Change focus at clipboard publication, before the final server grab.
@@ -1822,7 +1893,7 @@ mod x11 {
             assert!(error.contains("target changed"), "{error}");
             assert!(key_events(&conn).is_empty(), "Broad eligibility must not bypass the final target check");
             let leaf = snapshot(&conn, root).unwrap();
-            assert!(paste_explicit("Embedded application", leaf, true).unwrap().submitted);
+            assert!(paste_explicit("Embedded application", leaf, true, "Ctrl+KeyV").unwrap().submitted);
             let events = key_events(&conn);
             assert_eq!(events.len(), 4);
             assert!(events.iter().all(|event| event.2 == child));
@@ -1843,10 +1914,10 @@ mod x11 {
             assert!(own_clipboard_guarded("revoked at publication", &|| false).is_err());
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             let owner = own_clipboard("published before cancellation").unwrap();
-            assert!(paste_copied("published before cancellation", target, true, Some(owner), &|| false).is_err());
+            assert!(paste_copied("published before cancellation", target, true, "Ctrl+Shift+KeyV", Some(owner), &|| false).is_err());
             assert!(owns_clipboard(owner).unwrap());
             conn.set_selection_owner(target.window, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(paste_copied("never overwrite the user's newer copy", target, true, Some(owner), &|| true).unwrap_err().contains("clipboard changed"));
+            assert!(paste_copied("never overwrite the user's newer copy", target, true, "Shift+Insert", Some(owner), &|| true).unwrap_err().contains("clipboard changed"));
             assert_eq!(conn.get_selection_owner(clipboard).unwrap().reply().unwrap().owner, target.window);
             assert!(key_events(&conn).is_empty());
             assert_eq!(remember_target(), Some(target));

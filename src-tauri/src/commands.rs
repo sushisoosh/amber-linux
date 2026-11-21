@@ -201,6 +201,8 @@ fn save_settings_inner(app: &AppHandle, core: &Core, settings: Settings) -> Resu
     let _transaction = core.settings_changes.lock().unwrap();
     amber_core::connections::validate(&settings.connections)?;
     amber_core::instructions::validate(&settings.instructions)?;
+    #[cfg(target_os = "linux")]
+    amber_core::insertion::PasteShortcut::parse(&settings.insert.paste_shortcut)?;
     let before = core.settings();
     if settings.history && !before.history {
         crate::secrets::check_available()?;

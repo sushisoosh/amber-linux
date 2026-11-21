@@ -218,7 +218,7 @@ impl Default for BubbleSettings {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum InsertMethod {
-    /// Clipboard + Ctrl+V; works almost everywhere, fast for long text.
+    /// Clipboard + paste shortcut (Ctrl+V by default); fast for long text.
     Paste,
     /// Unicode keystrokes; leaves the clipboard alone, slower, some apps drop characters.
     Type,
@@ -228,6 +228,8 @@ pub enum InsertMethod {
 #[serde(default, rename_all = "camelCase")]
 pub struct InsertSettings {
     pub method: InsertMethod,
+    /// X11: one paste chord. Keep invalid saved values so delivery fails closed.
+    pub paste_shortcut: String,
     /// Linux opt-in. Older Linux versions ignored `method`, so it is not consent to paste.
     pub paste_on_completion: bool,
     /// X11: allow any application/window type instead of only known native editors.
@@ -243,7 +245,7 @@ pub struct InsertSettings {
 impl Default for InsertSettings {
     fn default() -> Self {
         InsertSettings {
-            method: InsertMethod::Paste, paste_on_completion: false, paste_into_any_window: true,
+            method: InsertMethod::Paste, paste_shortcut: "Ctrl+KeyV".into(), paste_on_completion: false, paste_into_any_window: true,
             paste_into_different_window: false, restore_clipboard: true, trailing_space: true,
         }
     }
@@ -708,6 +710,27 @@ mod tests {
                 assert_eq!(restored.insert, settings.insert);
                 assert!(!restored.insert.paste_on_completion);
             }
+        }
+    }
+
+    #[test]
+    fn x11_paste_shortcut_defaults_and_saved_values_are_not_rewritten() {
+        for json in ["{}", r#"{"insert":{}}"#, r#"{"insert":{"method":"paste","pasteOnCompletion":true}}"#] {
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.insert.paste_shortcut, "Ctrl+KeyV");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::load_linux(&path).0;
+        assert_eq!(settings.insert.paste_shortcut, "Ctrl+KeyV");
+        for shortcut in ["Ctrl+KeyV", "Ctrl+Shift+KeyV", "Shift+Insert", "Alt+KeyQ", "F24", "", "Ctrl+Enter", "nonsense"] {
+            settings.insert.paste_shortcut = shortcut.into();
+            settings.save(&path).unwrap();
+            assert_eq!(serde_json::to_value(&settings).unwrap()["insert"]["pasteShortcut"], shortcut);
+            let (restored, error) = Settings::load_linux(&path);
+            assert!(error.is_none());
+            assert_eq!(restored.insert.paste_shortcut, shortcut, "Invalid hand-edited values must reach runtime validation unchanged");
+            assert_eq!(restored.insert, settings.insert);
         }
     }
 
