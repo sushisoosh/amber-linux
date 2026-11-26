@@ -62,18 +62,16 @@ export class Fire {
   private bars = [0, 0, 0];
   private visual: Visual = "idle";
   private since = performance.now();
-  /** While working: the expected duration; the rim fills against it. */
-  private expectedMs: number | null = null;
+  private ring = new ProgressRing();
   level = 0;
 
   expect(ms: number | null) {
-    this.expectedMs = ms;
-    this.since = performance.now();
+    if (ms !== null) this.ring.expect(ms, performance.now());
   }
 
   set(visual: Visual) {
     if (visual === this.visual) return;
-    if (visual !== "working") this.expectedMs = null;
+    if (visual !== "working") this.ring.reset();
     this.visual = visual;
     this.since = performance.now();
     if (visual === "error") this.sparks = [];
@@ -112,7 +110,8 @@ export class Fire {
         break;
       case "working":
         this.drawFlame(ctx, cx, cy, r, elapsed);
-        if (this.expectedMs) this.drawRing(ctx, cx, cy, r, progress(elapsed, this.expectedMs));
+        const fraction = this.ring.at(now);
+        if (fraction !== null) this.drawRing(ctx, cx, cy, r, fraction);
         else this.drawFuse(ctx, cx, cy, r, elapsed);
         break;
       case "done":
@@ -291,8 +290,35 @@ function easeOut(t: number) {
  * looking ring waiting. Same curve as Amber for Android and estimate.rs.
  */
 export function progress(elapsed: number, expected: number): number {
-  if (expected <= 0) return 0;
+  if (!Number.isFinite(elapsed) || !Number.isFinite(expected) || expected <= 0) return 0;
   const t = elapsed / expected;
   if (t <= 0.9) return Math.max(0, t);
-  return 0.9 + (0.98 - 0.9) * (1 - Math.exp(-(t - 0.9) * 2));
+  return Math.min(0.98, 0.9 + (0.98 - 0.9) * (1 - Math.exp(-(t - 0.9) * 2)));
+}
+
+/** Each event budgets remaining work from the current fraction, never from zero. */
+export class ProgressRing {
+  private since = 0;
+  private expected: number | null = null;
+  private anchor = 0;
+  private value = 0;
+
+  reset() {
+    this.expected = null;
+    this.anchor = this.value = 0;
+  }
+
+  expect(remainingMs: number, now: number) {
+    if (!Number.isFinite(remainingMs) || remainingMs < 0 || !Number.isFinite(now)) return;
+    this.anchor = this.at(now) ?? 0;
+    this.since = now;
+    this.expected = Math.max(1, remainingMs);
+  }
+
+  at(now: number): number | null {
+    if (this.expected === null) return null;
+    const next = this.anchor + (0.98 - this.anchor) * progress(now - this.since, this.expected) / 0.98;
+    this.value = Math.min(0.98, Math.max(this.value, next));
+    return this.value;
+  }
 }

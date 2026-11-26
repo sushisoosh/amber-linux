@@ -9,6 +9,41 @@ import type { PageProps } from "../App";
 import { DEFAULT_HISTORY_FILTERS, filterHistory, historyPrograms, type HistoryFilters } from "../history";
 import { Row, Section, Switch } from "../ui";
 
+export function HistoryTimings({ entries }: { entries: readonly HistoryEntry[] }) {
+  const duration = (ms: number | null | undefined) => ms == null ? "Not measured" : ms.toLocaleString();
+  return <>
+    <div className="comparison-legend" id="history-timings-legend">
+      Everyday dictation timings in milliseconds, kept and deleted with history. The current filters apply.
+      Transcription measures work after recording stops (only the remaining work for live chunking), including model setup and retries.
+      Cleanup includes rules and any smart-cleanup attempt, not just successful model work.
+      Processing total runs from stop or retry to cleaned text, including preparation but excluding recording and insertion.
+      Retries have no new recording. Older entries, phone requests and terminal commands may have no measurements.
+      Scroll horizontally for all columns.
+    </div>
+    <div className="comparison-scroll" role="region" aria-label="Everyday dictation timings" aria-describedby="history-timings-legend" tabIndex={0}>
+      <table className="comparison-table">
+        <caption className="visually-hidden">Performance of saved dictations</caption>
+        <thead><tr>
+          <th scope="col">Dictation / Engine</th>
+          <th scope="col" className="comparison-number">Recording<span>ms</span></th>
+          <th scope="col" className="comparison-number">Transcription after stop<span>ms</span></th>
+          <th scope="col" className="comparison-number">Cleanup pipeline<span>ms</span></th>
+          <th scope="col" className="comparison-number">Processing total<span>ms</span></th>
+          <th scope="col" className="comparison-preview">Text preview</th>
+        </tr></thead>
+        <tbody>{entries.map((e) => <tr key={e.at}>
+          <th scope="row" className="comparison-model"><span>{new Date(e.at).toLocaleString()}</span><small>{e.program.trim() || "Unknown program"} / {e.engine}</small>{e.timings?.live && <small>Live chunking: remaining work only</small>}</th>
+          <td className="comparison-number">{e.timings && e.timings.recordingMs === null ? "Retry: no new recording" : duration(e.timings?.recordingMs)}</td>
+          <td className="comparison-number">{duration(e.timings?.transcriptionMs)}</td>
+          <td className="comparison-number">{duration(e.timings?.cleanupMs)}{e.timings?.cleanupSkipped && <small>Smart cleanup skipped or failed; fallback text kept</small>}</td>
+          <td className="comparison-number comparison-total">{duration(e.timings?.processingMs)}</td>
+          <td className="comparison-preview"><div>{e.text.slice(0, 160)}{e.text.length > 160 && "..."}</div></td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </>;
+}
+
 export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProps) {
   const linux = ov.platform === "linux";
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
@@ -57,6 +92,7 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
     <>
       <h1>History</h1>
       <p className="lead">{linux ? "Persistent history is opt-in and requires an available Secret Service wallet for encryption. The recorder keeps its latest result in memory independently. Copying is always your choice." : "Your last dictations, kept on this PC only and encrypted for your Windows account. Copy one to put it where it should have gone."}</p>
+      <p className="note">Progress estimates learn separately from successful recognition and smart-cleanup requests for your execution settings. Compact counts, averages and variation are kept locally indefinitely, even with history and statistics off or after deleting history; no audio, transcripts or individual timing records are retained for this learning. The ring budgets both stages and refines cleanup after recognition. Model loading, retries, fallback and system load can extend the wait; the ring never signals completion while work is running.</p>
       <Section>
         <Row label="Keep a history" hint={linux ? "Turning this off requests deletion of saved history. A storage failure is reported, not silently replaced with plaintext." : "Off deletes what is kept."}>
           <Switch on={s.history} onChange={(v) => save((x) => (x.history = v))} />
@@ -161,6 +197,7 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
                     : "No saved dictations yet. New dictations will appear here while history is on."}
             </div>
           )}
+          {visibleEntries.length > 0 && <HistoryTimings entries={visibleEntries} />}
           {visibleEntries.map((e) => (
             <div className="item" key={e.at} style={{ alignItems: "flex-start", flexWrap: "wrap" }}>
               <div className="name" style={{ flexBasis: 240 }}>

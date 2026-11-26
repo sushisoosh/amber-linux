@@ -42,6 +42,8 @@ struct Running {
     base: String,
     key: Key,
     model: SpeechModel,
+    effective_runtime: String,
+    threads: u32,
 }
 
 impl Running {
@@ -51,7 +53,7 @@ impl Running {
             running, changes, base: self.base.clone(), transcriber: WhisperServerTranscriber::new(&self.base, slack),
             model: self.model.clone(),
         });
-        Served { transcriber, runtime: self.key.runtime.clone(), model: self.key.model.clone() }
+        Served { transcriber, runtime: self.effective_runtime.clone(), model: self.key.model.clone(), threads: self.threads }
     }
 }
 
@@ -61,6 +63,7 @@ pub struct Served {
     pub transcriber: Box<dyn Transcriber>,
     pub runtime: String,
     pub model: String,
+    pub threads: u32,
 }
 
 #[derive(Default)]
@@ -137,7 +140,7 @@ impl Whisper {
             speech.load(&model.id, &CancellationToken::default()).map_err(|error| error.message)?;
             let transcriber = Box::new(OnnxEngine { transcriber: speech.engine(&model.id)?, changes: self.changes.clone() });
             self.set_status(app, Status::of("ready", Some(format!("{} on CPU (ONNX)", model.label))));
-            return Ok(Served { transcriber, runtime: "onnx-cpu".into(), model: model.id.into() });
+            return Ok(Served { transcriber, runtime: "onnx-cpu".into(), model: model.id.into(), threads: 0 });
         }
 
         let rt = local::runtime(&key.runtime).ok_or("Unknown runtime.")?;
@@ -178,7 +181,13 @@ impl Whisper {
             core.llm.warm(app, true);
         }
         match spawned {
-            Ok(r) => {
+            Ok(mut r) => {
+                let gpu = if rt.id == "cuda" { self.gpu_in_use() } else { None };
+                r.effective_runtime = match (rt.id, gpu) {
+                    ("cuda", Some(false)) => "cuda-cpu".into(),
+                    ("cuda", None) => "cuda-unknown".into(),
+                    _ => rt.id.into(),
+                };
                 let served = r.served(self.running.clone(), self.changes.clone());
                 if model.short_context {
                     // Leaves the server at a short context for its first language detection
@@ -188,7 +197,6 @@ impl Whisper {
                 }
                 crate::diag::info(format!("local engine ready: {} on {} in {} ms", model.label, rt.label, started.elapsed().as_millis()));
                 *running = Some(r);
-                let gpu = if rt.id == "cuda" { self.gpu_in_use() } else { None };
                 let message = if gpu == Some(false) {
                     // whisper.cpp falls back to the CPU without complaint; say it out loud.
                     crate::diag::warn(format!("GPU not used, running on the CPU: {}", self.last_output()));
@@ -225,7 +233,7 @@ impl Whisper {
         // answers 503 until then.
         let base = format!("http://127.0.0.1:{port}{path}");
         let deadline = Instant::now() + START_TIMEOUT;
-        let mut running = Running { child, base: base.clone(), key: key.clone(), model: model.clone() };
+        let mut running = Running { child, base: base.clone(), key: key.clone(), model: model.clone(), effective_runtime: key.runtime.clone(), threads };
         loop {
             if let Ok(Some(status)) = running.child.try_wait() {
                 return Err(format!("The local engine stopped while loading ({status}). {}", self.explain()));

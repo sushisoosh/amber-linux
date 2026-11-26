@@ -85,8 +85,15 @@ impl Llm {
 
     /// The running server, if it is the configured one and done loading - never waits. If
     /// not, a load starts in the background (unless the last one failed a moment ago).
-    pub fn ready(&self, app: &AppHandle) -> Option<Endpoint> {
-        let c = app.state::<Core>().settings().cleanup;
+    fn ready_for(&self, app: &AppHandle, s: &Settings) -> Option<Endpoint> {
+        if let Some(endpoint) = self.ready_snapshot(s) { return Some(endpoint); }
+        self.warm(app, false);
+        None
+    }
+
+    /// Non-blocking prediction must neither load a model nor assume it will become ready.
+    fn ready_snapshot(&self, s: &Settings) -> Option<Endpoint> {
+        let c = &s.cleanup;
         if let Ok(mut running) = self.running.try_lock() {
             if let Some(r) = running.as_mut() {
                 if matches!(r.child.try_wait(), Ok(None)) && r.key.runtime == c.local_runtime && r.key.model == c.local_model {
@@ -94,7 +101,6 @@ impl Llm {
                 }
             }
         }
-        self.warm(app, false);
         None
     }
 
@@ -304,6 +310,10 @@ pub fn wants_local(s: &Settings) -> bool {
 /// The client for the smart cleanup the settings ask for - or why not. [wait]: for the local
 /// model, wait while it loads (the settings page's preview) instead of skipping (a dictation).
 pub fn cleaner(app: &AppHandle, s: &Settings, wait: bool) -> Result<ChatCleaner, String> {
+    cleaner_measured(app, s, wait, None, None).map(|(cleaner, _)| cleaner)
+}
+
+fn cleaner_measured(app: &AppHandle, s: &Settings, wait: bool, profile: Option<&Profile>, recognized: Option<&str>) -> Result<(ChatCleaner, Option<amber_core::estimate::Route>), String> {
     let c = &s.cleanup;
     match c.engine {
         EngineKind::Local => {
@@ -311,10 +321,11 @@ pub fn cleaner(app: &AppHandle, s: &Settings, wait: bool) -> Result<ChatCleaner,
             let endpoint = if wait {
                 llm.ensure(app)?
             } else {
-                llm.ready(app).ok_or("the cleanup model is still loading")?
+                llm.ready_for(app, s).ok_or("the cleanup model is still loading")?
             };
             // llama-server serves the one model it loaded, whatever the request names.
-            Ok(ChatCleaner::new(&endpoint.url, &endpoint.key, c.local_model.as_str(), None))
+            let route = amber_core::estimate::cleanup(s, profile, recognized, Some((&endpoint.runtime, &endpoint.model, process::default_threads())));
+            Ok((ChatCleaner::new(&endpoint.url, &endpoint.key, &endpoint.model, None), route))
         }
         EngineKind::Server => {
             let target = amber_core::connections::resolve_cleanup(s)?;
@@ -322,7 +333,7 @@ pub fn cleaner(app: &AppHandle, s: &Settings, wait: bool) -> Result<ChatCleaner,
             if c.model.trim().is_empty() {
                 return Err("No chat model chosen for the cleanup.".into());
             }
-            target.cleaner(&key, &c.model).map_err(|e| e.message)
+            target.cleaner(&key, &c.model).map(|cleaner| (cleaner, amber_core::estimate::cleanup(s, profile, recognized, None))).map_err(|e| e.message)
         }
     }
 }
@@ -387,7 +398,34 @@ pub fn tidy(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Pr
 /// The third result conservatively records a configured remote cleanup attempt, even on
 /// failure/cancellation. It must not be inferred from whether the returned text changed.
 pub fn tidy_cancellable(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken) -> (String, Option<String>, bool) {
-    tidy_with_cleaner(s, recognized, profile, snippets, cancel, true, || cleaner(app, s, false).map(|c| (c, ())))
+    tidy_learning(&app.state::<Core>().estimates, s, recognized, profile, snippets, cancel,
+        || cleaner_measured(app, s, false, profile, Some(recognized)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tidy_learning(estimates: &amber_core::estimate::Estimates, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken,
+    make_cleaner: impl FnOnce() -> Result<(ChatCleaner, Option<amber_core::estimate::Route>), String>) -> (String, Option<String>, bool) {
+    let mut observation = None;
+    let result = tidy_with_cleaner(s, recognized, profile, snippets, cancel, true, || {
+        let (cleaner, route) = make_cleaner()?;
+        observation = route.map(|route| (route, Instant::now()));
+        Ok((cleaner, ()))
+    });
+    if let Some((route, started)) = observation {
+        estimates.observe(&route, recognized.chars().count() as u64, started.elapsed().as_millis() as u64,
+            result.1.is_none() && !result.0.is_empty() && !cancel.is_cancelled());
+    }
+    result
+}
+
+/// Only budget model work that would be attempted now. A cold local model is skipped by
+/// ordinary dictation; a later readiness change gets its own refinement before cleanup.
+pub(crate) fn expected_ms(app: &AppHandle, s: &Settings, profile: Option<&Profile>, recognized: Option<&str>, chars: u64) -> u64 {
+    if !amber_core::estimate::cleanup_wanted(s, profile, recognized, true) { return 0; }
+    let core = app.state::<Core>();
+    let endpoint = if s.cleanup.engine == EngineKind::Local { core.llm.ready_snapshot(s) } else { None };
+    let local = endpoint.as_ref().map(|e| (e.runtime.as_str(), e.model.as_str(), process::default_threads()));
+    amber_core::estimate::cleanup(s, profile, recognized, local).map(|route| core.estimates.expected_ms(&route, chars)).unwrap_or(0)
 }
 
 /// Tests use the same rules and smart cleanup, without app profiles or snippet expansion.
@@ -704,6 +742,40 @@ mod tests {
             server.join().unwrap();
             assert_eq!(result, (text.into(), None, engine == EngineKind::Server));
         }
+    }
+
+    #[test]
+    fn cleanup_learning_only_counts_successful_actual_model_work() {
+        use amber_core::estimate::{self, Estimates};
+        let s = settings(EngineKind::Server);
+        let spoken = "Please send the report tomorrow.";
+        let route = estimate::cleanup(&s, None, Some(spoken), None).unwrap();
+        for (status, cancelled) in [(503, false), (200, true), (200, false)] {
+            let estimates = Estimates::in_memory();
+            let cancel = CancellationToken::default();
+            let body = serde_json::json!({"choices": [{"message": {"content": spoken}, "finish_reason": "stop"}]}).to_string();
+            let flag = cancel.clone();
+            let (cleaner, server) = reply_with(status, body, move || {
+                std::thread::sleep(Duration::from_millis(2));
+                if cancelled { flag.cancel(); }
+            });
+            let _ = tidy_learning(&estimates, &s, spoken, None, true, &cancel, || Ok((cleaner, Some(route.clone()))));
+            server.join().unwrap();
+            assert_eq!(estimates.measured_ms(&route, 100).is_some(), status == 200 && !cancelled);
+        }
+        let estimates = Estimates::in_memory();
+        let mut disabled = s.clone();
+        disabled.cleanup.smart = false;
+        let _ = tidy_learning(&estimates, &disabled, spoken, None, true, &CancellationToken::default(), || panic!("rules must not learn"));
+        let _ = tidy_learning(&estimates, &s, "", None, true, &CancellationToken::default(), || panic!("empty text must not learn"));
+        let _ = tidy_learning(&estimates, &s, spoken, None, true, &CancellationToken::default(), || Err("model still loading".into()));
+        let mut snippet = s.clone();
+        snippet.snippets.push(amber_core::snippets::Snippet { trigger: spoken.into(), text: "Saved text".into() });
+        let _ = tidy_learning(&estimates, &snippet, spoken, None, true, &CancellationToken::default(), || panic!("snippets must not learn"));
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        let _ = tidy_learning(&estimates, &s, spoken, None, true, &cancel, || panic!("cancelled requests must not learn"));
+        assert!(estimates.measured_ms(&route, 100).is_none());
     }
 
     #[test]

@@ -222,7 +222,7 @@ impl Memory {
 
     /// Keeps a finished dictation in the history and counts it in the statistics, as the
     /// settings allow.
-    pub fn remember(&self, s: &Settings, text: &str, program: &str, engine: &str, inserted: bool, audio_ms: u64, wait_ms: u64) {
+    pub fn remember(&self, s: &Settings, text: &str, program: &str, engine: &str, inserted: bool, audio_ms: u64, wait_ms: u64, timings: Option<amber_core::history::Timings>) {
         let at = now_ms();
         if s.history {
             // Under the lock, so switching the history off (which clears under it too) wins
@@ -230,7 +230,7 @@ impl Memory {
             let mut stored = self.history.lock().unwrap();
             if self.enabled.load(std::sync::atomic::Ordering::SeqCst) && stored.error.is_none() {
                 stored.history.add(
-                    Entry { at, text: text.to_string(), program: program.to_string(), engine: engine.to_string(), inserted },
+                    Entry { at, text: text.to_string(), program: program.to_string(), engine: engine.to_string(), inserted, timings },
                     at,
                     s.history_days,
                 );
@@ -385,7 +385,7 @@ mod tests {
         let memory = Memory::load(&dir, &settings);
         assert!(memory.history_error().unwrap().contains("not imported"));
         assert!(memory.history().is_empty());
-        memory.remember(&settings, "new private transcript", "editor", "local", false, 100, 100);
+        memory.remember(&settings, "new private transcript", "editor", "local", false, 100, 100, None);
         assert!(memory.history().is_empty());
         assert!(memory.forget(1).is_err());
         assert!(memory.prune(1).is_err());
@@ -402,7 +402,10 @@ mod tests {
         let dir = temp_dir();
         let settings = Settings { history: false, statistics: false, ..Settings::default() };
         let memory = Memory::load(&dir, &settings);
-        memory.remember(&settings, "not retained", "editor", "local", false, 100, 100);
+        memory.remember(&settings, "not retained", "editor", "local", false, 100, 100, Some(amber_core::history::Timings {
+            recording_ms: Some(100), transcription_ms: 50, cleanup_ms: 10, processing_ms: 100,
+            live: false, cleanup_skipped: false,
+        }));
         memory.prune(1).unwrap();
         memory.forget(1).unwrap();
         assert!(memory.history().is_empty());

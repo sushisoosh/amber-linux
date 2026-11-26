@@ -81,7 +81,7 @@ listen<DictationEvent>("dictation-state", (e) => {
   if (e.payload.command) commandMark.classList.add("on");
   else if (state !== "inserting" && state !== "done") commandMark.classList.remove("on");
   fire.set(visualOf(state));
-  if (e.payload.expectedMs) fire.expect(e.payload.expectedMs);
+  if (e.payload.expectedMs !== undefined) fire.expect(e.payload.expectedMs);
   // The opacity setting is for the bubble at rest; while it works, it is fully there.
   canvas.style.opacity = String(state === "idle" ? config.opacity : 1);
   if (state !== "recording") fire.level = 0;

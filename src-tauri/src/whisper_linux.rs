@@ -26,6 +26,7 @@ pub struct Served {
     pub transcriber: Box<dyn Transcriber>,
     pub runtime: String,
     pub model: String,
+    pub threads: u32,
 }
 
 #[derive(Default)]
@@ -91,7 +92,7 @@ impl Whisper {
                 changes: self.changes.clone(), threads: settings.threads, model: id.into(),
             });
             self.set_status(app, Status::of("ready", Some(format!("{} on CPU (ONNX)", model.label))));
-            return Ok(Served { transcriber, runtime: "onnx-cpu".into(), model: id.into() });
+            return Ok(Served { transcriber, runtime: "onnx-cpu".into(), model: id.into(), threads: 0 });
         }
         if !imports::installed(layout, &model) {
             let message = format!("The model {} is missing or incomplete. Download or import it in the settings.", model.label);
@@ -109,7 +110,9 @@ impl Whisper {
             changes: self.changes.clone(), threads: settings.threads, model: model.id.clone(),
         });
         self.set_status(app, Status::of("ready", Some(format!("{} on CPU (built in)", model.label))));
-        Ok(Served { transcriber, runtime: "cpu".into(), model: model.id.into() })
+        let cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+        let threads = if settings.threads == 0 { amber_core::local::default_threads() } else { settings.threads }.min(cores).max(1);
+        Ok(Served { transcriber, runtime: "cpu".into(), model: model.id.into(), threads })
     }
 
     pub fn remove_imported(&self, app: &tauri::AppHandle, removal: imports::Removal<'_>) -> Result<(), String> {

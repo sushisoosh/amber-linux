@@ -27,6 +27,7 @@ export interface DictationEvent {
   state: Phase;
   message?: string | null;
   /** While recognizing: the expected duration, for the progress ring. */
+  /** Remaining recognition + cleanup budget. Updates preserve the ring's current progress. */
   expectedMs?: number;
   /** A terminal request: the bubble shows ">_". */
   command?: boolean;
@@ -276,6 +277,14 @@ export interface HistoryEntry {
   program: string;
   engine: string;
   inserted: boolean;
+  timings?: {
+    recordingMs: number | null;
+    transcriptionMs: number;
+    cleanupMs: number;
+    processingMs: number;
+    live: boolean;
+    cleanupSkipped: boolean;
+  } | null;
 }
 
 export interface StatsSummary {
