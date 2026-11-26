@@ -1003,7 +1003,20 @@ pub fn chat_providers(core: State<Core>) -> Vec<ChatProvider> {
 
 #[tauri::command]
 pub async fn history_list(app: AppHandle) -> Result<Vec<amber_core::history::Entry>, String> {
-    tauri::async_runtime::spawn_blocking(move || app.state::<Core>().memory.history()).await.map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Core>().memory.history().into_iter().map(|mut entry| {
+            entry.execution = None;
+            entry
+        }).collect()
+    }).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn history_comparisons(app: AppHandle, ats: Option<Vec<u64>>) -> Result<amber_core::history::Comparisons, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        amber_core::history::comparisons(&core.memory.history(), &core.estimates, ats.as_deref())
+    }).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

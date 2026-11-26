@@ -1,129 +1,51 @@
 # Amber for Linux
 
-An independent Linux desktop port of [Amber for Windows](https://github.com/EinFabo/amberpc),
-originally created by [EinFabo](https://github.com/EinFabo). Speak into a microphone,
-recognize speech locally or through a provider, review the result, and copy or paste it
-into another application.
+**Local-first speech-to-text for the Linux desktop.** Dictate, review the transcript,
+and copy it into another application, with optional cleanup and guarded X11 paste.
+This is an independent port of [Amber for Windows](https://github.com/EinFabo/amberpc),
+originally created by [EinFabo](https://github.com/EinFabo), not an official upstream release.
 
-This is a derivative port, not a clean-room rewrite or an official Linux release from
-the original creator. The original application, design, artwork, and retained source
-come from Amber; this tree adds Linux desktop integration, packaging, and further
-model, provider, and workflow features. The original Git history is preserved, with
-Linux development following upstream commit
-[`64d67e3`](https://github.com/EinFabo/amberpc/commit/64d67e308511cb922e1de957d7896b1cdd56e42d).
+**Preview:** targets x86_64 Linux with CPU inference. X11 and Wayland have different
+capabilities; real-desktop validation is still required. There are no published Linux
+desktop releases in this repository yet.
 
-## License and Publication Status
+- **Local or hosted recognition:** Whisper, Parakeet, Moonshine, or your chosen provider.
+- **Model library:** verified downloads and offline imports of supported speech models.
+- **Optional cleanup:** local rules, local or hosted language models, and keyword instructions.
+- **Compare results:** replay one recording with different models and cleanup settings.
+- **Private storage:** encrypted credentials, opt-in history, and saved Testing tables.
 
-**Amber is not Apache-licensed.** The original [LICENSE](LICENSE) says
-`Copyright (c) 2026 EinFabo. All rights reserved.` It requires prior written
-permission from the copyright holder to modify or redistribute the source, artwork,
-or a modified version. Its limited allowance for GitHub forks is not a general
-license to publish this port. Attribution alone does not grant those rights.
-
-No permission or endorsement is asserted by this README. Obtain written permission
-before publishing modified source or packages, and retain the original license and
-copyright notices. The license directs permission requests to the
-[original project's issues](https://github.com/EinFabo/amberpc/issues).
-Third-party libraries, runtimes, and models retain their separate licenses; those
-licenses do not relicense Amber itself.
-
-For maintainers, [Publishing to GitHub](docs/github-publishing.md) explains the
-permission gate, creating a linked fork, preserving the existing local remote,
-reviewing files, and pushing deliberately. Build instructions below describe the
-checkout; they do not grant modification or redistribution permission.
-
-## Features
-
-- Local CPU speech recognition with Whisper, Parakeet, or Moonshine, plus hosted
-  transcription with your own credentials.
-- A model library, checksum-verified downloads, and offline imports of supported
-  local speech models.
-- Rule-based cleanup, optional local or hosted smart cleanup, saved provider
-  connections, and opt-in keyword instructions.
-- A Recorder for reviewing results and a Testing page for comparing engines and
-  cleanup settings using the same recording.
-- X11 shortcuts and guarded clipboard paste; desktop-portal shortcuts and manual
-  paste on Wayland.
-- Optional encrypted history and saved testing tables, with encrypted credentials
-  backed by the desktop's Secret Service wallet.
-
-Start with [Build and Install](#build-and-install), then [First Run](#first-run).
-Read [Linux Desktop Support](#linux-desktop-support) before enabling automatic paste
-and [Privacy and History](#privacy-and-history) before choosing hosted services.
-
-## Linux Desktop Support
-
-The desktop port targets x86_64 Linux on Arch/i3, GNOME, and KDE. It remains a preview
-until the real-desktop integration matrix has passed, not a claim of Windows feature
-parity or support for every distribution. GPU acceleration, ARM, Flatpak, and AppImage
-support are deferred. Windows and standalone-server code remain in this repository;
-this README describes the Linux desktop, not those separate applications.
-
-- Local CPU Whisper inference is built in; only its model weights need downloading.
-  Parakeet and Moonshine additionally download a verified ONNX Runtime on first setup.
-  Hosted recognition and optional local/server cleanup are supported.
-- Dictation shortcuts leave Amber in the background. The Linux Recorder page keeps results
-  in memory for review and explicit Copy by default. Under **Delivery**, enable **Copy and
-  paste completed dictation** to copy completed text and paste automatically on
-  eligible X11 targets. Completion delivery remains **off by default**. Copy, completion
-  delivery and explicit insertion replace clipboard text, images or files without restoring
-  them; clipboard managers may retain the text. Keep Amber running until you paste.
-- On X11, **Paste into any window** is **on by default**: browsers, chat apps, dialogs,
-  terminals and other window types are eligible, not just known native editors. Turning it
-  off restores the native-editor restriction. This option also applies to
-  `amber-dictation --insert-last`, which captures the currently focused destination when
-  invoked and works independently of completion delivery.
-- X11's **Allow pasting into a different window** is **off by default**: completion requires
-  the window captured at recording start. When enabled, the currently focused destination
-  is chosen once when delivery begins, not when recording stops. Both target options can
-  be configured while completion delivery is off.
-- Under **Delivery > Paste shortcut** on X11, choose `Ctrl+V` (the unchanged default,
-  stored as `insert.pasteShortcut: "Ctrl+KeyV"`), `Ctrl+Shift+V` (common in terminals),
-  or `Shift+Insert`, or record a custom combination. Choose the binding the target
-  application actually uses for clipboard paste: the same binding applies to **all targets**,
-  for both automatic completion and explicit `--insert-last`. This setting is available with
-  completion off; it does not enable completion or change either target option.
-  It is sent to the destination, not registered as a global shortcut; avoid the recording
-  hotkey or other globally bound commands. Some X11 apps use `Shift+Insert` to paste the
-  primary selection, not the clipboard; Amber leaves that selection unchanged. The recorder
-  uses logical letters, so V remains V on Colemak/Dvorak. Escape cancels recording;
-  Enter/Return/NumpadEnter, unmodified typing and modifier-only bindings are not allowed.
-  F1-F24 can stand alone. Shifted numbers/punctuation and AltGr are not recorded because
-  their logical base key cannot be determined reliably across layouts.
-  **Reset to Ctrl+V** restores the default binding only.
-  Invalid imported bindings are not silently replaced; invalid saves are rejected.
-  Windows still uses Ctrl+V, and Wayland still requires manual paste.
-- All X11 paste still requires single-line text without control characters and an observable
-  non-Amber target with stable window and input focus during paste. Amber sends the configured
-  paste shortcut, never Enter or a focus switch. Changing the binding does not relax these
-  safeguards. Editable fields (including password fields) and paste acceptance cannot be verified. Targets that
-  change during paste, unobservable targets and multiline/control-character text require
-  manual paste; completed results remain in Recorder even when automatic paste is blocked
-  or cannot be confirmed.
-- Wayland shortcuts use the desktop portal when available. GNOME 48+ and KDE Plasma
-  6 are the primary targets. On older/missing portal backends, configure a desktop
-  shortcut for `amber-dictation --toggle`; `amber-dictation --cancel` stops/cancels a dictation. That
-  fallback is toggle-only. Wayland remains manual-paste-only; clipboard access requires
-  Amber to be focused.
-- Credentials and optional history use authenticated encryption with a key in Secret
-  Service (GNOME Keyring or a compatible wallet). A missing/locked wallet never
-  causes plaintext persistence. After a credential-save error, changes remain active
-  in the current session, but persistence may have failed or be unconfirmed; do not
-  rely on them surviving a restart. History, statistics, and login startup are opt-in.
-- Phone/tunnel/control servers, automatic terminal-command mode, Discord mute, automatic
-  per-app profiles, the Windows updater, and the Windows floating bubble are disabled
-  in the Linux desktop. Updates are installed from Linux packages.
+[Build and install](#build-and-install) | [First run](#first-run) |
+[Desktop support](#linux-desktop-support) | [Speech engines](#speech-engines) |
+[Privacy](#privacy-and-history) | [Development](#development) | [License](#license-and-attribution)
 
 ## Build and Install
 
-Run these commands from the repository root. Package generation does not demonstrate
-compatibility with every distribution; test installation on the intended desktop.
+**Download status:** build from source using the instructions below. Upstream Windows
+installers and Amber Server downloads do **not** install this Linux desktop port.
+The CI configuration can build `.deb`/`.rpm` artifacts, but that is not a published
+Linux release or a guarantee of desktop compatibility.
+
+> **License notice:** this is source-available, not open-source software. The retained
+> [LICENSE](LICENSE) is all rights reserved and requires prior written permission for
+> modification or redistribution. These instructions grant no additional rights;
+> see [License and Attribution](#license-and-attribution) before proceeding.
+
+### Get the Source
+
+Install Git through your distribution's package manager if needed, then clone this port:
+
+```bash
+git clone https://github.com/sushisoosh/amber-linux.git
+cd amber-linux
+```
+
+Run the following commands from that repository root on the Linux machine you intend
+to use. Choose the instructions for your distribution.
 
 ### Arch/i3
 
-Build a native package from this checkout, subject to the license requirements above.
-The helper includes current uncommitted source files; it does **not** clone the
-unported upstream repository or require a hardcoded fork URL.
+Build and install the current checkout as a native Arch package:
 
 ```bash
 sudo pacman -Syu --needed base-devel nodejs npm
@@ -131,42 +53,134 @@ bash tools/arch.sh --force --install
 amber-dictation
 ```
 
-`makepkg` runs as your regular user and asks pacman for missing build/test dependencies.
-An existing rustup installation can provide Cargo; use a current stable toolchain
-(the locked desktop dependencies require Rust 1.90 or newer). Build concurrency
-defaults to two jobs; set `CARGO_BUILD_JOBS` to override it. Packages are kept in
-`target/arch`, and the helper prints its staging directory so a failed build can be
-inspected. The installed command is **`amber-dictation`**, not `amber`, to avoid
-colliding with unrelated Arch/AUR programs.
+Run the helper as your **regular user**, not root. It snapshots the current files,
+including uncommitted changes, then uses `makepkg` to install missing dependencies,
+build, test, and install. It does not fetch the unported upstream tree. `--force`
+ensures an existing package with the same version is rebuilt.
 
-`--force` rebuilds the current source even if `target/arch` already contains this version.
-Without it, `makepkg --install` can reinstall an older build instead of compiling your changes.
+Packages land in `target/arch`; the installed command is **`amber-dictation`**, not
+`amber`. Builds default to two jobs (`CARGO_BUILD_JOBS` overrides this). If you already
+use rustup, select current stable Rust, at least 1.90. For microphone, keyring, startup,
+and lock-screen setup, see [First Run](#first-run) and the i3 notes below.
 
-The source snapshot uses a fresh native build directory. If changing the `GGML_*`
-CPU flags in an existing checkout, first run `cargo clean -p whisper-rs-sys`:
-the upstream build script does not track those environment changes reliably.
+### Ubuntu 24.04
 
-To prepare sources on a non-Arch machine instead:
+Install **Node.js 22 with npm** and **current stable Rust (1.90 or newer)** first,
+using the [Node.js installation instructions](https://nodejs.org/en/download) and
+[rustup](https://rustup.rs/), or your existing toolchain manager. Ubuntu's default
+Node.js/Rust packages may be older than required.
 
 ```bash
-bash tools/arch.sh --prepare-only /tmp/amber-arch-source
+sudo apt-get update
+sudo apt-get install build-essential cmake pkg-config clang libclang-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev \
+  librsvg2-dev libxdo-dev libxtst-dev libssl-dev libdbus-1-dev python3
+npm ci
+npm run app:build -- --bundles deb
+sudo apt install ./target/release/bundle/deb/*.deb
+amber-dictation
 ```
 
-Transfer that directory to Arch, then run `makepkg --syncdeps --check --install`
-inside it as a regular user. Its generated PKGBUILD pins the archive SHA-256.
-Repository metadata, build outputs, dependency trees and common signing-secret
-files are excluded. Runtime/model redistribution and public publishing still need
-the appropriate permissions; no AUR upload or release publication is automated.
+`app:build` builds the frontend and desktop app and automatically selects the Linux
+Tauri configuration. `apt install ./...deb` installs the resulting package and resolves
+runtime dependencies. If the output directory contains several versions, give `apt`
+the path to the **one** package you want instead of the wildcard. You can also launch
+Amber from your application menu.
 
-First run: select a microphone, download a speech model, and test the Recorder page.
-CPAL uses ALSA: for a PipeWire desktop, install `pipewire-alsa` if the default input
-is missing. For a PulseAudio desktop, the alternative is `pulseaudio-alsa`. Do not
-replace a working audio stack or install both routes blindly. Persistent encrypted
-credentials/history need an unlocked Secret Service implementation such as GNOME
-Keyring; local recognition and session-only credentials work without one. Bare i3
-does not automatically unlock a keyring.
+For the CI-style `.deb` and `.rpm` build, install `rpm` and run
+`npm run app:build -- --bundles deb,rpm`. Outputs are under `target/release/bundle/`.
+Generating an RPM on Ubuntu does not establish compatibility with an RPM-based distro;
+use the `.deb` on Ubuntu. Linux updates are installed by rebuilding/replacing the package,
+not through the Windows updater.
 
-Optional i3 config entries, using unused keys of your choice:
+## First Run
+
+1. Launch `amber-dictation` after installation, or `npm run app` for development.
+2. Choose and test a microphone.
+3. In **Engine**, download or import a local speech model, or choose a hosted provider
+   and add its key under **Credentials** or **Connections**.
+4. Record a short phrase in **Recorder**, review it, and use **Copy**. Paste manually
+   into a test document first.
+5. Set a dictation shortcut. The X11 default is `Ctrl+Alt+Space`. Automatic completion
+   delivery is **off by default**; read the [paste safeguards](#linux-desktop-support)
+   before enabling it. Wayland requires manual paste.
+
+For offline recognition, choose local speech with no hosted cleanup. Initial model and
+runtime downloads need a network connection; downloaded local models can run offline.
+
+**Microphone missing on Arch?** Audio capture uses ALSA. On a PipeWire desktop, check
+that `pipewire-alsa` is installed; on PulseAudio, the alternative is `pulseaudio-alsa`.
+Do not replace a working audio stack or install both routes blindly.
+
+**Credentials or history will not save?** Persistent encrypted storage needs an unlocked
+Secret Service wallet, such as GNOME Keyring or a compatible wallet. Bare i3 does not
+unlock one automatically. Local recognition and session-only credentials work without
+one; a wallet error never enables plaintext persistence. After a credential-save error,
+changes may work for this session without surviving a restart.
+
+## Linux Desktop Support
+
+The preview targets **x86_64 Linux on Arch/i3, GNOME, and KDE**, not every distribution
+or Windows feature parity. GPU acceleration, ARM, Flatpak, and AppImage are deferred.
+
+| Capability | X11 | Wayland |
+|---|---|---|
+| Record, review, and copy | Yes | Yes; focus Amber for clipboard access |
+| Dictation shortcuts | Native global shortcuts | Desktop portal when available |
+| Automatic paste | Opt-in, subject to focus/text safeguards | Not implemented; paste manually |
+| Desktop shortcut fallback | `amber-dictation --toggle` / `--cancel` | Same commands; toggle-only |
+
+GNOME 48+ and KDE Plasma 6 are the primary portal targets. On older or missing portal
+backends, bind the commands above in your desktop settings. Tray and notification support
+are optional; the Recorder and its Quit button remain available without them.
+
+Linux has a **recording/processing indicator**: a click-through, non-focusable
+floating window shown during recording, transcription, and insertion. It is not the
+interactive Windows bubble: mouse dictation, dragging, and its Windows settings are
+not offered on Linux. Placement and stacking depend on the compositor, especially on
+Wayland; the Recorder remains the fallback.
+
+**Before enabling paste:** **Delivery > Copy and paste completed dictation** is off by
+default. Copy, automatic delivery, and explicit insertion replace the clipboard without
+restoring its old text, images, or files; clipboard managers may retain the result.
+Keep Amber running until you paste. Amber cannot verify editable fields, detect every
+password field, or confirm that an application accepted the paste.
+
+<details>
+<summary>X11 delivery options and safeguards</summary>
+
+- **Paste into any window** is on by default: browsers, chat apps, dialogs, and terminals
+  are eligible, not just known native editors. Turn it off to restore that restriction.
+  This does not enable automatic delivery by itself.
+- **Allow pasting into a different window** is off by default: completion requires the
+  target captured at recording start. When enabled, Amber chooses the focused target
+  once when delivery begins, not when recording stops.
+- `amber-dictation --insert-last` captures the currently focused target when invoked.
+  It works independently of automatic completion delivery and follows **Paste into any
+  window** and **Paste shortcut**.
+- Every X11 paste still requires single-line, control-free text and an observable
+  non-Amber target with stable window and input focus. Amber never switches focus or
+  sends Enter. Blocked/unconfirmed results remain in Recorder for manual copying.
+
+**Delivery > Paste shortcut** defaults to `Ctrl+V`. Choose `Ctrl+Shift+V` for applications
+that use it, `Shift+Insert`, or a custom binding. The same binding is sent to **all targets**
+for completion and explicit insertion; it is not registered as a global shortcut. Avoid
+the recording hotkey or other global commands. Some applications use `Shift+Insert` for
+the primary selection, which Amber leaves unchanged.
+
+The binding recorder uses logical letters, including on Colemak/Dvorak. Escape cancels;
+Enter/Return/NumpadEnter, unmodified typing, and modifier-only bindings are rejected.
+F1-F24 can stand alone. Shifted numbers/punctuation and AltGr are not recorded because
+their logical base key is ambiguous across layouts. **Reset to Ctrl+V** resets only
+the binding (`insert.pasteShortcut: "Ctrl+KeyV"`), not delivery or target permissions.
+Invalid imported bindings are not silently replaced, and invalid saves are rejected.
+
+</details>
+
+<details>
+<summary>i3 shortcuts, autostart, and screen locking</summary>
+
+Optional i3 entries, using unused keys of your choice:
 
 ```i3
 exec --no-startup-id amber-dictation --autostart
@@ -175,19 +189,13 @@ bindsym $mod+F10 exec --no-startup-id amber-dictation --cancel
 bindsym $mod+F11 exec --no-startup-id amber-dictation --insert-last
 ```
 
-Amber's own X11 shortcut is `Ctrl+Alt+Space` by default. Do not register the same
-combination in both Amber and i3. Bare i3 does not process XDG autostart files:
-use the explicit `exec` line above **or** an XDG launcher such as `dex`, not both.
-A tray host and a notification daemon are optional; the Recorder window and its
-Quit button must remain usable without them. The explicit paste command uses Delivery's
-**Paste shortcut** and **Paste into any window** option and captures its current destination.
-Single-line, control-free text and stable focus are required; the shortcut never switches windows or
-sends Enter, and cannot confirm that the destination accepted the paste.
+Do not register the same combination in Amber and i3. Bare i3 does not process XDG
+autostart files: use the explicit `exec` line above **or** an XDG launcher such as
+`dex`, not both. The `--insert-last` binding follows the X11 safeguards above.
 
-For locking, install `i3lock` and optionally `xss-lock`. Direct `i3lock` does not
-reliably announce a login1 lock. The packaged wrapper requests Amber cancellation
-(including the microphone test) before running the locker, without preventing
-locking when Amber is absent/unresponsive:
+For locking, install `i3lock` and optionally `xss-lock`. Direct `i3lock` does not reliably
+announce a login1 lock. The Arch package's wrapper requests cancellation, including the
+microphone test, before running the locker; absent/unresponsive Amber does not prevent locking:
 
 ```i3
 bindsym $mod+Shift+l exec --no-startup-id amber-i3-lock --nofork
@@ -195,86 +203,23 @@ exec --no-startup-id xss-lock --transfer-sleep-lock -- amber-i3-lock --nofork
 ```
 
 Do not add a second locker alongside an existing one; adapt the existing binding.
-Cancellation is a best-effort request, not proof that an unresponsive process
-released its microphone. Suspend/session monitoring and its availability are shown
-in Recorder diagnostics. Actual audio, keyring, lock and resume behavior still
-require a check on the destination desktop.
+Cancellation is best-effort, not proof that an unresponsive process released its
+microphone. Recorder diagnostics show suspend/session-monitoring availability. Check
+actual audio, keyring, locking, and resume behavior on the destination desktop.
 
-Reproducible checks (X11 tests create a disposable authenticated Xvfb/i3 session,
-never use the current desktop):
+</details>
 
-```bash
-npm ci
-npm run test:ui
-python tools/test-arch.py
-python tools/test-x11.py
-cargo test --workspace --locked
-```
-
-The X11 integration tests use fake client windows to validate focus, clipboard
-transfers and input events. They do not prove text landed in a real editor, identify
-all terminal/password fields, or replace a microphone test on the destination PC.
-
-### Ubuntu Build
-
-Build on Ubuntu 24.04 with current stable Rust, Node.js 22, and:
-
-```bash
-sudo apt-get update
-sudo apt-get install build-essential cmake pkg-config clang libclang-dev \
-  libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev \
-  librsvg2-dev libxdo-dev libxtst-dev libssl-dev libdbus-1-dev rpm
-npm ci
-npm run build
-npm run test:ui
-cargo test -p amber-core -p amber-inference -p amber-server -p amber-pc --locked
-npm run app:build -- --bundles deb,rpm
-```
-
-The Linux Tauri configuration is selected automatically. `.deb`/`.rpm` outputs are
-under `target/release/bundle/`. Model tests marked ignored require explicitly
-provided model files; ordinary tests do not download models or contact paid APIs.
-CI builds/tests/packages are not substitutes for microphone, keyring, clipboard,
-focus, suspend/revocation, native Wayland/XWayland, and clean-install testing on real
-GNOME/KDE sessions. Wayland automatic text injection is not implemented; use review,
-Copy, and manual paste. GPU/ARM/Flatpak/AppImage support is deferred.
-
-For development, `npm run app` starts the complete Tauri application and keeps running
-until stopped with `Ctrl+C`. `npm run dev` starts only the frontend, not the desktop
-backend. Run these commands from the repository root after installing the prerequisites
-and running `npm ci`. The upstream Windows installers do not contain this Linux port;
-no published Linux download is assumed here.
-
-For the disposable X11 integration tests on Ubuntu, also install their desktop-test
-dependencies and run the harness with Python 3:
-
-```bash
-sudo apt-get install xvfb i3-wm xauth x11-utils x11-xkb-utils fonts-dejavu-core
-python3 tools/test-x11.py
-```
-
-## First Run
-
-1. Launch `amber-dictation` after installation, or use `npm run app` for development.
-2. Choose and test a microphone. On bare i3, check the audio and keyring notes above.
-3. In **Engine**, download a local speech model, import a supported model, or choose a
-   hosted provider and add its key in **Credentials** or **Connections**.
-4. Record a short phrase in **Recorder**. Review the result and use **Copy**, then paste
-   manually into a test document.
-5. Set a dictation shortcut. On X11, enable automatic completion delivery only after
-   reviewing the clipboard and focus safeguards above. Wayland requires manual paste.
-
-Start with local speech and no hosted cleanup if you want recognition to stay on your
-machine. Initial model/runtime downloads need a network connection; recognition with
-downloaded local models can run offline.
+Phone/tunnel/control servers, automatic terminal-command mode, Discord mute, automatic
+per-app profiles, and the Windows updater are disabled in the Linux desktop. Retained
+Windows and standalone-server code does not imply Linux desktop support for those features.
 
 ## Speech Engines
 
 | Engine | Where your voice goes | Notes |
 |---|---|---|
 | Whisper, CPU | stays on this PC | Built-in inference; download or import model weights |
-| Parakeet, CPU | nowhere | v3 int8: 25 languages including German; v2 int8: English only |
-| Moonshine, CPU | nowhere | Tiny/Base int8, English only; long recordings are chunked |
+| Parakeet, CPU | stays on this PC | v3 int8: 25 languages including German; v2 int8: English only |
+| Moonshine, CPU | stays on this PC | Tiny/Base int8, English only; long recordings are chunked |
 | Groq | Groq | Whisper presets; provider account and API key required |
 | OpenAI | OpenAI | GPT-4o (mini) Transcribe, Whisper |
 | Tinfoil.sh | Tinfoil | Voxtral Small 24B (default), Whisper large-v3-turbo; HTTPS without client enclave verification |
@@ -282,6 +227,14 @@ downloaded local models can run offline.
 | Deepgram | Deepgram | Nova-3; native transcription API |
 | ElevenLabs | ElevenLabs | Scribe v2; no speaker labels or paid vocabulary add-on |
 | Own server | your configured endpoint | Compatible `POST /v1/audio/transcriptions` API; HTTPS required except for literal loopback IPs |
+
+Whisper inference is built in; download or import its model weights. Parakeet and
+Moonshine also need the verified ONNX Runtime offered during setup. With streaming
+chunking active, finished parts are recognized at pauses while you keep speaking.
+Testing and enabled keyword instructions process complete recordings instead.
+
+<details>
+<summary>Tinfoil setup and verification limits</summary>
 
 For Tinfoil on either desktop platform, save an inference API key from
 [its dashboard](https://dash.tinfoil.sh) on the **Credentials** page. Keys can be managed
@@ -294,16 +247,17 @@ Unlike Android, the desktop client does not verify enclave attestation. The conn
 test only fetches the public model catalog; a successful test does not validate the key
 or prove that inference works.
 
+</details>
+
+<details>
+<summary>Model catalog, downloads, and runtime requirements</summary>
+
 The default Whisper catalog includes **FUTO Base**, **FUTO Small**, and **ACFT Large v3
 Turbo q8_0**. Model licenses are separate from Amber's license. Larger models require
 more memory and CPU time; choose one that fits your machine.
 
-With streaming chunking active, long dictations are **recognized while you speak**:
-finished parts are recognized at pauses while you continue recording. Testing and
-enabled keyword instructions process complete recordings instead.
-
-Catalog downloads are pinned by URL and SHA-256 in `crates/core/src/local.rs` and
-`crates/core/src/onnx.rs`. Mismatched checksums are rejected. Linux Whisper inference
+Catalog downloads are pinned by URL and SHA-256 in [local.rs](crates/core/src/local.rs)
+and [onnx.rs](crates/core/src/onnx.rs). Mismatched checksums are rejected. Linux Whisper inference
 runs inside the application, not as a Windows executable or an external speech server.
 
 The **Engine > Model library** also offers stock Whisper Tiny, Base, Small, Medium,
@@ -322,7 +276,12 @@ these Moonshine variants only recognize English. Neither engine uses the vocabul
 or forces the selected language. Long ONNX recordings use bounded chunks, which can affect
 words near chunk boundaries. Model manifests and runtime hashes live in `crates/core/src/onnx.rs`.
 
-### Model Memory
+</details>
+
+<details>
+<summary>Loading, unloading, and importing local models</summary>
+
+**Model memory**
 
 Downloaded, selected and loaded are separate states. With **Load when Amber starts** on
 (the default), Amber preloads the selected local speech model at startup. Otherwise a
@@ -334,7 +293,7 @@ it again. Switching models replaces the resident speech model; switching to a se
 quitting releases it. Ordinary local use has no configurable idle-unload timer. A model
 used for server fallback retains the existing ten-minute idle cleanup behavior.
 
-### Custom Model Imports
+**Custom imports**
 
 **Engine > Import a local speech model** accepts Whisper GGML `.bin` files, Parakeet int8
 ONNX folders, and Moonshine Tiny/Base ONNX folders. Browse to the source, name the model,
@@ -356,10 +315,10 @@ If local fallback is enabled and the selected local model/runtime is installed,
 Amber can attempt local recognition when the speech server is unavailable. Fallback
 can itself fail; local recognition never silently falls back to a hosted provider.
 
-On Linux, API keys are stored in an encrypted vault backed by Secret Service. A locked
-or unavailable wallet does not cause a fallback to plaintext credential storage.
+</details>
 
-### Audio Uploads
+<details>
+<summary>Audio upload formats, compression, and provider limitations</summary>
 
 Under **Engine > Server > Audio upload**, choose **Ogg Opus (lossy, ~32 kbps)** to reduce
 the audio sent for recognition. Encoding runs locally using the bundled codec, without
@@ -381,31 +340,36 @@ This is decided before uploading and recorded in Testing details, not a retry of
 request. Deepgram and ElevenLabs vocabulary hints are omitted because their keyterms options
 add a surcharge.
 
+</details>
+
 ## Testing
 
-The **Testing** page records comparisons without pasting, typing, changing the clipboard,
-or adding transcripts to ordinary history/statistics. The comparison table aligns model
-identifiers, compression and smart-cleanup checkmarks, encoding/recognition/cleanup times,
-the combined stage time, and result previews. Times are milliseconds; recognition includes
-encoding, so the total does not add encoding twice. The Opus checkmark describes the actual
-prepared upload, not just the requested setting. Missing stages are not shown as zero-time
-successes. **Details** expands a row to show its captured settings, raw and cleaned text,
-individual attempts, file sizes, and failures. File sizes exclude multipart overhead and
-are not confirmation that all bytes were sent.
+Use **Testing** to compare engines and cleanup settings with the **same recording**:
+record once, change Engine, Audio upload, or Cleanup, then choose **Replay** on a row.
+Each replay starts from the original lossless WAV, not a compressed upload, and does
+not reopen the microphone. **Details** shows captured settings, raw/cleaned text,
+timings, attempts, and failures.
 
-Record once, change Engine, Audio upload or Cleanup, and use **Replay** on a row (or
-**Run again with current settings** in its details). Every replay starts from the same original prepared lossless
-WAV, never from a compressed upload, and creates a separate comparison with the same
-recording number. It does not open the microphone. Recognition wall time includes encoding,
-model loading and retries; Testing processes complete recordings instead of live chunking.
+Testing never pastes, types, changes the clipboard, adds ordinary history/statistics,
+or trains the timing estimator. Choosing a hosted provider still sends audio or text
+to it, including on replay; Testing is not a privacy bypass.
+
+<details>
+<summary>Timing interpretation, saved tables, and audio retention</summary>
+
+Times are milliseconds. Recognition wall time includes encoding, model loading, and
+retries; combined stage time does not add encoding twice. Testing uses complete recordings,
+not live chunking. The Opus checkmark describes the actual upload format, not just the
+requested setting. Missing stages are not zero-time successes. File sizes exclude multipart
+overhead and do not confirm that every byte was sent.
 
 The current table holds up to 20 results. **Clear table** removes only these unsaved rows.
 Give the table an optional name and choose **Save table & start new** to keep its transcripts,
 configuration and timings across restarts and start an empty table. Up to 10 saved tables
 appear in separate sections below; they can be collapsed or explicitly deleted. Saving and
 deleting use encrypted local storage (`testing-tables.bin`), not plaintext. Linux requires an
-unlocked Secret Service wallet. A failed save
-leaves the current table intact. Unlock the wallet and **Reload saved tables** to recover
+unlocked Secret Service wallet. A failed save leaves the current table intact.
+Unlock the wallet and **Reload saved tables** to recover
 from storage errors. Saved tables are not silently overwritten when the limit is reached.
 
 Audio stays in memory only, shared across current and saved rows under a 64 MiB budget.
@@ -413,8 +377,9 @@ Replaying a saved row adds a new current row without changing that saved table. 
 the last comparison that uses a recording releases it; the audio budget can also evict
 the least recently used recording while leaving its text and timings intact. After Amber
 exits, unsaved rows and all audio are gone. Saved tables remain, but their Replay buttons
-are unavailable without the original audio. Selecting a server still sends audio or text
-to that provider, including when replaying; Testing is not a privacy bypass.
+are unavailable without the original audio.
+
+</details>
 
 ## Cleanup
 
@@ -437,7 +402,8 @@ install Ollama and pull the chosen model separately. Use Own server for a differ
 Connection checks do not submit inference requests and do not prove that a selected model
 or API key can perform paid inference. Anthropic uses its native Messages protocol.
 
-### Connections and Discovery
+<details>
+<summary>Saved connections and model discovery</summary>
 
 **Settings > Connections** saves multiple named provider accounts or OpenAI-compatible
 base URLs. Each has an independent encrypted key, bound to its identity, provider and
@@ -459,7 +425,10 @@ for literal loopback addresses. Missing/stale connections fail rather than silen
 another endpoint or key. Testing snapshots retain the selected connections and instruction
 rules; credential changes are blocked until the test or its cancellation has settled.
 
-### Keyword Instructions
+</details>
+
+<details>
+<summary>Opt-in keyword instructions</summary>
 
 **Settings > Instructions** is a separate opt-in transformation feature. A first whole
 keyword selects a saved prompt and is removed before transforming the rest of the dictation.
@@ -471,16 +440,17 @@ bash list all files modified today
 
 The chosen cleanup model can turn that into command text such as `find . -type f -mtime -1`.
 Shell output is always review/copy-only, never automatically pasted or executed.
-Choose Text output for transformations meant for normal
-delivery, such as drafting an email. Rule prompts are ordinary settings, not secret storage.
+Choose Text output for transformations meant for normal delivery, such as drafting an
+email. Rule prompts are ordinary settings, not secret storage.
 
 Rules require both their own Enabled switch and global smart cleanup.
 Matching happens before filler cleanup: `please bash...`,
 `bashful...` and quoted keywords do not trigger the Bash rule. Failure keeps the original
 request, including its keyword. Enabled rules defer streaming chunks so they apply once to
 the complete utterance. Testing/replay and the explicit preview support them.
-Ordinary cleanup retains its existing
-meaning-preservation checks.
+Ordinary cleanup retains its existing meaning-preservation checks.
+
+</details>
 
 ## Privacy and History
 
@@ -502,7 +472,100 @@ History supports text/program search and combined program, local-date, and inser
 filters. Search terms stay in memory only. **Delete all history** clears the entire
 history, including entries hidden by the current filters.
 
-## Layout
+### History and Timing Estimates
+
+New history entries show the saved cleanup method/model and outcome alongside the
+speech engine. Legacy entries show **Not recorded** rather than guessing from today's
+settings.
+
+**Comparable estimates** lists successful speech/cleanup combinations actually used
+in retained history, respecting the current history filters. It normalizes recognition
+to **10 seconds of audio** and model cleanup to **100 Unicode characters**, using the
+**same persisted estimator as the progress ring**. Separate recognition, cleanup, and
+combined estimates include sample counts and learned/default/legacy indicators.
+Sample counts belong to each stage across successful dictations, not just the displayed
+filter or pair; sparse or similar-length data is blended with prior estimates.
+
+These are approximate latency estimates, **not a benchmark or quality score**, and not
+averages calculated from history's wall times. Startup, retries, streaming, and different
+inputs can change observed timings. Rules-only/snippet paths have no cleanup *model*
+budget, not zero processing time. Missing route metadata, mixed-route streaming runs,
+and failed/skipped model cleanup are excluded from the comparison. Use
+[Testing](#testing) for same-recording comparisons.
+
+Learning works even with history/statistics off. Compact timing aggregates persist
+locally in `estimates.json`, separately from history, without audio, transcripts, or
+individual timing records. Deleting history removes those combinations from this overview
+but **does not reset learned estimates**. These aggregates are not encrypted.
+
+## Development
+
+Install the native dependencies and toolchains above, then run from the repository root:
+
+```bash
+npm ci
+npm run app
+```
+
+`npm run app` starts the full Tauri desktop application and stays running until `Ctrl+C`.
+`npm run dev` starts **only** the frontend, without the desktop backend. On Arch, the
+package helper installs build/test dependencies but builds in a separate staging directory;
+run `npm ci` in this checkout before developing here.
+
+For source checks:
+
+```bash
+npm run build
+npm run test:ui
+python3 tools/test-arch.py
+cargo test --workspace --locked
+```
+
+For just the platform-independent logic, use `cargo test -p amber-core --locked`.
+Its bundled codec needs CMake; set `CMAKE` if it is not on `PATH`. Ordinary tests do not
+download models or contact paid APIs; ignored model tests need explicitly provided files.
+
+For disposable X11 integration tests on Ubuntu, install the additional dependencies:
+
+```bash
+sudo apt-get install python3 xvfb i3-wm xauth x11-utils x11-xkb-utils fonts-dejavu-core
+python3 tools/test-x11.py
+```
+
+The Arch helper already includes these test dependencies and runs the X11 checks.
+The harness creates an authenticated Xvfb/i3 session, not tests on your current desktop.
+It checks focus, clipboard transfers, keyboard layouts, and input events with test windows;
+it cannot prove a real editor accepted text or identify every terminal/password field.
+After building, `python3 tools/test-x11.py --app target/release/amber-dictation` also
+smoke-tests startup, closing, and reopening the application.
+
+CI and these checks do **not** replace clean installation, real microphone/keyring,
+clipboard/focus, lock/suspend/resume, and native Wayland/XWayland checks on target desktops.
+
+<details>
+<summary>Arch source snapshots and native build troubleshooting</summary>
+
+To prepare the current source on a non-Arch machine with Git and Node.js installed:
+
+```bash
+bash tools/arch.sh --prepare-only /tmp/amber-arch-source
+```
+
+The destination must be empty and outside the checkout. Transfer that directory to Arch
+and run `makepkg --syncdeps --check --install` inside it as a regular user. The generated
+PKGBUILD pins the archive SHA-256; repository metadata, build outputs, dependency trees,
+and common signing-secret files are excluded. This is not an AUR upload or release process;
+source/runtime/model redistribution still requires the appropriate permissions.
+
+The helper prints and retains its staging directory so failed builds can be inspected.
+It uses a fresh native build directory. When changing `GGML_*` CPU flags in an existing
+build directory, run `cargo clean -p whisper-rs-sys` first: the upstream build script does
+not reliably track those environment changes.
+
+</details>
+
+<details>
+<summary>Repository layout and development conventions</summary>
 
 ```text
 crates/core/      platform-independent settings, providers, cleanup, downloads, tests
@@ -511,37 +574,49 @@ crates/onnx/      shared Parakeet and Moonshine inference
 src-tauri/        desktop application and platform-specific integration
 src/             React settings, Recorder, Testing, and indicator UI
 packaging/arch/   native Arch package recipe and desktop entry
-tools/            build, packaging, and integration-test helpers
+tools/           build, packaging, and integration-test helpers
 server/           separate standalone server, not the Linux desktop phone API
 streamdeck/       retained upstream Windows Stream Deck integration
 ```
 
 Keep platform-independent logic in `crates/core` and platform API work in `src-tauri`.
-Keep `package.json` and the workspace version in `Cargo.toml` equal. The build and
-test commands above cover source checks; real microphone, clipboard, wallet, focus,
-lock/resume, Wayland, and clean-install tests remain necessary on target desktops.
+Keep `package.json` and the workspace version in `Cargo.toml` equal. The retained
+[standalone server](server/README.md) is separate from the Linux desktop. The inherited
+[roadmap](docs/PLAN.md) includes Windows/server plans, not promises of Linux support.
 
-## Updates and Related Projects
+</details>
 
-Linux updates are installed through rebuilt/replacement Linux packages, not the
-Windows updater. Review the publication guide before enabling GitHub Actions: the
-inherited CI can upload Linux package artifacts, and the server workflow can publish
-releases when matching tags are pushed. Source publication and binary redistribution
-both need the appropriate permission.
+## License and Attribution
 
-Do not use `tools/release.sh` to release this Linux port: it still targets the
-original creator's Windows repository. The inherited server-release workflow instead
-publishes to the repository where it runs, but its installer scripts still default
-to upstream downloads. Neither workflow is a ready-to-use Linux desktop release
-process. Upstream Windows updater and server-download URLs are not download links
-for this port.
+Amber was created by [EinFabo](https://github.com/EinFabo). This is a derivative of
+[Amber for Windows](https://github.com/EinFabo/amberpc), not a clean-room rewrite or an
+endorsed upstream Linux release. The original application, design, artwork, and retained
+source come from Amber. Original Git history is preserved, with Linux development
+following upstream commit
+[`64d67e3`](https://github.com/EinFabo/amberpc/commit/64d67e308511cb922e1de957d7896b1cdd56e42d).
 
-- [Original Amber for Windows, by EinFabo](https://github.com/EinFabo/amberpc): original
-  application, Windows installation instructions, releases, and upstream development.
-- [Standalone server documentation](server/README.md): retained server functionality,
-  separate from this Linux desktop; its upstream download links do not install this port.
-- [Publishing to GitHub](docs/github-publishing.md): progressive maintainer instructions.
+The original [LICENSE](LICENSE) says **Copyright (c) 2026 EinFabo. All rights reserved.**
+Amber is **not Apache-licensed**. It requires prior written permission to modify or
+redistribute the source, artwork, or a modified version. The limited GitHub viewing/forking
+allowance is not a general license to publish this port, and attribution does not grant
+those rights. This README asserts no permission or endorsement. Retain the license and
+copyright notices; permission requests go to the [original project's issues](https://github.com/EinFabo/amberpc/issues).
+Third-party libraries, runtimes, and models keep their own licenses, which do not relicense Amber.
 
-Tinfoil enclave verification and configurable idle model unloading are not implemented.
-The inherited [roadmap](docs/PLAN.md) also includes Windows/server plans; it is not a
-promise that those features work on Linux.
+<details>
+<summary>Maintainer publication and release cautions</summary>
+
+[Publishing to GitHub](docs/github-publishing.md) describes the permission gate and
+publication precautions. Its remote/setup examples reflect an earlier checkout;
+inspect the current repository rather than applying them blindly.
+
+The inherited CI can upload Linux package artifacts, and the server workflow can publish
+releases on matching tags. Both source publication and binary redistribution require
+appropriate permission. An enabled workflow is not evidence of that permission.
+
+Do **not** use `tools/release.sh` for this Linux port: it still targets the original
+creator's Windows repository. The server-release workflow publishes to its current
+repository, but the server installers still default to upstream downloads. Neither is
+a ready-to-use Linux desktop release process.
+
+</details>

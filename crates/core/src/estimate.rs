@@ -17,7 +17,7 @@ const MAX_SIZE: f64 = 1_000_000_000.0;
 const MAX_MS: f64 = 86_400_000.0;
 const MAX_SAMPLES: u64 = 1 << 53;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Line {
     pub overhead: f64,
     pub slope: f64,
@@ -114,6 +114,17 @@ pub struct Estimates {
     store: Mutex<Store>,
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Source { Learned, Default, Legacy, NotNeeded }
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Summary {
+    pub ms: u64,
+    pub samples: u64,
+    pub source: Source,
+}
+
 impl Estimates {
     pub fn load(path: &Path) -> Self {
         let mut store = Store { version: VERSION, ..Store::default() };
@@ -153,23 +164,29 @@ impl Estimates {
     }
 
     pub fn expected_ms(&self, route: &Route, size: u64) -> u64 {
-        self.prediction(route, size).0
+        self.summary(route, size).ms
     }
 
     /// The model list must not label an unmeasured default as measured.
     pub fn measured_ms(&self, route: &Route, size: u64) -> Option<u64> {
-        let (ms, measured) = self.prediction(route, size);
-        measured.then_some(ms)
+        let summary = self.summary(route, size);
+        matches!(summary.source, Source::Learned | Source::Legacy).then_some(summary.ms)
     }
 
-    fn prediction(&self, route: &Route, size: u64) -> (u64, bool) {
-        if size == 0 { return (0, false); }
+    /// The ring and comparison table share this exact prediction, including legacy priors.
+    /// Reading a summary neither creates samples nor writes the aggregate store.
+    pub fn summary(&self, route: &Route, size: u64) -> Summary {
+        if size == 0 { return Summary { ms: 0, samples: 0, source: Source::NotNeeded }; }
         let store = self.store.lock().unwrap();
         let legacy = route.legacy.as_ref().and_then(|key| store.legacy.get(key));
         let default = legacy.map(|r| Line { overhead: 200.0, slope: r.per_ms }).unwrap_or(route.default);
         let moments = store.models.get(&route.key);
         let line = moments.map(|m| m.line(default)).unwrap_or(default);
-        (line.predict((size as f64).min(MAX_SIZE)).round() as u64, moments.is_some() || legacy.is_some())
+        Summary {
+            ms: line.predict((size as f64).min(MAX_SIZE)).round() as u64,
+            samples: moments.map_or(0, |m| m.samples),
+            source: if moments.is_some() { Source::Learned } else if legacy.is_some() { Source::Legacy } else { Source::Default },
+        }
     }
 
     /// Only a completed, non-cancelled model request is eligible. Test runs never learn.
@@ -191,11 +208,43 @@ impl Estimates {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Persisted only with encrypted history, never with transcript-free learning aggregates.
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Route {
     key: String,
     legacy: Option<String>,
     default: Line,
+    label: String,
+}
+
+impl Route {
+    pub fn key(&self) -> &str { &self.key }
+
+    /// The suffix also distinguishes private prompt/language/connection variants without
+    /// displaying those settings or assuming two identical model names mean one route.
+    pub fn label(&self) -> String { format!("{} [{}]", self.label, &self.key[..8]) }
+}
+
+impl<'de> Deserialize<'de> for Route {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored { key: String, legacy: Option<String>, default: Line, label: String }
+        let stored = Stored::deserialize(deserializer)?;
+        if !valid_fingerprint(&stored.key) || stored.legacy.as_ref().is_some_and(|k| !valid_fingerprint(k))
+            || !stored.default.overhead.is_finite() || !(0.0..=MAX_MS).contains(&stored.default.overhead)
+            || !stored.default.slope.is_finite() || !(0.0..=MAX_MS).contains(&stored.default.slope)
+            || stored.label.len() > 512 || stored.label.chars().any(char::is_control)
+        {
+            return Err(serde::de::Error::custom("invalid history estimate route"));
+        }
+        Ok(Self { key: stored.key, legacy: stored.legacy, default: stored.default, label: stored.label })
+    }
+}
+
+fn safe_name(value: &str) -> String {
+    if !value.is_empty() && value.len() <= 100
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/-:".contains(&b)) && !value.contains("://")
+    { value.to_string() } else { format!("custom-{}", &fingerprint(&value)[..8]) }
 }
 
 fn valid_fingerprint(key: &str) -> bool {
@@ -213,6 +262,9 @@ pub fn local_speech(s: &Settings, runtime: &str, model: &str, threads: u32) -> R
         key: fingerprint(&("speech-v2", "local", runtime, model, threads, &s.language, &s.vocabulary, s.local.chunking)),
         legacy: Some(fingerprint(&format!("local:{runtime}:{model}"))),
         default: Line { overhead: 200.0, slope: 0.1 },
+        label: format!("local {}/{}, {}, live {}", safe_name(runtime), safe_name(model),
+            if threads == 0 { "runtime-managed threads".into() } else { format!("{threads} threads") },
+            if s.local.chunking { "enabled" } else { "disabled" }),
     }
 }
 
@@ -228,6 +280,8 @@ pub fn server_speech(s: &Settings) -> Option<Route> {
             &s.server.model, format, &s.language, &s.vocabulary)),
         legacy: Some(fingerprint(&format!("{}::{}", target.provider.id, s.server.model))),
         default: Line { overhead: 200.0, slope: 0.05 },
+        label: format!("{} / {}, upload {:?}, connection {}", target.provider.id, safe_name(&s.server.model), format,
+            &fingerprint(&(target.provider.id, &target.base_url, &s.server.connection_id))[..8]),
     })
 }
 
@@ -253,15 +307,17 @@ pub fn cleanup(s: &Settings, profile: Option<&Profile>, recognized: Option<&str>
     let mode = selected.as_ref().map(|m| (&m.instruction.prompt, m.instruction.output));
     let style = profile.map(|p| p.style).unwrap_or_default();
     let instruction = profile.map(|p| p.instruction.as_str()).unwrap_or("");
-    let route = match s.cleanup.engine {
+    let (route, label) = match s.cleanup.engine {
         EngineKind::Local => {
             let (runtime, model, threads) = local?;
-            fingerprint(&("local", runtime, model, threads))
+            (fingerprint(&("local", runtime, model, threads)), format!("local {}/{}, {} threads", safe_name(runtime), safe_name(model), threads))
         }
         EngineKind::Server => {
             let target = crate::connections::resolve_cleanup(s).ok()?;
             if s.cleanup.model.trim().is_empty() { return None; }
-            fingerprint(&(target.provider.id, &target.base_url, &s.cleanup.connection_id, &s.cleanup.model))
+            (fingerprint(&(target.provider.id, &target.base_url, &s.cleanup.connection_id, &s.cleanup.model)),
+                format!("{} / {}, connection {}", target.provider.id, safe_name(&s.cleanup.model),
+                    &fingerprint(&(target.provider.id, &target.base_url, &s.cleanup.connection_id))[..8]))
         }
     };
     Some(Route {
@@ -269,6 +325,7 @@ pub fn cleanup(s: &Settings, profile: Option<&Profile>, recognized: Option<&str>
             s.cleanup.fillers, s.cleanup.spoken_punctuation, s.cleanup.german_commas)),
         legacy: None,
         default: Line { overhead: 400.0, slope: if s.cleanup.engine == EngineKind::Local { 12.0 } else { 4.0 } },
+        label,
     })
 }
 
@@ -303,6 +360,7 @@ mod tests {
         assert!((600..620).contains(&e.expected_ms(&r, 10_000)));
         assert!(e.expected_ms(&r, 1) > 0);
         assert_eq!(e.expected_ms(&r, 0), 0);
+        assert_eq!(e.summary(&r, 0), Summary { ms: 0, samples: 0, source: Source::NotNeeded });
     }
 
     #[test]
@@ -344,16 +402,20 @@ mod tests {
         std::fs::write(&path, r#"{"local:cpu:test":{"per_ms":0.3,"samples":8},"bad":{"per_ms":-1,"samples":4}}"#).unwrap();
         let e = Estimates::load(&path);
         assert_eq!(e.measured_ms(&r, 10_000), Some(3_200));
+        assert_eq!(e.summary(&r, 10_000), Summary { ms: 3_200, samples: 0, source: Source::Legacy });
+        let snapshot: Route = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(e.summary(&snapshot, 10_000), e.summary(&r, 10_000));
         for x in [1_000, 2_000, 3_000, 4_000] { e.observe(&r, x, 500 + x / 2, true); }
         let mut history = crate::history::History::default();
         history.add(crate::history::Entry {
-            at: 1, text: "Private history text".into(), program: "editor".into(), engine: "cpu".into(), inserted: false, timings: None,
+            at: 1, text: "Private history text".into(), program: "editor".into(), engine: "cpu".into(), inserted: false, timings: None, cleanup: None, execution: None,
         }, 1, 1);
         history.prune(u64::MAX, 1);
         assert!(history.entries().is_empty());
         history.clear();
         let loaded = Estimates::load(&path);
         assert_eq!(loaded.expected_ms(&r, 10_000), 5_500);
+        assert_eq!(loaded.summary(&snapshot, 10_000), Summary { ms: 5_500, samples: 4, source: Source::Learned });
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["version"], VERSION);
         assert_eq!(loaded.store.lock().unwrap().models[&r.key], e.store.lock().unwrap().models[&r.key]);
@@ -448,6 +510,10 @@ mod tests {
         let speech = server_speech(&s).unwrap();
         let profile = Profile { instruction: "private style instruction".into(), ..Profile::default() };
         let clean = cleanup(&s, Some(&profile), None, None).unwrap();
+        let snapshots = serde_json::to_string(&[&speech, &clean]).unwrap();
+        for secret in ["private.example", "conn_a", "Private account name", "private vocabulary", "private style instruction"] {
+            assert!(!snapshots.contains(secret), "encrypted route snapshot still must not copy raw settings: {secret}");
+        }
         s.connections[0].name = "Another display name".into();
         s.server.provider = "openai".into();
         s.server.base_url = "https://unused.example/v1".into();
@@ -470,6 +536,23 @@ mod tests {
             assert!(!stored.contains(private), "no raw identity or individual record: {private}");
         }
         assert_eq!(Estimates::load(&path).store.lock().unwrap().models.len(), 2);
+    }
+
+    #[test]
+    fn route_snapshots_validate_fingerprints_and_numeric_priors() {
+        let route = route();
+        let value = serde_json::to_value(&route).unwrap();
+        assert_eq!(serde_json::from_value::<Route>(value.clone()).unwrap(), route);
+        for (field, invalid) in [("key", serde_json::json!("raw endpoint")), ("legacy", serde_json::json!("bad")),
+            ("default", serde_json::json!({"overhead": -1, "slope": 1})), ("default", serde_json::json!({"overhead": 200, "slope": 1e100}))] {
+            let mut invalid_value = value.clone();
+            invalid_value[field] = invalid;
+            assert!(serde_json::from_value::<Route>(invalid_value).is_err());
+        }
+        let mut settings = Settings::default();
+        settings.server.model = "https://user:password@private.example/model?key=secret".into();
+        let safe = serde_json::to_string(&server_speech(&settings).unwrap()).unwrap();
+        assert!(!safe.contains("private.example") && !safe.contains("secret") && !safe.contains("password"));
     }
 
     #[test]

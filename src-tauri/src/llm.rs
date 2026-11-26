@@ -391,31 +391,44 @@ pub fn tidy(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Pr
     // not expose saved prompts or turn a remotely supplied keyword into executable output.
     let mut phone = s.clone();
     phone.instructions.clear();
-    let (text, why, _) = tidy_cancellable(app, &phone, recognized, profile, snippets, &CancellationToken::default());
-    (text, why)
+    let result = tidy_cancellable(app, &phone, recognized, profile, snippets, &CancellationToken::default());
+    (result.text, result.skipped)
 }
 
-/// The third result conservatively records a configured remote cleanup attempt, even on
+pub struct Tidied {
+    pub text: String,
+    pub skipped: Option<String>,
+    pub remote: bool,
+    pub cleanup: amber_core::history::Cleanup,
+    pub route: Option<amber_core::estimate::Route>,
+}
+
+/// The remote flag conservatively records a configured remote cleanup attempt, even on
 /// failure/cancellation. It must not be inferred from whether the returned text changed.
-pub fn tidy_cancellable(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken) -> (String, Option<String>, bool) {
+pub fn tidy_cancellable(app: &AppHandle, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken) -> Tidied {
     tidy_learning(&app.state::<Core>().estimates, s, recognized, profile, snippets, cancel,
         || cleaner_measured(app, s, false, profile, Some(recognized)))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn tidy_learning(estimates: &amber_core::estimate::Estimates, s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken,
-    make_cleaner: impl FnOnce() -> Result<(ChatCleaner, Option<amber_core::estimate::Route>), String>) -> (String, Option<String>, bool) {
+    make_cleaner: impl FnOnce() -> Result<(ChatCleaner, Option<amber_core::estimate::Route>), String>) -> Tidied {
     let mut observation = None;
-    let result = tidy_with_cleaner(s, recognized, profile, snippets, cancel, true, || {
+    let mut cleanup = amber_core::history::Cleanup::default();
+    let result = tidy_recorded(s, recognized, profile, snippets, cancel, true, &mut cleanup, || {
         let (cleaner, route) = make_cleaner()?;
         observation = route.map(|route| (route, Instant::now()));
         Ok((cleaner, ()))
     });
-    if let Some((route, started)) = observation {
-        estimates.observe(&route, recognized.chars().count() as u64, started.elapsed().as_millis() as u64,
+    if let Some((route, started)) = &observation {
+        estimates.observe(route, recognized.chars().count() as u64, started.elapsed().as_millis() as u64,
             result.1.is_none() && !result.0.is_empty() && !cancel.is_cancelled());
+        if cleanup.outcome != amber_core::history::CleanupOutcome::Skipped {
+            cleanup.engine = Some(route.label());
+        }
     }
-    result
+    let route = observation.filter(|_| cleanup.outcome == amber_core::history::CleanupOutcome::Success && !cancel.is_cancelled()).map(|(route, _)| route);
+    Tidied { text: result.0, skipped: result.1, remote: result.2, cleanup, route }
 }
 
 /// Only budget model work that would be attempted now. A cold local model is skipped by
@@ -460,6 +473,13 @@ pub fn tidy_for_test(app: &AppHandle, s: &Settings, result: &mut amber_core::tes
 
 #[allow(clippy::too_many_arguments)]
 fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken, log: bool, make_cleaner: impl FnOnce() -> Result<(ChatCleaner, L), String>) -> (String, Option<String>, bool) {
+    tidy_recorded(s, recognized, profile, snippets, cancel, log, &mut amber_core::history::Cleanup::default(), make_cleaner)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tidy_recorded<L>(s: &Settings, recognized: &str, profile: Option<&Profile>, snippets: bool, cancel: &CancellationToken, log: bool,
+    cleanup: &mut amber_core::history::Cleanup, make_cleaner: impl FnOnce() -> Result<(ChatCleaner, L), String>) -> (String, Option<String>, bool) {
+    use amber_core::history::{CleanupMethod, CleanupOutcome};
     let _quiet = (!log).then(crate::diag::silence);
     if let Err(e) = cancel.check() {
         return (recognized.to_string(), Some(e.message), false);
@@ -467,11 +487,14 @@ fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile
     let instruction = amber_core::instructions::match_start(&s.instructions, recognized);
     // Explicit leading instructions win; otherwise a snippet stays exactly as saved.
     if let Some(snippet) = amber_core::snippets::find(&s.snippets, recognized).filter(|_| snippets && instruction.is_none()) {
+        cleanup.method = CleanupMethod::Snippet;
+        cleanup.outcome = CleanupOutcome::Success;
         // The trigger is what was just said: logged only where dictated text is.
         crate::diag::info(if s.log_text && !cfg!(target_os = "linux") { format!("snippet \"{}\"", snippet.trigger) } else { "snippet inserted".to_string() });
         return (snippet.text.clone(), None, false);
     }
     if let Some(selected) = &instruction {
+        cleanup.method = CleanupMethod::Instruction;
         let error = if !s.cleanup.smart || !profiles::smart_cleanup(s.cleanup.smart, profile) {
             Some("Keyword instructions need smart cleanup enabled globally and for this program; kept the original.")
         } else if selected.body.is_empty() {
@@ -483,8 +506,11 @@ fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile
     // spoken punctuation to a request intended for an explicit transformation.
     let text = if instruction.is_some() { recognized.into() } else { by_rule(s, recognized) };
     if !profiles::smart_cleanup(s.cleanup.smart, profile) || text.is_empty() {
+        cleanup.method = if s.cleanup.fillers || s.cleanup.spoken_punctuation || s.cleanup.german_commas { CleanupMethod::Rules } else { CleanupMethod::None };
+        cleanup.outcome = CleanupOutcome::Success;
         return (text, None, false);
     }
+    cleanup.method = if instruction.is_some() { CleanupMethod::Instruction } else { CleanupMethod::Smart };
     let started = Instant::now();
     // One language chosen for recognition: the cleanup is told it; several: it tells by itself.
     let languages = amber_core::engine::TranscribeOptions::new(&s.language, "");
@@ -503,6 +529,7 @@ fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile
         // cleanup passes (), preserving its existing non-pinning behavior.
         cancel.check().map_err(|e| e.message)?;
         remote_attempted = s.cleanup.engine == EngineKind::Server;
+        cleanup.outcome = CleanupOutcome::Failed;
         let cleaned = match &instruction {
             Some(selected) => c.transform_cancellable(selected.body, selected.instruction, cancel),
             None => c.clean_cancellable(&text, &ask, cancel),
@@ -512,6 +539,7 @@ fn tidy_with_cleaner<L>(s: &Settings, recognized: &str, profile: Option<&Profile
     });
     match result {
         Ok(cleaned) => {
+            cleanup.outcome = CleanupOutcome::Success;
             crate::diag::info(format!("cleanup: {} -> {} chars in {} ms", text.chars().count(), cleaned.chars().count(), started.elapsed().as_millis()));
             (cleaned, None, remote_attempted)
         }
@@ -585,10 +613,13 @@ mod tests {
         for (smart, profile, text) in [(false, None, "Bash: list files"), (false, Some(&always), "Bash: list files"),
             (true, Some(&never), "Bash: list files"), (true, None, "Bash:  ")] {
             s.cleanup.smart = smart;
-            let (out, why, remote) = tidy_with_cleaner::<()>(&s, text, profile, false, &cancel, false,
+            let mut cleanup = amber_core::history::Cleanup::default();
+            let (out, why, remote) = tidy_recorded::<()>(&s, text, profile, false, &cancel, false, &mut cleanup,
                 || panic!("an inactive or empty instruction must not construct a model"));
             assert_eq!(out, text);
             assert!(why.is_some() && !remote);
+            assert_eq!(cleanup, amber_core::history::Cleanup { method: amber_core::history::CleanupMethod::Instruction,
+                outcome: amber_core::history::CleanupOutcome::Skipped, engine: None });
         }
     }
 
@@ -747,6 +778,7 @@ mod tests {
     #[test]
     fn cleanup_learning_only_counts_successful_actual_model_work() {
         use amber_core::estimate::{self, Estimates};
+        use amber_core::history::{CleanupMethod, CleanupOutcome};
         let s = settings(EngineKind::Server);
         let spoken = "Please send the report tomorrow.";
         let route = estimate::cleanup(&s, None, Some(spoken), None).unwrap();
@@ -759,23 +791,72 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
                 if cancelled { flag.cancel(); }
             });
-            let _ = tidy_learning(&estimates, &s, spoken, None, true, &cancel, || Ok((cleaner, Some(route.clone()))));
+            let result = tidy_learning(&estimates, &s, spoken, None, true, &cancel, || Ok((cleaner, Some(route.clone()))));
             server.join().unwrap();
             assert_eq!(estimates.measured_ms(&route, 100).is_some(), status == 200 && !cancelled);
+            assert_eq!(result.cleanup.method, CleanupMethod::Smart);
+            assert_eq!(result.cleanup.engine, Some(route.label()));
+            assert_eq!(result.cleanup.outcome, if status == 200 && !cancelled { CleanupOutcome::Success } else { CleanupOutcome::Failed });
+            assert_eq!(result.route.is_some(), status == 200 && !cancelled);
         }
         let estimates = Estimates::in_memory();
         let mut disabled = s.clone();
         disabled.cleanup.smart = false;
-        let _ = tidy_learning(&estimates, &disabled, spoken, None, true, &CancellationToken::default(), || panic!("rules must not learn"));
+        let result = tidy_learning(&estimates, &disabled, spoken, None, true, &CancellationToken::default(), || panic!("rules must not learn"));
+        assert_eq!(result.cleanup.method, CleanupMethod::Rules);
+        assert_eq!(result.cleanup.outcome, CleanupOutcome::Success);
+        assert!(result.cleanup.engine.is_none() && result.route.is_none());
+        disabled.cleanup.fillers = false;
+        disabled.cleanup.spoken_punctuation = false;
+        disabled.cleanup.german_commas = false;
+        let result = tidy_learning(&estimates, &disabled, spoken, None, true, &CancellationToken::default(), || panic!("disabled cleanup must not learn"));
+        assert_eq!(result.cleanup.method, CleanupMethod::None);
+        assert_eq!(result.cleanup.outcome, CleanupOutcome::Success);
+        let never = Profile { cleanup: CleanupChoice::Never, ..Profile::default() };
+        let result = tidy_learning(&estimates, &s, spoken, Some(&never), true, &CancellationToken::default(), || panic!("profile disabled model cleanup"));
+        assert_eq!(result.cleanup.method, CleanupMethod::Rules);
+        assert!(result.cleanup.engine.is_none());
         let _ = tidy_learning(&estimates, &s, "", None, true, &CancellationToken::default(), || panic!("empty text must not learn"));
-        let _ = tidy_learning(&estimates, &s, spoken, None, true, &CancellationToken::default(), || Err("model still loading".into()));
+        let result = tidy_learning(&estimates, &s, spoken, None, true, &CancellationToken::default(), || Err("model still loading".into()));
+        assert_eq!(result.cleanup.method, CleanupMethod::Smart);
+        assert_eq!(result.cleanup.outcome, CleanupOutcome::Skipped);
+        assert!(result.cleanup.engine.is_none() && result.route.is_none());
         let mut snippet = s.clone();
         snippet.snippets.push(amber_core::snippets::Snippet { trigger: spoken.into(), text: "Saved text".into() });
-        let _ = tidy_learning(&estimates, &snippet, spoken, None, true, &CancellationToken::default(), || panic!("snippets must not learn"));
+        let result = tidy_learning(&estimates, &snippet, spoken, None, true, &CancellationToken::default(), || panic!("snippets must not learn"));
+        assert_eq!(result.cleanup.method, CleanupMethod::Snippet);
+        assert_eq!(result.cleanup.outcome, CleanupOutcome::Success);
+        assert!(result.cleanup.engine.is_none() && result.route.is_none());
         let cancel = CancellationToken::default();
         cancel.cancel();
         let _ = tidy_learning(&estimates, &s, spoken, None, true, &cancel, || panic!("cancelled requests must not learn"));
         assert!(estimates.measured_ms(&route, 100).is_none());
+    }
+
+    #[test]
+    fn cleanup_metadata_uses_actual_model_route_for_profiles_and_instructions() {
+        use amber_core::history::{CleanupMethod, CleanupOutcome};
+        let estimates = amber_core::estimate::Estimates::in_memory();
+        let mut s = instruction_settings();
+        s.cleanup.engine = EngineKind::Local;
+        let profile = Profile { cleanup: CleanupChoice::Always, instruction: "private profile".into(), ..Profile::default() };
+        for instruction in [false, true] {
+            s.cleanup.smart = instruction;
+            let spoken = if instruction { "Bash: list files" } else { "Please send the report tomorrow." };
+            let answer = if instruction { "ls" } else { spoken };
+            // The factory's served identity wins over the configured selection.
+            let route = amber_core::estimate::cleanup(&s, Some(&profile), Some(spoken), Some(("cpu", "actual-loaded-model", 3))).unwrap();
+            let body = serde_json::json!({"choices": [{"message": {"content": answer}, "finish_reason": "stop"}]}).to_string();
+            let (cleaner, server) = reply(200, body, None);
+            let result = tidy_learning(&estimates, &s, spoken, Some(&profile), true, &CancellationToken::default(), || Ok((cleaner, Some(route.clone()))));
+            server.join().unwrap();
+            assert_eq!(result.text, answer);
+            assert_eq!(result.cleanup.method, if instruction { CleanupMethod::Instruction } else { CleanupMethod::Smart });
+            assert_eq!(result.cleanup.outcome, CleanupOutcome::Success);
+            assert_eq!(result.cleanup.engine, Some(route.label()));
+            assert_eq!(result.route, Some(route));
+            assert!(result.cleanup.engine.unwrap().contains("actual-loaded-model"));
+        }
     }
 
     #[test]

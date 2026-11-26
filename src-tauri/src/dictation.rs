@@ -589,7 +589,7 @@ fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, pr
         // No model, or it failed: a dictation into a terminal is not lost for it.
         Err(e) if !explicit => return dictate(&format!("no command ({e})")),
         Err(e) => {
-            core.memory.remember(&core.settings(), &request, program.unwrap_or(""), "terminal", false, spoken_ms, 0, None);
+            core.memory.remember(&core.settings(), &request, program.unwrap_or(""), "terminal", false, spoken_ms, 0, None, None, None);
             let kept = if settings.history { " What you said is in the history." } else { "" };
             fail(app, session, format!("{e}{kept}"), true);
             return true;
@@ -616,7 +616,7 @@ fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, pr
     };
     let outcome = insert::insert(&typed, &how, target);
     let inserted = matches!(outcome, Ok(Outcome::Pasted | Outcome::Typed));
-    core.memory.remember(&core.settings(), &format!("{request} → {typed}"), program.unwrap_or(""), "terminal", inserted, spoken_ms, 0, None);
+    core.memory.remember(&core.settings(), &format!("{request} → {typed}"), program.unwrap_or(""), "terminal", inserted, spoken_ms, 0, None, None, None);
     let what = if settings.log_text { format!("\"{typed}\"") } else { format!("{} characters", typed.chars().count()) };
     crate::diag::info(format!("terminal: {} command {what} into {}", shell.name(), program.unwrap_or("?")));
     match risk {
@@ -689,6 +689,7 @@ fn run(
     // Recognized while speaking: only the tail after the last cut is left.
     let parts = parts.filter(|p| p.usable(recording.samples.len()));
     let tail = parts.as_ref().map(|p| audio::prepare(&recording.samples[p.cut_at..], recording.rate));
+    let speech_tail = matches!(&tail, Some(Ok(_)));
 
     let profile = program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
     let cleanup_budget = crate::llm::expected_ms(app, &settings, profile, None, estimate::predicted_chars(prepared.spoken_ms));
@@ -745,7 +746,13 @@ fn run(
     let cleanup_budget = crate::llm::expected_ms(app, &settings, profile, Some(&recognized), recognized.chars().count() as u64);
     if !progress(app, session, Some(cleanup_budget), false) { return; }
     let cleanup_started = Instant::now();
-    let (cleaned, skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, cancel);
+    let crate::llm::Tidied { text: cleaned, skipped, remote: remote_cleanup, cleanup, route } = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, cancel);
+    let speech_route = match &parts {
+        Some(parts) if !speech_tail => parts.execution_route(None),
+        Some(parts) => recognition_timing.as_ref().and_then(|timing| parts.execution_route(Some(&timing.route))),
+        None => recognition_timing.as_ref().map(|timing| timing.route.clone()),
+    };
+    let execution = speech_route.map(|speech| amber_core::history::Execution { speech, cleanup: route });
     let timings = amber_core::history::Timings {
         recording_ms: Some(audio::duration_ms(recording.samples.len(), recording.rate)),
         transcription_ms,
@@ -795,7 +802,7 @@ fn run(
         let message = result.message.clone();
         if keep_result(app, session, result, copy_only) {
             core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
-                prepared.spoken_ms, stopped.elapsed().as_millis() as u64, Some(timings));
+                prepared.spoken_ms, stopped.elapsed().as_millis() as u64, Some(timings), Some(cleanup), execution);
             crate::notify(app, "Amber", &message);
         }
         let _ = (recognize_ms, target);
@@ -819,7 +826,7 @@ fn run(
             return fail(app, session, format!("The shell instruction could not be copied: {e}"), true);
         }
         core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
-            prepared.spoken_ms, stopped.elapsed().as_millis() as u64, Some(timings));
+            prepared.spoken_ms, stopped.elapsed().as_millis() as u64, Some(timings), Some(cleanup), execution);
         let message = format!("{}Shell instruction copied for review. Amber did not paste it or press Enter.",
             skipped.map(|why| format!("{why} ")).unwrap_or_default());
         core.dictation.inner.lock().unwrap().phase = Phase::Done;
@@ -842,6 +849,8 @@ fn run(
         prepared.spoken_ms,
         stopped.elapsed().as_millis() as u64,
         Some(timings),
+        Some(cleanup),
+        execution,
     );
     match outcome {
         Ok(Outcome::OnClipboard(message)) => {
@@ -931,7 +940,8 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
     let copy_only = instruction_copy_only(&settings, &recognized);
     progress(app, session, Some(crate::llm::expected_ms(app, &settings, profile, Some(&recognized), recognized.chars().count() as u64)), false);
     let cleanup_started = Instant::now();
-    let (text, skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, &cancel);
+    let crate::llm::Tidied { text, skipped, remote: remote_cleanup, cleanup, route } = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, &cancel);
+    let execution = recognition_timing.as_ref().map(|timing| amber_core::history::Execution { speech: timing.route.clone(), cleanup: route });
     let timings = amber_core::history::Timings {
         recording_ms: None,
         transcription_ms,
@@ -974,7 +984,7 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
         settle(app, session, Duration::from_millis(900));
         let _ = (remote_cleanup, copy_only);
     }
-    core.memory.remember(&core.settings(), &text, failed.program.as_deref().unwrap_or(""), &engine, false, failed.spoken_ms, started.elapsed().as_millis() as u64, Some(timings));
+    core.memory.remember(&core.settings(), &text, failed.program.as_deref().unwrap_or(""), &engine, false, failed.spoken_ms, started.elapsed().as_millis() as u64, Some(timings), Some(cleanup), execution);
     crate::diag::info(format!("recognized again: {} words", text::words(&text)));
     Ok(text)
 }
@@ -1036,17 +1046,22 @@ impl ChunkJob {
                     // Asked for its language only until it is known - with no language set, or
                     // several to choose among.
                     let detect = options.fixed().is_none() && parts.language.is_none();
-                    let result = transcriber(&app, &settings).and_then(|p| {
+                    // Match final recognition's language identity without ever including the
+                    // dynamic text prompt in a persisted route or changing chunk learning.
+                    let mut actual = settings.clone();
+                    actual.language = options.language.clone().unwrap_or_else(|| "auto".into());
+                    let result = transcriber(&app, &actual).and_then(|p| {
                         parts.engine = p.label.clone();
                         let r = if detect {
                             p.transcriber.transcribe_detecting_cancellable(&part.wav, &options, &cancel)
                         } else {
                             p.transcriber.transcribe_cancellable(&part.wav, &options, &cancel).map(|t| (t, None))
                         };
-                        r.map_err(|e| e.message)
+                        r.map(|(text, detected)| (text, detected, p.estimate_route)).map_err(|e| e.message)
                     });
                     match result {
-                        Ok((text, detected)) => {
+                        Ok((text, detected, route)) => {
+                            parts.record_route(route);
                             if detect {
                                 parts.language = chunking::part_language(detected.as_deref(), &options.among());
                             }
@@ -1074,7 +1089,11 @@ impl ChunkJob {
     /// The parts recognized until now - waits for one still being recognized.
     fn finish(self) -> Parts {
         self.stop.store(true, Ordering::SeqCst);
-        self.handle.join().unwrap_or(Parts { failed: true, ..Parts::default() })
+        self.handle.join().unwrap_or_else(|_| {
+            let mut parts = Parts::default();
+            parts.failed = true;
+            parts
+        })
     }
 
     /// The recording was thrown away: the job stops at the next frame, nobody waits for it.

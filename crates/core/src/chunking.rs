@@ -147,9 +147,30 @@ pub struct Parts {
     pub language: Option<String>,
     /// The engine the parts went to, for the history and statistics.
     pub engine: String,
+    /// A comparison needs one actual route for every part, not just the final engine label.
+    route: Option<crate::estimate::Route>,
+    mixed_routes: bool,
 }
 
 impl Parts {
+    pub fn record_route(&mut self, route: crate::estimate::Route) {
+        if self.mixed_routes { return; }
+        if self.route.as_ref().is_some_and(|old| old.key() != route.key()) {
+            self.mixed_routes = true;
+            self.route = None;
+        } else {
+            self.route = Some(route);
+        }
+    }
+
+    /// None means no speech tail; an attempted tail with an unknown route must be excluded
+    /// by the caller, not passed here as if no request took place.
+    pub fn execution_route(&self, tail: Option<&crate::estimate::Route>) -> Option<crate::estimate::Route> {
+        let route = self.route.as_ref()?;
+        if self.failed || self.mixed_routes || tail.is_some_and(|tail| tail.key() != route.key()) { return None; }
+        Some(route.clone())
+    }
+
     /// Worth using for a recording of [total] samples: something recognized, nothing failed.
     pub fn usable(&self, total: usize) -> bool {
         !self.failed && self.cut_at > 0 && self.cut_at <= total && !self.texts.is_empty()
@@ -344,6 +365,25 @@ mod tests {
         assert_eq!(parts.with_tail(None), "Das ist ein Test.");
         assert!(!Parts { failed: true, ..parts.clone() }.usable(200));
         assert!(!Parts { texts: vec![], ..parts }.usable(200));
+    }
+
+    #[test]
+    fn live_comparisons_require_actual_uniform_routes_with_or_without_a_tail() {
+        let settings = crate::settings::Settings::default();
+        let route = crate::estimate::local_speech(&settings, "cpu", "first", 4);
+        let other = crate::estimate::local_speech(&settings, "cpu", "second", 4);
+        let mut parts = Parts::default();
+        parts.engine = "local cpu/first".into();
+        assert_eq!(parts.execution_route(None), None, "never infer a route from an engine label");
+        parts.record_route(route.clone());
+        parts.record_route(route.clone());
+        assert_eq!(parts.execution_route(None), Some(route.clone()), "no-tail runs retain the chunk route");
+        assert_eq!(parts.execution_route(Some(&route)), Some(route.clone()));
+        assert_eq!(parts.execution_route(Some(&other)), None, "a different tail is not the whole dictation");
+        parts.record_route(other);
+        parts.record_route(route.clone());
+        assert_eq!(parts.execution_route(None), None, "returning to a previous model cannot hide mixed parts");
+        assert_eq!(parts.execution_route(Some(&route)), None);
     }
 
     #[test]

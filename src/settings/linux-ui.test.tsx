@@ -4,14 +4,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React, { createElement, type ComponentProps, type ComponentType } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { ChatProvider, LocalInfo, LocalItem, Overview, Settings, TestResult } from "../shared/types";
+import type { ChatProvider, HistoryComparisons, LocalInfo, LocalItem, Overview, Settings, TestResult } from "../shared/types";
 import type { PageProps } from "./App";
 import { DownloadItem, SpeechModelActions } from "./downloads";
 import { AppPage } from "./pages/AppPage";
 import { CleanupPage } from "./pages/Cleanup";
 import { CredentialLink, CredentialsPage } from "./pages/Credentials";
 import { EnginePage, visibleSpeechModels } from "./pages/Engine";
-import { HistoryPage, HistoryTimings } from "./pages/History";
+import { HistoryEstimateTable, HistoryPage, HistoryTimings } from "./pages/History";
 import { accelerator, DEFAULT_PASTE_SHORTCUT, HotkeyInput, HotkeysPage, pretty } from "./pages/Hotkeys";
 import { InsertPage } from "./pages/Insert";
 import { MicrophonePage } from "./pages/Microphone";
@@ -76,6 +76,58 @@ test("everyday timings distinguish legacy, retry, live and skipped cleanup", () 
   assert.match(html, /Everyday text/);
 });
 
+test("history captures cleanup methods and models without inventing legacy metadata", () => {
+  const base = { at: 100, text: "Dictated text", program: "editor", engine: "Whisper Small", inserted: false };
+  const html = renderToStaticMarkup(<HistoryTimings entries={[
+    base,
+    { ...base, at: 200, cleanup: { method: "none", outcome: "success", engine: null } },
+    { ...base, at: 300, cleanup: { method: "rules", outcome: "success", engine: null } },
+    { ...base, at: 400, cleanup: { method: "snippet", outcome: "success", engine: null } },
+    { ...base, at: 500, cleanup: { method: "smart", outcome: "success", engine: "Local / Qwen3 / cpu" } },
+    { ...base, at: 600, cleanup: { method: "instruction", outcome: "success", engine: "OpenAI / model-a" } },
+    { ...base, at: 700, cleanup: { method: "smart", outcome: "failed", engine: "Groq / model-b" } },
+    { ...base, at: 800, cleanup: { method: "instruction", outcome: "skipped", engine: null } },
+  ]} />);
+  assert.match(html, /Cleanup method \/ Model/);
+  assert.equal((html.match(/Not recorded/g) ?? []).length, 1);
+  for (const label of ["No cleanup", "Rules only", "Snippet", "Smart cleanup", "Keyword instruction", "Local / Qwen3 / cpu", "OpenAI / model-a", "Groq / model-b", "Failed; fallback text kept", "Skipped; fallback text kept"]) {
+    assert.ok(html.includes(label), label);
+  }
+});
+
+test("comparable estimates use backend reference units and distinguish data sources from history counts", () => {
+  const base: HistoryComparisons["rows"][number] = {
+    id: "learned", speech: "Whisper Small / cpu / 4 threads", cleanup: "Smart cleanup / Qwen3",
+    dictations: 2, recognitionMs: 2500, cleanupMs: 800, totalMs: 3300,
+    recognitionSamples: 50, cleanupSamples: 3, recognitionSource: "learned", cleanupSource: "learned",
+  };
+  const comparison: HistoryComparisons = { referenceAudioMs: 10000, referenceChars: 100, rows: [
+    base,
+    { ...base, id: "default", speech: "New server model", recognitionSamples: 0, recognitionSource: "default", cleanupSamples: 0, cleanupSource: "default" },
+    { ...base, id: "legacy", speech: "Legacy model", recognitionSamples: 0, recognitionSource: "legacy", cleanup: "Rules only", cleanupMs: 0, totalMs: 2500, cleanupSamples: 0, cleanupSource: "notNeeded" },
+  ] };
+  const before = structuredClone(comparison);
+  const html = renderToStaticMarkup(<HistoryEstimateTable comparison={comparison} />);
+  assert.match(html, /10 seconds of audio \+ 100 text characters/);
+  assert.match(html, /Unicode, not words or tokens/);
+  assert.match(html, /ms \/ 10 s audio/);
+  assert.match(html, /ms \/ 100 characters/);
+  assert.match(html, /ms \/ reference workload/);
+  assert.match(html, /in filtered history/);
+  assert.match(html, /50 successful samples; learned/);
+  assert.match(html, /3 successful samples; limited data/);
+  assert.match(html, /Default; no measured samples/);
+  assert.match(html, /Legacy timing prior/);
+  assert.match(html, /0<small>No model stage/);
+  assert.match(html, /not necessarily better recognition or cleanup quality/);
+  assert.ok(html.indexOf("Legacy model") < html.indexOf("Whisper Small"), "fastest reference total comes first");
+  assert.deepEqual(comparison, before, "display sorting does not mutate fetched data");
+  const differentReference = renderToStaticMarkup(<HistoryEstimateTable comparison={{ ...comparison, referenceAudioMs: 20000, referenceChars: 250 }} />);
+  assert.match(differentReference, /20 seconds of audio \+ 250 text characters/);
+  assert.match(differentReference, /ms \/ 20 s audio/);
+  assert.match(differentReference, /ms \/ 250 characters/);
+});
+
 test("everyday timing table follows history opt-in and filters", (t) => {
   const entries = [
     { at: 100, text: "Visible dictation", program: "editor", engine: "local", inserted: false },
@@ -90,11 +142,84 @@ test("everyday timing table follows history opt-in and filters", (t) => {
   }) as typeof React.useState);
   const enabled = render(HistoryPage, props("linux", { history: true }));
   assert.match(enabled, /Everyday dictation timings/);
+  assert.match(enabled, /Comparable estimates/);
+  assert.match(enabled, /failed or skipped model cleanup are excluded/);
+  assert.match(enabled, /Use Testing to compare the same recording/);
   assert.match(enabled, /Visible dictation/);
   assert.doesNotMatch(enabled, /Filtered dictation/);
   calls = 0;
   const disabled = render(HistoryPage, props("linux", { history: false }));
-  assert.doesNotMatch(disabled, /Everyday dictation timings|Visible dictation|Filtered dictation/);
+  assert.doesNotMatch(disabled, /Everyday dictation timings|Comparable estimates|Visible dictation|Filtered dictation/);
+});
+
+test("unrelated history page renders keep the comparison request dependencies stable", (t) => {
+  const entries = [{ at: 100, text: "Saved dictation", program: "editor", engine: "local", inserted: true }];
+  const originalState = React.useState;
+  const originalEffect = React.useEffect;
+  let stateCalls = 0;
+  const requests: React.DependencyList[] = [];
+  t.mock.method(React, "useState", ((initial: unknown) => originalState(stateCalls++ === 0 ? entries : initial)) as typeof React.useState);
+  t.mock.method(React, "useEffect", ((effect, deps) => {
+    if (deps?.[0] === "[100]") requests.push(deps);
+    originalEffect(effect, deps);
+  }) as typeof React.useEffect);
+  render(HistoryPage, props("linux", { history: true }));
+  stateCalls = 0;
+  render(HistoryPage, props("linux", { history: true }));
+  assert.equal(requests.length, 2);
+  assert.ok(requests[0].every((dependency, index) => Object.is(dependency, requests[1][index])), "newly filtered arrays must not restart the request on unrelated parent renders");
+});
+
+test("stale history loads cannot resurrect deleted rows or overwrite a newer successful load with an error", async (t) => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const pending: { resolve: (entries: unknown[]) => void; reject: (error: Error) => void }[] = [];
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: {
+    invoke: (command: string) => {
+      assert.equal(command, "history_list");
+      return new Promise<unknown[]>((resolve, reject) => pending.push({ resolve, reject }));
+    },
+  } } });
+  t.after(() => {
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  const updates: unknown[][] = [[], [], []];
+  const originalState = React.useState;
+  const originalCallback = React.useCallback;
+  let stateCalls = 0;
+  let load: (() => Promise<void>) | undefined;
+  t.mock.method(React, "useState", ((initial: unknown) => {
+    const index = stateCalls++;
+    const state = originalState(initial);
+    return index < updates.length ? [state[0], (value: unknown) => updates[index].push(value)] : state;
+  }) as typeof React.useState);
+  t.mock.method(React, "useCallback", ((callback: () => Promise<void>, dependencies: React.DependencyList) => {
+    load = callback;
+    return originalCallback(callback, dependencies);
+  }) as typeof React.useCallback);
+  let refreshed = 0;
+  const properties = props("linux", { history: true });
+  properties.desktop.refresh = async () => { refreshed++; };
+  render(HistoryPage, properties);
+  assert.ok(load);
+  const stale = load();
+  const latest = load();
+  pending[1].resolve([]);
+  await latest;
+  pending[0].resolve([{ at: 100, text: "Deleted row" }]);
+  await stale;
+  assert.deepEqual(updates[0], [[]]);
+  assert.deepEqual(updates[2], [null]);
+  assert.equal(refreshed, 1);
+  const staleError = load();
+  const newest = load();
+  pending[3].resolve([]);
+  await newest;
+  pending[2].reject(new Error("Outdated storage failure"));
+  await staleError;
+  assert.deepEqual(updates[0], [[], []]);
+  assert.deepEqual(updates[2], [null, null]);
+  assert.equal(refreshed, 2);
 });
 
 const settings: Settings = {

@@ -277,6 +277,12 @@ export interface HistoryEntry {
   program: string;
   engine: string;
   inserted: boolean;
+  /** Captured when this dictation ran; absent for older history. */
+  cleanup?: {
+    method: "none" | "rules" | "snippet" | "smart" | "instruction";
+    outcome: "success" | "skipped" | "failed";
+    engine: string | null;
+  } | null;
   timings?: {
     recordingMs: number | null;
     transcriptionMs: number;
@@ -285,6 +291,26 @@ export interface HistoryEntry {
     live: boolean;
     cleanupSkipped: boolean;
   } | null;
+}
+
+export type EstimateSource = "learned" | "default" | "legacy" | "notNeeded";
+
+export interface HistoryComparisons {
+  referenceAudioMs: number;
+  referenceChars: number;
+  rows: {
+    id: string;
+    speech: string;
+    cleanup: string;
+    dictations: number;
+    recognitionMs: number;
+    cleanupMs: number;
+    totalMs: number;
+    recognitionSamples: number;
+    cleanupSamples: number;
+    recognitionSource: EstimateSource;
+    cleanupSource: EstimateSource;
+  }[];
 }
 
 export interface StatsSummary {

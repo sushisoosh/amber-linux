@@ -838,6 +838,14 @@ textarea:focus-visible {
   width: 155px;
 }
 
+.history-estimates {
+  min-width: 900px;
+}
+
+.history-estimates-error {
+  overflow-wrap: anywhere;
+}
+
 .comparison-table .comparison-model > span {
   font-weight: 500;
 }

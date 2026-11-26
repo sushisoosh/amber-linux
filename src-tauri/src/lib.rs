@@ -244,6 +244,7 @@ pub fn run() {
             commands::chat_providers,
             commands::running_programs,
             commands::history_list,
+            commands::history_comparisons,
             commands::history_delete,
             commands::history_clear,
             commands::copy_text,

@@ -1,13 +1,103 @@
 // The last dictations, kept on this PC: nothing dictated into the wrong window, or that
 // could not be inserted, is lost.
 
-import { useCallback, useDeferredValue, useEffect, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { DictationEvent, HistoryEntry } from "../../shared/types";
+import type { DictationEvent, EstimateSource, HistoryComparisons, HistoryEntry } from "../../shared/types";
 import type { PageProps } from "../App";
 import { DEFAULT_HISTORY_FILTERS, filterHistory, historyPrograms, type HistoryFilters } from "../history";
 import { Row, Section, Switch } from "../ui";
+
+function CleanupMethod({ cleanup }: { cleanup: HistoryEntry["cleanup"] }) {
+  if (!cleanup) return <span>Not recorded</span>;
+  const label = { none: "No cleanup", rules: "Rules only", snippet: "Snippet", smart: "Smart cleanup", instruction: "Keyword instruction" }[cleanup.method];
+  return <>
+    <span>{label}</span>
+    {cleanup.engine && <small>{cleanup.engine}</small>}
+    {cleanup.outcome !== "success" && <small>{cleanup.outcome === "failed" ? "Failed" : "Skipped"}; fallback text kept</small>}
+  </>;
+}
+
+function estimateBasis(source: EstimateSource, samples: number) {
+  switch (source) {
+    case "notNeeded": return "No model stage";
+    case "default": return "Default; no measured samples";
+    case "legacy": return "Legacy timing prior";
+    case "learned": return `${samples.toLocaleString()} successful sample${samples === 1 ? "" : "s"}; ${samples < 4 ? "limited data" : "learned"}`;
+  }
+}
+
+export function HistoryEstimateTable({ comparison }: { comparison: HistoryComparisons }) {
+  const rows = [...comparison.rows].sort((a, b) => a.totalMs - b.totalMs || a.id.localeCompare(b.id));
+  return <>
+    <div className="comparison-legend" id="history-estimates-legend">
+      Same reference workload for every combination: {comparison.referenceAudioMs / 1000} seconds of audio + {comparison.referenceChars} text characters (Unicode, not words or tokens).
+      These are current predictions from the same estimator as the progress ring, including fixed overhead, not averages of the wall times below.
+      Sorted by combined estimate, fastest first. Lower is faster, not necessarily better recognition or cleanup quality.
+      Scroll horizontally for all columns.
+    </div>
+    <div className="comparison-scroll" role="region" aria-label="Comparable timing estimates" aria-describedby="history-estimates-legend" tabIndex={0}>
+      <table className="comparison-table history-estimates">
+        <caption className="visually-hidden">Normalized estimates for recorded engine and cleanup combinations</caption>
+        <thead><tr>
+          <th scope="col" className="comparison-model">Speech engine / Model</th>
+          <th scope="col" className="comparison-model">Cleanup method / Model</th>
+          <th scope="col" className="comparison-number">Dictations<span>in filtered history</span></th>
+          <th scope="col" className="comparison-number">Recognition<span>ms / {comparison.referenceAudioMs / 1000} s audio</span></th>
+          <th scope="col" className="comparison-number">Cleanup model<span>ms / {comparison.referenceChars} characters</span></th>
+          <th scope="col" className="comparison-number">Combined<span>ms / reference workload</span></th>
+        </tr></thead>
+        <tbody>{rows.map((row) => <tr key={row.id}>
+          <th scope="row" className="comparison-model"><span>{row.speech}</span></th>
+          <td className="comparison-model"><span>{row.cleanup}</span></td>
+          <td className="comparison-number">{row.dictations.toLocaleString()}</td>
+          <td className="comparison-number">{row.recognitionMs.toLocaleString()}<small>{estimateBasis(row.recognitionSource, row.recognitionSamples)}</small></td>
+          <td className="comparison-number">{row.cleanupMs.toLocaleString()}<small>{estimateBasis(row.cleanupSource, row.cleanupSamples)}</small></td>
+          <td className="comparison-number comparison-total">{row.totalMs.toLocaleString()}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </>;
+}
+
+function HistoryEstimates({ entries, visibleEntries }: { entries: readonly HistoryEntry[]; visibleEntries: readonly HistoryEntry[] }) {
+  const [result, setResult] = useState<{ selection: string; comparison?: HistoryComparisons; error?: string } | null>(null);
+  const [revision, setRevision] = useState(0);
+  const selection = JSON.stringify(visibleEntries.map((entry) => entry.at));
+  useEffect(() => {
+    let cancelled = false;
+    setResult(null);
+    void invoke<HistoryComparisons>("history_comparisons", { ats: JSON.parse(selection) as number[] }).then(
+      (comparison) => { if (!cancelled) setResult({ selection, comparison }); },
+      (error: unknown) => { if (!cancelled) setResult({ selection, error: `Could not load estimates: ${error}` }); },
+    );
+    return () => { cancelled = true; };
+  }, [selection, revision, entries]);
+  const current = result?.selection === selection ? result : null;
+  return <Section title="Comparable estimates">
+    <Row label="Compare engine and cleanup combinations" hint="Successful combinations in your saved dictations. The history filters below apply here too.">
+      <button className="btn" onClick={() => setRevision((value) => value + 1)}>Refresh estimates</button>
+    </Row>
+    {!current && <div className="row note" role="status">Loading comparable estimates...</div>}
+    {current?.error && <div className="row note error history-estimates-error" role="alert">{current.error}</div>}
+    {current?.comparison && (current.comparison.rows.length > 0
+      ? <HistoryEstimateTable comparison={current.comparison} />
+      : <div className="row note">No comparable combinations in this selection yet. Complete a new dictation with history enabled to record its execution details.</div>)}
+    <details className="comparison-help">
+      <summary>How to read these estimates</summary>
+      <div className="comparison-legend">
+        Older entries without execution details, mixed-route streaming runs, and failed or skipped model cleanup are excluded.
+        Bracketed IDs distinguish execution settings without displaying private prompts or connection addresses.
+        Sample counts belong to each processing stage across all successful dictations, not just this filter or combination.
+        Sparse or similar-length data is blended with prior estimates; legacy estimates have no reliable sample count.
+        Rules and snippets have no cleanup-model budget, but their actual pipeline still takes time.
+        Model loading, failed attempts and retries are not part of these reference estimates; live chunking overlaps recording.
+        Estimates are not a controlled benchmark. Use Testing to compare the same recording.
+      </div>
+    </details>
+  </Section>;
+}
 
 export function HistoryTimings({ entries }: { entries: readonly HistoryEntry[] }) {
   const duration = (ms: number | null | undefined) => ms == null ? "Not measured" : ms.toLocaleString();
@@ -25,6 +115,7 @@ export function HistoryTimings({ entries }: { entries: readonly HistoryEntry[] }
         <caption className="visually-hidden">Performance of saved dictations</caption>
         <thead><tr>
           <th scope="col">Dictation / Engine</th>
+          <th scope="col" className="comparison-model">Cleanup method / Model</th>
           <th scope="col" className="comparison-number">Recording<span>ms</span></th>
           <th scope="col" className="comparison-number">Transcription after stop<span>ms</span></th>
           <th scope="col" className="comparison-number">Cleanup pipeline<span>ms</span></th>
@@ -33,9 +124,10 @@ export function HistoryTimings({ entries }: { entries: readonly HistoryEntry[] }
         </tr></thead>
         <tbody>{entries.map((e) => <tr key={e.at}>
           <th scope="row" className="comparison-model"><span>{new Date(e.at).toLocaleString()}</span><small>{e.program.trim() || "Unknown program"} / {e.engine}</small>{e.timings?.live && <small>Live chunking: remaining work only</small>}</th>
+          <td className="comparison-model"><CleanupMethod cleanup={e.cleanup} /></td>
           <td className="comparison-number">{e.timings && e.timings.recordingMs === null ? "Retry: no new recording" : duration(e.timings?.recordingMs)}</td>
           <td className="comparison-number">{duration(e.timings?.transcriptionMs)}</td>
-          <td className="comparison-number">{duration(e.timings?.cleanupMs)}{e.timings?.cleanupSkipped && <small>Smart cleanup skipped or failed; fallback text kept</small>}</td>
+          <td className="comparison-number">{duration(e.timings?.cleanupMs)}{e.timings?.cleanupSkipped && !e.cleanup && <small>Smart cleanup skipped or failed; fallback text kept</small>}</td>
           <td className="comparison-number comparison-total">{duration(e.timings?.processingMs)}</td>
           <td className="comparison-preview"><div>{e.text.slice(0, 160)}{e.text.length > 160 && "..."}</div></td>
         </tr>)}</tbody>
@@ -50,19 +142,23 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
   const [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [filters, setFilters] = useState<HistoryFilters>(DEFAULT_HISTORY_FILTERS);
+  const loadGeneration = useRef(0);
   const deferredQuery = useDeferredValue(filters.query);
   const searching = filters.query !== deferredQuery;
   const visibleEntries = filterHistory(entries, { ...filters, query: deferredQuery }, Date.now());
   const programs = historyPrograms(entries);
   const filtered = filters.query !== "" || filters.program !== null || filters.date !== "all" || filters.status !== "all";
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     try {
-      setEntries(await invoke<HistoryEntry[]>("history_list"));
+      const loaded = await invoke<HistoryEntry[]>("history_list");
+      if (generation !== loadGeneration.current) return;
+      setEntries(loaded);
       setLoadError(null);
     } catch (e) {
-      setLoadError(`Could not load history: ${e}`);
+      if (generation === loadGeneration.current) setLoadError(`Could not load history: ${e}`);
     } finally {
-      await desktop.refresh();
+      if (generation === loadGeneration.current) await desktop.refresh();
     }
   }, [desktop.refresh]);
 
@@ -72,7 +168,10 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
     const un = listen<DictationEvent>("dictation-state", (e) => {
       if (e.payload.state === "ready" || e.payload.state === "done" || e.payload.state === "error") void load();
     });
-    return () => void un.then((f) => f());
+    return () => {
+      ++loadGeneration.current;
+      void un.then((f) => f());
+    };
   }, [load, s.history]);
 
   const again = async () => {
@@ -119,6 +218,7 @@ export function HistoryPage({ s, save, toast, ov, desktop, phase, go }: PageProp
         {loadError && <div className="row"><div className="note error" role="alert">{loadError}</div></div>}
       </Section>
       {linux && <p className="note">If your wallet was unavailable when Amber started, unlock it and restart Amber to reload encrypted history. Keep any needed result before restarting. Do not turn history off to retry: that deletes stored dictations.</p>}
+      {s.history && <HistoryEstimates entries={entries} visibleEntries={visibleEntries} />}
       {s.history && (
         <Section title="Saved dictations">
           <div className="row column" role="search" aria-label="Filter history" style={{ gap: 12 }}>
