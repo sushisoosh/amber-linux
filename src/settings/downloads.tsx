@@ -69,6 +69,7 @@ export function DownloadItem({
   measured,
   builtIn = false,
   selectOnDownload = true,
+  disabled = false,
   toast,
 }: {
   local: Local;
@@ -82,6 +83,7 @@ export function DownloadItem({
   measured?: number;
   builtIn?: boolean;
   selectOnDownload?: boolean;
+  disabled?: boolean;
   toast: (message: string) => void;
 }) {
   const { info, progress, errors, reload, download } = local;
@@ -95,7 +97,7 @@ export function DownloadItem({
         className={`radio ${selected ? "on" : ""} ${!item.installed ? "disabled" : ""}`}
         aria-label={`Use ${item.label}`}
         aria-pressed={selected}
-        disabled={!item.installed}
+        disabled={disabled || !item.installed}
         onClick={onSelect}
         title={item.installed ? "" : item.imported ? "Imported files are missing; import the source again" : "Download it first"}
       />
@@ -128,9 +130,10 @@ export function DownloadItem({
       ) : item.installed || item.imported ? (
         <button
           className="btn danger"
+          disabled={disabled}
           onClick={async () => {
             try {
-              if (item.imported) await invoke("remove_imported_model", { id: item.id });
+              if (item.imported) await invoke(kind === "llmModel" ? "remove_imported_cleanup_model" : "remove_imported_model", { id: item.id });
               else await invoke("remove_download", { kind, id: item.id });
             } catch (e) {
               toast(String(e));
@@ -141,7 +144,7 @@ export function DownloadItem({
           Delete
         </button>
       ) : (
-        <button className="btn" onClick={() => download(kind, item.id, selectOnDownload).catch((e) => toast(String(e)))}>
+        <button className="btn" disabled={disabled} onClick={() => download(kind, item.id, selectOnDownload).catch((e) => toast(String(e)))}>
           {selectOnDownload ? "Download & use" : "Download"}
         </button>
       )}

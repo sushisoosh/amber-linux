@@ -189,6 +189,7 @@ export interface LocalInfo {
   llmStatus: LocalStatus;
   onnxRuntimeInstalled: boolean;
   importsError: string | null;
+  llmImportsError: string | null;
 }
 
 export interface DownloadEvent {

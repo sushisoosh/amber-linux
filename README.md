@@ -389,8 +389,28 @@ self-corrections and punctuation, with checks intended to preserve meaning. Revi
 important text: those checks do not guarantee a correct transcript.
 
 Local smart cleanup uses a separately downloaded Linux CPU llama.cpp runtime and
-Qwen3 4B Instruct 2507 model, not the Whisper speech model. It runs an authenticated
-server on `127.0.0.1`. Alternatively, select a hosted cleanup provider or an existing
+a selectable GGUF language model, not the Whisper speech model. It runs an authenticated
+server on `127.0.0.1`. **Cleanup > On this PC** offers Qwen3 4B Instruct 2507 (the default),
+Qwen2.5 1.5B, English-focused SmolLM2 1.7B, and Qwen2.5 7B, all in Q4_K_M quantization.
+The catalog shows download sizes and approximate speed, memory, language, and license
+guidance. Speed labels are relative, not benchmarks; compare actual cleanup with **Try it**
+or the same recording in **Testing**. Memory use exceeds the downloaded file size.
+Downloads are pinned to a revision and SHA-256 verified; they can be cancelled and resumed.
+Turn off **Use downloads when finished** before starting a model download to keep your
+current selection. This preference does not change downloads already running or runtime setup.
+
+**Import a cleanup model** accepts an existing single-file GGUF instruct/chat model with
+an embedded chat template. Browse to the file, name it, and confirm that you trust its
+source. Importing is offline and copies the model into Amber's managed storage, so allow
+extra disk space. The source file is never modified or deleted. Structure checks and a
+recorded checksum cannot guarantee safety, llama.cpp compatibility, or cleanup quality.
+Use non-thinking text models; split GGUF files, adapters, and speech models are not supported.
+Imported models appear beside the catalog and can be selected or deleted independently.
+**Use after import** saves the selection after copying; otherwise the current model stays
+selected. The llama.cpp runtime is still required and is downloaded separately. Missing
+selected models produce an error rather than silently switching to another cleanup model.
+
+Alternatively, select a hosted cleanup provider or an existing
 local Ollama instance. Hosted cleanup sends recognized text to that provider even
 when speech recognition itself is local. Automatic per-application profiles and the
 Windows terminal-command mode are disabled on Linux.

@@ -275,6 +275,12 @@ fn models(core: &Core) -> Vec<api::ModelInfo> {
         }).collect(),
         speech_runtime: rt.map_or("this PC", |r| r.label).to_string(),
         llms: if llm_rt.is_some() { local::LLM_MODELS.iter().filter(|m| layout.llm_model_installed(m)).map(|m| m.id.to_string()).collect() } else { Vec::new() },
+        imported_llms: amber_core::cleanup_imports::list(layout).unwrap_or_default().iter().filter_map(|m| {
+            let model = amber_core::cleanup_imports::resolve(layout, &m.id).ok()?;
+            if llm_rt.is_none() || !amber_core::cleanup_imports::installed(layout, &model) { return None; }
+            Some(api::ModelInfo { id: m.id.clone(), label: m.name.clone(), kind: api::ModelKind::Cleanup,
+                note: format!("Imported {} GGUF on this PC", m.architecture), default: false })
+        }).collect(),
         llm_runtime: llm_rt.map_or("this PC", |r| r.label).to_string(),
         cloud_speech: amber_core::connections::resolve_speech(&s).is_ok_and(|target| crate::connections::key_for(core, &target).is_ok()),
         cloud_cleanup: amber_core::connections::resolve_cleanup(&s).is_ok_and(|target| crate::connections::key_for(core, &target).is_ok()),

@@ -39,9 +39,9 @@ export function Row({ label, hint, children }: { label: ReactNode; hint?: ReactN
   );
 }
 
-export function Switch({ on, onChange }: { on: boolean; onChange: (on: boolean) => void }) {
+export function Switch({ on, onChange, disabled = false }: { on: boolean; onChange: (on: boolean) => void; disabled?: boolean }) {
   const label = useContext(RowLabel);
-  return <button className={`switch ${on ? "on" : ""}`} role="switch" aria-checked={on} aria-label={label} onClick={() => onChange(!on)} />;
+  return <button className={`switch ${on ? "on" : ""}`} role="switch" aria-checked={on} aria-label={label} disabled={disabled} onClick={() => onChange(!on)} />;
 }
 
 export function Segmented<T extends string>({

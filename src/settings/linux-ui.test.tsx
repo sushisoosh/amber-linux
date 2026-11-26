@@ -23,6 +23,7 @@ import { ConnectionsPage } from "./pages/Connections";
 import { BASH_EXAMPLE, instructionIssue, instructionKeyword, InstructionsPage } from "./pages/Instructions";
 import "./history.test";
 import { progress, ProgressRing } from "../bubble/fire";
+import { CleanupModelImports } from "./modelImports";
 
 test("progress refinements preserve continuity through recognition, cleanup and overruns", () => {
   const ring = new ProgressRing();
@@ -678,6 +679,177 @@ test("Linux cleanup describes CPU execution while Windows keeps GPU wording", ()
   assert.match(render(CleanupPage, props("windows")), /on your GPU/);
 });
 
+test("Cleanup starts with one explicit smart-cleanup toggle above the independent rules", () => {
+  for (const platform of ["linux", "windows"] as const) {
+    const p = props(platform);
+    const enabled = render(CleanupPage, p);
+    assert.match(enabled, /role="switch" aria-checked="true" aria-label="Enable smart cleanup"/);
+    assert.match(enabled, /Enabled: your selected model/);
+    assert.match(enabled, /Rule-based cleanup below is independent/);
+    assert.ok(enabled.indexOf("Enable smart cleanup") < enabled.indexOf("Rule-based cleanup</h2>"));
+    assert.ok(enabled.indexOf("Enable smart cleanup") < enabled.indexOf("Remove filler words"));
+    assert.equal((enabled.match(/aria-label="Enable smart cleanup"/g) ?? []).length, 1);
+    assert.doesNotMatch(enabled, /aria-label="Smart cleanup"/);
+    p.s.cleanup.smart = false;
+    const disabled = render(CleanupPage, p);
+    assert.match(disabled, /role="switch" aria-checked="false" aria-label="Enable smart cleanup"/);
+    assert.match(disabled, /Disabled: model-based cleanup is off\. Your model selection is kept/);
+    assert.match(disabled, /aria-checked="true" aria-label="Remove filler words"/);
+    assert.doesNotMatch(disabled, /On this PC|Server with API key|Cleanup model library/);
+    assert.match(render(CleanupPage, { ...p, settingsSaving: true }), /aria-label="Enable smart cleanup" disabled=""/);
+  }
+});
+
+test("The top cleanup toggle saves only smart-cleanup enablement and preserves model choices", async () => {
+  const p = props();
+  const original = structuredClone(p.s);
+  let control: ComponentProps<typeof Switch> | undefined;
+  p.save = async (change) => { change(p.s); return true; };
+  function Probe() {
+    const page = CleanupPage(p);
+    const visit = (node: React.ReactNode) => {
+      if (!React.isValidElement<{ label?: string; children?: React.ReactNode }>(node)) return;
+      if (node.type === Row && node.props.label === "Enable smart cleanup" && React.isValidElement<ComponentProps<typeof Switch>>(node.props.children)) {
+        control = node.props.children.props;
+      }
+      React.Children.forEach(node.props.children, visit);
+    };
+    visit(page);
+    return page;
+  }
+  render(Probe, {});
+  assert.ok(control);
+  await control.onChange(false);
+  assert.deepEqual(p.s, { ...original, cleanup: { ...original.cleanup, smart: false } });
+  render(Probe, {});
+  assert.equal(control.on, false);
+  await control.onChange(true);
+  assert.deepEqual(p.s, original);
+});
+
+test("Cleanup preview waits for the selected settings to finish saving", () => {
+  assert.match(render(CleanupPage, { ...props(), settingsSaving: true }), /disabled="">Saving settings\.\.\.</);
+  assert.doesNotMatch(render(CleanupPage, { ...props(), settingsSaving: true }), />Clean up</);
+  assert.match(render(CleanupPage, props()), />Clean up</);
+});
+
+test("Local cleanup lists catalog and imported models with honest resource guidance", (t) => {
+  const model: LocalItem = { id: "qwen3-4b-instruct-2507-q4km", label: "Qwen3 4B", note: "Balanced speed; multilingual", sizeMb: 2382, installed: true, imported: false, wantsGpu: false, replaced: false };
+  const info: LocalInfo = {
+    runtimes: [], models: [], hasNvidia: false, recommended: ["cpu", "speech"], measured: {}, status: { state: "stopped" },
+    downloads: [], folder: "/models", llmRuntimes: [{ ...model, id: "cpu", label: "CPU runtime" }],
+    llmModels: [model, { ...model, id: "small", label: "Small model", installed: false }, { ...model, id: "cleanup-import-custom", label: "My GGUF", imported: true, installed: false }],
+    llmStatus: { state: "stopped" }, onnxRuntimeInstalled: false, importsError: null, llmImportsError: "Registry unreadable",
+  };
+  const useState = React.useState;
+  let seeded = false;
+  t.mock.method(React, "useState", ((initial: unknown) => {
+    if (!seeded && initial === null) { seeded = true; return useState(info); }
+    return useState(initial);
+  }) as typeof React.useState);
+  const p = props("linux", { cleanup: { ...settings.cleanup, localModel: model.id } });
+  const html = render(CleanupPage, p);
+  for (const text of [/Cleanup model library/, /Imported cleanup models/, /Import a cleanup model/, /Selected cleanup model/,
+    /not measured tokens per second/, /CPU uses RAM/, /2.3 GB/, /Use downloads when finished/, /Try it/, /My GGUF/,
+    /files missing/, /Registry unreadable/, /single GGUF/, /embedded chat template/, /Importing is offline/]) assert.match(html, text);
+  assert.match(html, /aria-label="Use Qwen3 4B" aria-pressed="true"/);
+  assert.match(html, /aria-label="Use My GGUF" aria-pressed="false" disabled=""/);
+  assert.match(html, />Download &amp; use</);
+  assert.match(html, /disabled="">Import cleanup model</);
+  assert.match(html, /newly started model downloads, not downloads already running or runtime setup/);
+  assert.doesNotMatch(html, /Selected model is unavailable|Cleanup runtime required/);
+  seeded = false;
+  p.s.cleanup.localModel = "missing";
+  info.llmRuntimes[0].installed = false;
+  const missing = render(CleanupPage, p);
+  assert.match(missing, /Selected model is unavailable/);
+  assert.match(missing, /Cleanup runtime required/);
+  assert.match(missing, /will not silently substitute/);
+  assert.match(missing, /disabled="">Load now</);
+});
+
+test("Cleanup imports require trust, pass selection to the backend and retain selection errors", async (t) => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const calls: { command: string; args: unknown }[] = [];
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (command: string, args: unknown) => {
+    calls.push({ command, args });
+    if (command === "browse_cleanup_model") return "/downloads/own.gguf";
+    assert.equal(command, "import_cleanup_model");
+    return { id: "cleanup-import-custom", name: "My cleanup", selectionError: "Disk full" };
+  } } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous); else Reflect.deleteProperty(globalThis, "window"); });
+  const state: unknown[] = [];
+  let index = 0;
+  t.mock.method(React, "useState", ((initial: unknown) => {
+    const slot = index++;
+    if (!(slot in state)) state[slot] = initial;
+    return [state[slot], (next: unknown) => { state[slot] = typeof next === "function" ? next(state[slot]) : next; }];
+  }) as typeof React.useState);
+  const inputs = new Map<string, ComponentProps<"input">>();
+  const switches = new Map<string, ComponentProps<typeof Switch>>();
+  const buttons = new Map<string, ComponentProps<"button">>();
+  let reloaded = 0;
+  const local = { info: null, progress: {}, errors: {}, reload: async () => { reloaded++; }, download: unexpectedAction };
+  function Probe() {
+    const page = CleanupModelImports({ ...props(), local });
+    const visit = (node: React.ReactNode) => {
+      if (!React.isValidElement<{ label?: string; children?: React.ReactNode; "aria-label"?: string }>(node)) return;
+      if (node.type === "input") inputs.set(node.props["aria-label"]!, node.props as ComponentProps<"input">);
+      if (node.type === "button" && typeof node.props.children === "string") buttons.set(node.props.children, node.props as ComponentProps<"button">);
+      if (node.type === Row && React.isValidElement<ComponentProps<typeof Switch>>(node.props.children) && node.props.children.type === Switch) switches.set(node.props.label!, node.props.children.props);
+      React.Children.forEach(node.props.children, visit);
+    };
+    visit(page);
+    return page;
+  }
+  const rerender = () => { index = 0; inputs.clear(); switches.clear(); buttons.clear(); return render(Probe, {}); };
+  const click = async (label: string) => { await buttons.get(label)!.onClick!({} as React.MouseEvent<HTMLButtonElement>); };
+  rerender();
+  assert.equal(buttons.get("Import cleanup model")!.disabled, true);
+  await click("Browse...");
+  rerender();
+  assert.equal(inputs.get("Cleanup GGUF source path")!.value, "/downloads/own.gguf");
+  inputs.get("Imported cleanup model name")!.onChange!({ target: { value: " My cleanup " } } as React.ChangeEvent<HTMLInputElement>);
+  rerender();
+  assert.equal(buttons.get("Import cleanup model")!.disabled, true, "Name and file do not imply trust");
+  switches.get("I trust this cleanup model's source")!.onChange(true);
+  switches.get("Use after import")!.onChange(true);
+  rerender();
+  assert.equal(buttons.get("Import cleanup model")!.disabled, false);
+  // Choosing another file must revoke the previous source confirmation.
+  inputs.get("Cleanup GGUF source path")!.onChange!({ target: { value: "/downloads/other.gguf" } } as React.ChangeEvent<HTMLInputElement>);
+  rerender();
+  assert.equal(buttons.get("Import cleanup model")!.disabled, true);
+  switches.get("I trust this cleanup model's source")!.onChange(true);
+  rerender();
+  await click("Import cleanup model");
+  assert.deepEqual(calls[1], { command: "import_cleanup_model", args: { request: { sourcePath: "/downloads/other.gguf", name: "My cleanup" }, selectAfterImport: true } });
+  assert.equal(reloaded, 1);
+  assert.match(rerender(), /was imported, but selection was not saved: Disk full/);
+  assert.equal(inputs.get("Cleanup GGUF source path")!.value, "");
+  assert.equal(switches.get("I trust this cleanup model's source")!.on, false);
+});
+
+test("Imported cleanup deletion uses its own backend without invoking speech removal", async (t) => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const commands: string[] = [];
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { __TAURI_INTERNALS__: { invoke: async (command: string) => { commands.push(command); } } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous); else Reflect.deleteProperty(globalThis, "window"); });
+  const item: ComponentProps<typeof DownloadItem> = {
+    local: { info: null, progress: {}, errors: {}, reload: async () => {}, download: unexpectedAction }, kind: "llmModel",
+    item: { id: "cleanup-import-custom", label: "My cleanup", note: "Imported", sizeMb: 100, installed: false, imported: true, wantsGpu: false, replaced: false },
+    selected: true, onSelect: unexpectedAction, toast: unexpectedAction,
+  };
+  const row = DownloadItem(item);
+  const button = row.props.children.at(-1) as React.ReactElement<ComponentProps<"button">>;
+  assert.equal(button.props.children, "Delete");
+  await button.props.onClick!({} as React.MouseEvent<HTMLButtonElement>);
+  assert.deepEqual(commands, ["remove_imported_cleanup_model"]);
+  const html = render(DownloadItem, item);
+  assert.doesNotMatch(html, />Download/);
+  assert.match(html, /files missing/);
+});
+
 test("Custom cleanup directs both platforms to address-scoped Credentials", (t) => {
   const providers: ChatProvider[] = [{ id: "custom", name: "Custom", models: [], hasKey: false }];
   const useState = React.useState;
@@ -787,7 +959,7 @@ test("An installed ONNX model exposes runtime repair and does not offer irreleva
   const info: LocalInfo = {
     runtimes: [], models: [{ id: "parakeet-v3-int8", label: "Parakeet v3", family: "parakeet", note: "25 languages", installed: true, sizeMb: 671, wantsGpu: false, replaced: false, imported: false }],
     hasNvidia: false, recommended: ["cpu", "futo-multilingual-74"], measured: {}, status: { state: "ready", message: "Parakeet v3 on CPU" },
-    downloads: [], folder: "/models", llmRuntimes: [], llmModels: [], llmStatus: { state: "stopped" }, onnxRuntimeInstalled: false, importsError: null,
+    downloads: [], folder: "/models", llmRuntimes: [], llmModels: [], llmStatus: { state: "stopped" }, onnxRuntimeInstalled: false, importsError: null, llmImportsError: null,
   };
   const useState = React.useState;
   let suppliedInfo = false;

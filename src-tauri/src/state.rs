@@ -115,6 +115,10 @@ impl Core {
         let mut s = self.settings.write().unwrap();
         let mut next = s.clone();
         change(&mut next);
+        if next.cleanup.local_model != s.cleanup.local_model && next.cleanup.local_model.starts_with("cleanup-import-") {
+            let model = amber_core::cleanup_imports::resolve(&self.paths.layout, &next.cleanup.local_model).map_err(|e| e.to_string())?;
+            amber_core::cleanup_imports::available(&self.paths.layout, &model).map_err(|e| e.to_string())?;
+        }
         let next = next.sanitized();
         #[cfg(target_os = "linux")]
         let next = next.for_linux(false);
@@ -292,5 +296,16 @@ mod connection_tests {
         assert!(core.try_update_settings(|s| s.server.connection_id = Some("conn_missing".into())).is_err());
         assert!(core.settings().server.connection_id.is_none());
         assert!(!core.paths.settings.exists());
+    }
+
+    #[test]
+    fn missing_or_unsafe_cleanup_import_selection_is_not_saved_or_normalized() {
+        let (core, _) = fixture();
+        let original = core.settings().cleanup.local_model;
+        for id in ["cleanup-import-0123456789abcdef0123456789abcdef", "cleanup-import-../../outside"] {
+            assert!(core.try_update_settings(|s| s.cleanup.local_model = id.into()).is_err());
+            assert_eq!(core.settings().cleanup.local_model, original);
+            assert!(!core.paths.settings.exists());
+        }
     }
 }

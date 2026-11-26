@@ -244,6 +244,16 @@ pub fn offered(all: &[ModelInfo], key: &AccessKey) -> Vec<ModelInfo> {
 /// None when the server offers none (its hook answers that).
 pub fn resolve(kind: ModelKind, requested: Option<&str>, all: &[ModelInfo], mine: &[ModelInfo]) -> Result<Option<String>, (u16, String)> {
     let of_kind: Vec<&ModelInfo> = mine.iter().filter(|m| m.kind == kind).collect();
+    // A specifically selected local cleanup model must not become a different model
+    // (including a cloud model) when its managed copy is removed or unavailable.
+    if let Some(id) = requested.filter(|id| kind == ModelKind::Cleanup
+        && (id.starts_with("cleanup-import-") || crate::local::llm_model(id).is_some())) {
+        if !of_kind.iter().any(|m| m.id == id) {
+            return Err(if all.iter().any(|m| m.kind == kind && m.id == id) {
+                (403, "This access key may not use the selected cleanup model.".into())
+            } else { (404, "The selected cleanup model is unavailable. Select another model or restore it on the PC.".into()) });
+        }
+    }
     if of_kind.is_empty() {
         if all.iter().any(|m| m.kind == kind) {
             let what = if kind == ModelKind::Speech { "speech" } else { "cleanup" };
@@ -768,6 +778,21 @@ mod tests {
         assert_eq!(resolve(ModelKind::Cleanup, None, &all[..2], &offered(&all[..2], &open)), Ok(None));
         assert_eq!(resolve(ModelKind::Speech, Some("futo-multilingual-74"), &all, &offered(&all, &open)), Ok(Some("futo-multilingual-74".into())));
         assert_eq!(resolve(ModelKind::Speech, Some("nope"), &all, &offered(&all, &open)), Ok(Some("acft-large-v3-turbo-q8_0".into())));
+    }
+
+    #[test]
+    fn explicit_cleanup_imports_and_catalog_models_never_fall_back() {
+        let imported = ModelInfo { id: "cleanup-import-0123456789abcdef0123456789abcdef".into(), kind: ModelKind::Cleanup,
+            label: "My GGUF".into(), note: String::new(), default: false };
+        let cloud = ModelInfo { id: "cloud-model".into(), kind: ModelKind::Cleanup, label: "Cloud".into(), note: String::new(), default: true };
+        let all = [cloud.clone(), imported.clone()];
+        assert_eq!(resolve(ModelKind::Cleanup, Some(&imported.id), &all, &all), Ok(Some(imported.id.clone())));
+        assert_eq!(resolve(ModelKind::Cleanup, Some(&imported.id), &all, &[cloud.clone()]).unwrap_err().0, 403);
+        for id in [imported.id.as_str(), crate::local::LLM_MODELS[0].id] {
+            assert_eq!(resolve(ModelKind::Cleanup, Some(id), &[cloud.clone()], &[cloud.clone()]).unwrap_err().0, 404);
+            assert_eq!(resolve(ModelKind::Cleanup, Some(id), &[], &[]).unwrap_err().0, 404);
+        }
+        assert_eq!(resolve(ModelKind::Cleanup, None, &all, &all), Ok(Some(cloud.id)));
     }
 
     #[test]

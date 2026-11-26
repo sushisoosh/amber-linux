@@ -12,6 +12,7 @@ pub struct Installed {
     /// Where the local speech models run: "NVIDIA GPU (CUDA)".
     pub speech_runtime: String,
     pub llms: Vec<String>,
+    pub imported_llms: Vec<ModelInfo>,
     pub llm_runtime: String,
     pub cloud_speech: bool,
     pub cloud_cleanup: bool,
@@ -63,6 +64,10 @@ pub fn pc_models(s: &Settings, installed: &Installed) -> Vec<ModelInfo> {
             default: s.cleanup.engine == EngineKind::Local && s.cleanup.local_model == m.id,
         })
         .collect();
+    cleanup.extend(installed.imported_llms.iter().map(|m| ModelInfo {
+        id: m.id.clone(), label: m.label.clone(), note: m.note.clone(), kind: ModelKind::Cleanup,
+        default: s.cleanup.engine == EngineKind::Local && s.cleanup.local_model == m.id,
+    }));
     if installed.cloud_cleanup && !s.cleanup.model.trim().is_empty() {
       if let Ok(target) = crate::connections::resolve_cleanup(s) {
         let label = target.provider.chat_model(&s.cleanup.model).map_or(s.cleanup.model.clone(), |m| m.label.to_string());
@@ -98,10 +103,26 @@ mod tests {
             imported_speech: Vec::new(),
             speech_runtime: "NVIDIA GPU (CUDA)".into(),
             llms: vec!["qwen3-4b-instruct-2507-q4km".into()],
+            imported_llms: Vec::new(),
             llm_runtime: "NVIDIA GPU (CUDA)".into(),
             cloud_speech: true,
             cloud_cleanup: true,
         }
+    }
+
+    #[test]
+    fn cleanup_imports_are_offered_with_their_saved_identity_and_default() {
+        let mut s = Settings::default();
+        s.cleanup.engine = EngineKind::Local;
+        s.cleanup.local_model = "cleanup-import-0123456789abcdef0123456789abcdef".into();
+        let mut installed = installed();
+        installed.imported_llms.push(ModelInfo { id: s.cleanup.local_model.clone(), kind: ModelKind::Cleanup,
+            label: "My cleanup model".into(), note: "Imported llama GGUF on this PC".into(), default: false });
+        let offered = pc_models(&s, &installed);
+        let defaults: Vec<_> = offered.iter().filter(|m| m.kind == ModelKind::Cleanup && m.default).collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].id, s.cleanup.local_model);
+        assert_eq!(defaults[0].label, "My cleanup model");
     }
 
     #[test]

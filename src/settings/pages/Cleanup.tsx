@@ -10,6 +10,7 @@ import { Row, Section, Segmented, Switch } from "../ui";
 import { STYLES } from "./Programs";
 import { CredentialLink } from "./Credentials";
 import { ConnectionChoice, ConnectionModelPicker } from "../connections";
+import { CleanupModelImports } from "../modelImports";
 
 const EXAMPLE = "Ähm, lass uns morgen um drei Uhr treffen, nee stopp, um vier Uhr, äh, im Café weil es da ruhig ist.";
 
@@ -22,6 +23,14 @@ export function CleanupPage(p: PageProps) {
       <h1>Cleanup</h1>
       <p className="lead">{linux ? "Optional processing before you review or paste the result. Rules run on this PC; smart cleanup uses the selected local model or sends recognized text to your chosen server." : "What happens to your words before they are inserted. Hesitation sounds go out by rule; a language model can also untangle what you corrected while speaking."}</p>
       <Section>
+        <Row
+          label="Enable smart cleanup"
+          hint={`${c.smart ? "Enabled: your selected model cleans up self-corrections, false starts and punctuation. If it fails or changes too much, the recognized text is retained." : "Disabled: model-based cleanup is off. Your model selection is kept."} Rule-based cleanup below is independent.${linux ? "" : " Per-program cleanup overrides still apply."}`}
+        >
+          <Switch on={c.smart} disabled={p.settingsSaving} onChange={(v) => save((x) => (x.cleanup.smart = v))} />
+        </Row>
+      </Section>
+      <Section title="Rule-based cleanup">
         <Row label="Remove filler words" hint="äh, ähm, öhm, hm … - by fixed rules, on this PC, instantly. Real words like “um” stay.">
           <Switch on={c.fillers} onChange={(v) => save((x) => (x.cleanup.fillers = v))} />
         </Row>
@@ -31,19 +40,13 @@ export function CleanupPage(p: PageProps) {
         <Row label="German commas" hint="Before “dass”, “weil”, “wenn”, “um … zu”, “sondern” - only where the comma is nearly certain, only in German text.">
           <Switch on={c.germanCommas} onChange={(v) => save((x) => (x.cleanup.germanCommas = v))} />
         </Row>
-        <Row
-          label="Smart cleanup"
-           hint={linux ? "A language model can resolve self-corrections, false starts and punctuation. If it fails or changes too much, the recognized text is retained." : "A language model resolves self-corrections (“at three, no wait, at four” → “at four”), false starts and punctuation. If it fails or changes too much, the text goes in as recognized."}
-        >
-          <Switch on={c.smart} onChange={(v) => save((x) => (x.cleanup.smart = v))} />
-        </Row>
       </Section>
       {c.smart && (
         <>
           <div className="cards">
             <button className={`card ${c.engine === "local" ? "on" : ""}`} onClick={() => save((x) => (x.cleanup.engine = "local"))}>
               <div className="title">On this PC</div>
-              <div className="hint">{linux ? "llama.cpp on your CPU. Works offline after downloading the runtime and model; speed and memory needs depend on the model." : "llama.cpp with Qwen3 4B on your GPU. Private, offline, free."}</div>
+              <div className="hint">{linux ? "llama.cpp on your CPU. Works offline after downloading the runtime and model; speed and memory needs depend on the model." : "llama.cpp on your GPU or CPU. Choose a model to download or import your own GGUF. Private, offline after setup."}</div>
             </button>
             <button className={`card ${c.engine === "server" ? "on" : ""}`} onClick={() => save((x) => (x.cleanup.engine = "server"))}>
               <div className="title">Server with API key</div>
@@ -58,11 +61,16 @@ export function CleanupPage(p: PageProps) {
   );
 }
 
-function LocalModel({ s, save, toast, ov }: PageProps) {
+function LocalModel(p: PageProps) {
+  const { s, save, toast, ov } = p;
   const local = useLocal();
+  const [selectOnDownload, setSelectOnDownload] = useState(true);
   const info = local.info;
-  if (!info) return null;
+  if (!info) return <Section title="Local cleanup"><Row label="Loading model library..." /></Section>;
   const st = info.llmStatus;
+  const selected = info.llmModels.find((m) => m.id === s.cleanup.localModel);
+  const runtime = info.llmRuntimes.find((r) => r.id === s.cleanup.localRuntime);
+  const imported = info.llmModels.filter((m) => m.imported);
   return (
     <>
       <Section title="Runs on">
@@ -76,12 +84,17 @@ function LocalModel({ s, save, toast, ov }: PageProps) {
             onSelect={() => save((x) => (x.cleanup.localRuntime = r.id))}
             recommended={(ov.platform !== "linux" && info.hasNvidia ? "cuda" : "cpu") === r.id}
             warning={r.wantsGpu && !info.hasNvidia ? "no NVIDIA driver found on this PC" : undefined}
+            disabled={p.settingsSaving}
             toast={toast}
           />
         ))}
       </Section>
-      <Section title="Model">
-        {info.llmModels.map((m) => (
+      <Section title="Cleanup model library">
+        <Row label="Choose a model" hint="Download sizes are shown below. Speed labels compare these models on similar hardware, not measured tokens per second. Memory estimates are approximate: CPU uses RAM, GPU uses VRAM plus RAM. Leave room for speech recognition and other apps." />
+        <Row label="Use downloads when finished" hint="Applies to newly started model downloads, not downloads already running or runtime setup. Off: download for later. On: select the model after its checksum has been verified.">
+          <Switch on={selectOnDownload} onChange={setSelectOnDownload} />
+        </Row>
+        {info.llmModels.filter((m) => !m.imported).map((m) => (
           <DownloadItem
             key={m.id}
             local={local}
@@ -89,12 +102,27 @@ function LocalModel({ s, save, toast, ov }: PageProps) {
             item={m}
             selected={s.cleanup.localModel === m.id}
             onSelect={() => save((x) => (x.cleanup.localModel = m.id))}
+            recommended={m.id === "qwen3-4b-instruct-2507-q4km"}
+            selectOnDownload={selectOnDownload}
+            disabled={p.settingsSaving}
             toast={toast}
           />
         ))}
-        <Row label={<StatusLabel status={st} />} hint={st.message ?? (ov.platform === "linux" ? "Loaded while smart cleanup is on. Uses system memory; leave cleanup off on a low-memory PC." : "Loaded with Amber while the smart cleanup is on; uses about 3 GB of graphics memory.")}>
+        <Row label="Compare on this PC" hint="Q4_K_M is a compact 4-bit quantization. Smaller models usually run faster but can miss corrections. Use Try it below for a quick check, or Testing to compare the same recording. Larger does not guarantee better cleanup." />
+      </Section>
+      {imported.length > 0 && <Section title="Imported cleanup models">
+        {imported.map((m) => <DownloadItem key={m.id} local={local} kind="llmModel" item={m}
+          selected={s.cleanup.localModel === m.id} onSelect={() => save((x) => (x.cleanup.localModel = m.id))}
+          disabled={p.settingsSaving} toast={toast} />)}
+      </Section>}
+      <CleanupModelImports {...p} local={local} />
+      <Section title="Selected cleanup model">
+        <Row label={selected?.label ?? s.cleanup.localModel} hint="Downloaded, selected and loaded are separate states. Deleting an imported model removes only Amber's copy, not your original file." />
+        {(!selected || !selected.installed) && <Row label="Selected model is unavailable" hint="Download it, import the source again, or select an installed model above. Amber will not silently substitute a different cleanup model." />}
+        {!runtime?.installed && <Row label="Cleanup runtime required" hint="Download a runtime under Runs on before loading the model. Importing a model does not download the runtime." />}
+        <Row label={<StatusLabel status={st} />} hint={st.message ?? "The selected model loads while local smart cleanup is on. Loading needs more memory than the model's download size; disable smart cleanup to release it."}>
           {st.state !== "ready" && (
-            <button className="btn" disabled={st.state === "starting"} onClick={() => invoke("start_llm").catch((e) => toast(String(e)))}>
+            <button className="btn" disabled={p.settingsSaving || st.state === "starting" || !selected?.installed || !runtime?.installed} onClick={() => invoke("start_llm").catch((e) => toast(String(e)))}>
               Load now
             </button>
           )}
@@ -161,7 +189,7 @@ function ServerModel(p: PageProps) {
   );
 }
 
-function TryIt({ s, toast }: PageProps) {
+function TryIt({ s, toast, settingsSaving }: PageProps) {
   const [text, setText] = useState(EXAMPLE);
   const [result, setResult] = useState<CleanupPreview | null>(null);
   const [busy, setBusy] = useState(false);
@@ -182,8 +210,8 @@ function TryIt({ s, toast }: PageProps) {
         <div className="note">Type or paste what a dictation might sound like:</div>
         <textarea value={text} onChange={(e) => setText(e.target.value)} />
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <button className="btn primary" disabled={busy || !text.trim()} onClick={run}>
-            {busy ? "Cleaning…" : "Clean up"}
+            <button className="btn primary" disabled={busy || settingsSaving || !text.trim()} onClick={run}>
+              {busy ? "Cleaning…" : settingsSaving ? "Saving settings..." : "Clean up"}
           </button>
           {s.cleanup.smart && <Segmented value={style} options={STYLES} onChange={setStyle} />}
           {result && s.cleanup.smart && <span className="note">{result.error ? "" : `${result.ms} ms`}</span>}

@@ -8,6 +8,61 @@ import { Progress, Row, Section, Switch } from "./ui";
 type Variant = "whisper" | "parakeet_int8" | "moonshine_tiny" | "moonshine_base";
 type Transfer = { done: number; total: number | null };
 
+export function CleanupModelImports({ local, ...p }: PageProps & { local: Local }) {
+  const [sourcePath, setSourcePath] = useState("");
+  const [name, setName] = useState("");
+  const [trust, setTrust] = useState(false);
+  const [select, setSelect] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+  const [progress, setProgress] = useState<Transfer | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const importing = busy || !!local.info?.downloads.includes("cleanup-model-import");
+  useEffect(() => {
+    let active = true;
+    const sub = listen<Transfer>("cleanup-model-import-progress", (e) => { if (active) setProgress(e.payload); });
+    return () => { active = false; void sub.then((unlisten) => unlisten()); };
+  }, []);
+  const run = async () => {
+    setBusy(true); setProgress(null); setError(null); setSuccess(null);
+    try {
+      const imported = await invoke<{ id: string; name: string; selectionError: string | null }>("import_cleanup_model", {
+        request: { sourcePath: sourcePath.trim(), name: name.trim() }, selectAfterImport: select,
+      });
+      if (imported.selectionError) setError(`${imported.name} was imported, but selection was not saved: ${imported.selectionError}`);
+      else setSuccess(`${imported.name} imported. Your original file was not changed.${select ? " Selected for local cleanup." : " Select it from Imported cleanup models when ready."}`);
+      setSourcePath(""); setName(""); setTrust(false);
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(false); setProgress(null); await local.reload().catch((e) => p.toast(String(e))); }
+  };
+  return <Section title="Import a cleanup model">
+    <Row label="Already downloaded a model?" hint="Choose a single GGUF text-generation instruct/chat model compatible with llama.cpp, with an embedded chat template. Whisper speech models, adapters and split GGUF files are not supported. Compatibility and cleanup quality are not guaranteed; prefer non-thinking models and test the result." />
+    <Row label="Trusted sources only" hint="Native libraries parse model files. Import checks structure and records a checksum, but cannot prove publisher trust or safety. Amber copies the file into its own storage, requiring extra disk space. Your original is never changed or deleted. Importing is offline." />
+    {local.info?.llmImportsError && <div className="row"><div role="alert" className="note error">Cleanup model registry: {local.info.llmImportsError}</div></div>}
+    <Row label="GGUF file" hint="Browse to an existing file or enter its absolute path, not a URL. Symlinks are not supported.">
+      <div className="credential-controls">
+        <input type="text" aria-label="Cleanup GGUF source path" value={sourcePath} disabled={importing || browsing} onChange={(e) => { setSourcePath(e.target.value); setTrust(false); }} />
+        <button className="btn" disabled={importing || browsing} onClick={async () => {
+          setBrowsing(true); setError(null);
+          try { const path = await invoke<string | null>("browse_cleanup_model"); if (path) { setSourcePath(path); setTrust(false); } }
+          catch (e) { setError(String(e)); }
+          finally { setBrowsing(false); }
+        }}>{browsing ? "Choosing..." : "Browse..."}</button>
+      </div>
+    </Row>
+    <Row label="Model name"><input type="text" aria-label="Imported cleanup model name" maxLength={80} value={name} disabled={importing} onChange={(e) => setName(e.target.value)} /></Row>
+    <Row label="I trust this cleanup model's source"><Switch on={trust} onChange={setTrust} disabled={importing} /></Row>
+    <Row label="Use after import" hint="Off: import for later without changing your current cleanup model. On: save the selection after the import finishes, even if this window is closed."><Switch on={select} onChange={setSelect} disabled={importing} /></Row>
+    <div className="row model-actions">
+      <button className="btn primary" disabled={importing || browsing || p.settingsSaving || !trust || !name.trim() || !sourcePath.trim()} onClick={run}>{importing ? "Importing..." : "Import cleanup model"}</button>
+      {importing && <button className="btn" onClick={() => void invoke("cancel_cleanup_model_import").catch((e) => setError(String(e)))}>Cancel import</button>}
+      {importing && progress && <Progress done={progress.done} total={progress.total} />}
+    </div>
+    {(error || success) && <div className="row"><div role={error ? "alert" : "status"} className={`note ${error ? "error" : "ok"}`}>{error ?? success}</div></div>}
+  </Section>;
+}
+
 export function ModelImports({ local, ...p }: PageProps & { local: Local }) {
   const [variant, setVariant] = useState<Variant>("whisper");
   const [sourcePath, setSourcePath] = useState("");

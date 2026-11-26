@@ -315,7 +315,7 @@ pub const LLM_RUNTIMES: [LlmRuntime; 2] = [
     LlmRuntime {
         id: "cpu",
         label: "CPU",
-        note: "slow - a few seconds per sentence on a fast CPU",
+        note: "uses system RAM; speed depends on your CPU, model and text length",
         archives: &[Archive {
             url: "https://github.com/ggml-org/llama.cpp/releases/download/b11981/llama-b11981-bin-win-cpu-x64.zip",
             sha256: "626dd4136947fb9cdf755523fefcad3d414858a4beca06ce424fcd3ee0a948c9",
@@ -326,7 +326,7 @@ pub const LLM_RUNTIMES: [LlmRuntime; 2] = [
     LlmRuntime {
         id: "cuda",
         label: "NVIDIA GPU (CUDA)",
-        note: "well under a second per sentence",
+        note: "GPU acceleration; speed depends on the model and GPU, with enough free VRAM required",
         // The CUDA build and, separately, the CUDA runtime with cuBLAS it needs to load.
         archives: &[
             Archive {
@@ -358,7 +358,7 @@ pub const LLM_RUNTIMES: [LlmRuntime; 2] = [
 pub const LLM_RUNTIMES: [LlmRuntime; 1] = [LlmRuntime {
     id: "cpu",
     label: "CPU",
-    note: "optional cleanup, slower than speech recognition",
+    note: "uses system RAM; speed depends on your CPU, model and text length",
     archives: &[Archive {
         url: LLAMA_SERVER_BUILDS[0].url,
         sha256: LLAMA_SERVER_BUILDS[0].sha256,
@@ -377,15 +377,40 @@ pub struct LlmModel {
     pub size_mb: u32,
 }
 
-/// Apache 2.0, no thinking mode (no time spent before the answer), good at German.
-pub const LLM_MODELS: [LlmModel; 1] = [LlmModel {
+/// Instruct models without a thinking phase. Keep the existing default first.
+/// Speed and memory notes are relative guidance, not measured cleanup benchmarks.
+pub const LLM_MODELS: [LlmModel; 4] = [LlmModel {
     id: "qwen3-4b-instruct-2507-q4km",
     file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-    label: "Qwen3 4B Instruct",
-    note: "good German, about 3 GB of graphics memory",
+    label: "Qwen3 4B Instruct (Q4_K_M)",
+    note: "Balanced speed; multilingual including German; allow roughly 4-6 GB free memory; Apache 2.0",
     url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
     sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
     size_mb: 2_382,
+}, LlmModel {
+    id: "qwen2.5-1.5b-instruct-q4km",
+    file: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    label: "Qwen2.5 1.5B Instruct (Q4_K_M)",
+    note: "Fast, lightweight; multilingual; best for simple edits, less reliable on complex corrections; roughly 2-3 GB free memory; Apache 2.0",
+    url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    sha256: "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+    size_mb: 1_066,
+}, LlmModel {
+    id: "smollm2-1.7b-instruct-q4km",
+    file: "smollm2-1.7b-instruct-q4_k_m.gguf",
+    label: "SmolLM2 1.7B Instruct (Q4_K_M)",
+    note: "Fast, lightweight; English-focused; simple edits on smaller PCs, not recommended for German; roughly 2-3 GB free memory; Apache 2.0",
+    url: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/2d4a76a30b4af41ecd395c35725ac11688d4cfe4/smollm2-1.7b-instruct-q4_k_m.gguf",
+    sha256: "decd2598bc2c8ed08c19adc3c8fdd461ee19ed5708679d1c54ef54a5a30d4f33",
+    size_mb: 1_007,
+}, LlmModel {
+    id: "qwen2.5-7b-instruct-q4km",
+    file: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+    label: "Qwen2.5 7B Instruct (Q4_K_M)",
+    note: "Slower, larger; multilingual; an option for more complex instructions, compare results before choosing; roughly 6-8 GB free memory; Apache 2.0",
+    url: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/8911e8a47f92bac19d6f5c64a2e2095bd2f7d031/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+    sha256: "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
+    size_mb: 4_467,
 }];
 
 pub fn llm_runtime(id: &str) -> Option<&'static LlmRuntime> {
@@ -1049,9 +1074,20 @@ mod tests {
             assert!(cuda.required.contains(&"cublas64_12.dll"));
             assert_eq!(cuda.size_mb(), 641);
         }
+        let mut ids = std::collections::HashSet::new();
+        let mut files = std::collections::HashSet::new();
+        assert_eq!(LLM_MODELS[0].id, "qwen3-4b-instruct-2507-q4km");
         for m in &LLM_MODELS {
+            assert!(ids.insert(m.id) && files.insert(m.file));
+            assert_eq!(llm_model(m.id).map(|model| model.file), Some(m.file));
             assert_eq!(m.sha256.len(), 64);
-            assert!(m.url.ends_with(m.file) && m.url.contains("/resolve/a06e946b"));
+            assert!(m.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(m.url.starts_with("https://huggingface.co/") && m.url.ends_with(m.file));
+            let revision = m.url.split("/resolve/").nth(1).unwrap().split('/').next().unwrap();
+            assert_eq!(revision.len(), 40, "Pin model downloads to a commit");
+            assert!(revision.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(m.file.ends_with(".gguf") && !m.file.contains(['/', '\\']));
+            assert!(m.size_mb > 0 && !m.note.is_empty());
         }
     }
 

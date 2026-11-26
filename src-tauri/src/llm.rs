@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use amber_core::cleanup::{Ask, ChatCleaner};
+use amber_core::cleanup_imports::{self, CleanupModel};
 use amber_core::engine::CancellationToken;
 use amber_core::profiles::{self, CleanupChoice, Profile};
 use amber_core::local;
@@ -123,7 +124,7 @@ impl Llm {
     /// A llama-server with the configured model, started first if needed - or stopped, if
     /// the settings no longer want it. Blocks while the model loads. Like the whisper server:
     /// settings are read under the lock, and a running server is only replaced once its
-    /// successor is fully downloaded.
+    /// successor is fully downloaded. An unavailable selection is never substituted.
     pub fn ensure(&self, app: &AppHandle) -> Result<Endpoint, String> {
         self.ensure_model(app, None)
     }
@@ -157,19 +158,21 @@ impl Llm {
         }
         let c = settings.cleanup;
         let key = Key { runtime: c.local_runtime.clone(), model: model.unwrap_or(&c.local_model).to_string() };
-        let rt = local::llm_runtime(&key.runtime).ok_or("Unknown runtime.")?;
-        let model = local::llm_model(&key.model).ok_or("Unknown model.")?;
-        let missing = if !layout.llm_runtime_installed(rt) {
-            Some(format!("The cleanup engine ({}) is not installed yet - download it under Cleanup.", rt.label))
-        } else if !layout.llm_model_installed(model) {
-            Some(format!("The model {} is not downloaded yet - get it under Cleanup.", model.label))
-        } else {
-            None
-        };
+        let (rt, model) = crate::imports::report_load_failure((|| {
+            let rt = local::llm_runtime(&key.runtime).ok_or("Unknown cleanup runtime.")?;
+            let model = cleanup_imports::resolve(layout, &key.model).map_err(|e| e.to_string())?;
+            cleanup_imports::available(layout, &model).map_err(|e| e.to_string())?;
+            if !layout.llm_runtime_installed(rt) {
+                return Err(format!("The cleanup engine ({}) is not installed yet - download it under Cleanup.", rt.label));
+            }
+            Ok((rt, model))
+        })(), |message| self.status_if(own, app, Status::of("failed", Some(message.into()))))?;
 
         if let Some(r) = running.as_mut() {
             let alive = matches!(r.child.try_wait(), Ok(None));
-            if alive && (r.key == key || missing.is_some()) {
+            if alive && r.key == key {
+                if own { *self.failed_at.lock().unwrap() = None; }
+                self.status_if(own, app, Status::of("ready", Some(format!("{} on {}", model.label, rt.label))));
                 return Ok(r.endpoint());
             }
             if !alive {
@@ -178,14 +181,9 @@ impl Llm {
             r.child.stop();
             *running = None;
         }
-        if let Some(msg) = missing {
-            self.status_if(own, app, Status::of("failed", Some(msg.clone())));
-            return Err(msg);
-        }
-
         self.status_if(own, app, Status::of("starting", Some(format!("Loading {}…", model.label))));
         let started = Instant::now();
-        match self.spawn(layout, rt, model, &key) {
+        match cleanup_imports::verify(layout, &model).map_err(|e| e.to_string()).and_then(|_| self.spawn(layout, rt, &model, &key)) {
             Ok(r) => {
                 let endpoint = r.endpoint();
                 crate::diag::info(format!("cleanup model ready: {} on {} in {} ms", model.label, rt.label, started.elapsed().as_millis()));
@@ -207,7 +205,7 @@ impl Llm {
         }
     }
 
-    fn spawn(&self, layout: &local::Layout, rt: &local::LlmRuntime, model: &local::LlmModel, key: &Key) -> Result<Running, String> {
+    fn spawn(&self, layout: &local::Layout, rt: &local::LlmRuntime, model: &CleanupModel, key: &Key) -> Result<Running, String> {
         let port = process::free_port().map_err(|e| format!("No free port: {e}"))?;
         let api_key = amber_core::api::new_key();
         let cmd = llama_command(layout, rt, model, port, &api_key);
@@ -281,16 +279,29 @@ impl Llm {
         }
     }
 
+    pub fn remove_imported(&self, app: &AppHandle, removal: cleanup_imports::Removal<'_>) -> Result<(), String> {
+        // Hold the lifecycle lock through deletion so a background warm cannot reload it.
+        let mut running = self.running.lock().unwrap();
+        if running.as_ref().is_some_and(|r| r.key.model == removal.id()) {
+            if let Some(mut r) = running.take() { r.child.stop(); }
+            self.set_status(app, Status::of("stopped", None));
+        }
+        removal.remove().map_err(|e| e.to_string())
+    }
+
 }
 
-fn llama_command(layout: &local::Layout, rt: &local::LlmRuntime, model: &local::LlmModel, port: u16, api_key: &str) -> Command {
+fn llama_command(layout: &local::Layout, rt: &local::LlmRuntime, model: &CleanupModel, port: u16, api_key: &str) -> Command {
     let mut cmd = Command::new(layout.llm_server_exe(rt));
     // Keep the Windows filename workaround. Linux's bundled libraries resolve via $ORIGIN;
     // no global library path changes are needed. Environment secrets remain visible to the
     // same OS user, but unlike argv they are not exposed to other users by default.
-    let model_path = layout.llm_model_path(model);
+    let model_path = &model.path;
     cmd.current_dir(model_path.parent().unwrap_or(&layout.root))
-        .args(["--model", model.file, "--host", "127.0.0.1", "--port", &port.to_string()])
+        .arg("--model").arg(model_path.file_name().expect("resolved cleanup model has a filename"))
+        .args(["--host", "127.0.0.1", "--port", &port.to_string()])
+        // Use the model's embedded template, not a Qwen/ChatML override.
+        .arg("--jinja")
         .args(["--ctx-size", CONTEXT, "--parallel", "1"])
         .args(["--threads", &process::default_threads().to_string()])
         .env("LLAMA_API_KEY", api_key);
@@ -317,9 +328,13 @@ fn cleaner_measured(app: &AppHandle, s: &Settings, wait: bool, profile: Option<&
     let c = &s.cleanup;
     match c.engine {
         EngineKind::Local => {
-            let llm = &app.state::<Core>().llm;
+            let core = app.state::<Core>();
+            let llm = &core.llm;
+            crate::imports::report_load_failure(cleanup_imports::resolve(&core.paths.layout, &c.local_model)
+                .and_then(|model| cleanup_imports::available(&core.paths.layout, &model)).map_err(|e| e.to_string()),
+                |message| llm.set_status(app, Status::of("failed", Some(message.into()))))?;
             let endpoint = if wait {
-                llm.ensure(app)?
+                llm.ensure_with(app, None, Some(s))?
             } else {
                 llm.ready_for(app, s).ok_or("the cleanup model is still loading")?
             };
@@ -345,10 +360,11 @@ pub fn cleaner_for(app: &AppHandle, s: &Settings, model: Option<&str>) -> Result
     let c = &s.cleanup;
     // A downloaded local model - also the PC's own while its smart cleanup is off: the
     // phone asked for it, the list offered it.
-    if let Some(m) = model.and_then(local::llm_model).filter(|m| layout.llm_model_installed(m)) {
-        let own = c.engine == EngineKind::Local && c.local_model == m.id;
-        let endpoint = app.state::<Core>().llm.ensure_model(app, (!own || !wants_local(s)).then_some(m.id))?;
-        return Ok(ChatCleaner::new(&endpoint.url, &endpoint.key, m.id, None));
+    if let Some(id) = model.filter(|id| local::llm_model(id).is_some() || id.starts_with("cleanup-import-")) {
+        let m = cleanup_imports::resolve(layout, id).map_err(|e| e.to_string())?;
+        cleanup_imports::available(layout, &m).map_err(|e| e.to_string())?;
+        let endpoint = app.state::<Core>().llm.ensure_with(app, Some(id), Some(s))?;
+        return Ok(ChatCleaner::new(&endpoint.url, &endpoint.key, &endpoint.model, None));
     }
     if model.is_some_and(|id| id == c.model) && c.engine != EngineKind::Server {
         let mut cloud = s.clone();
@@ -367,8 +383,9 @@ pub fn command(app: &AppHandle, s: &Settings, spoken: &str, shell: amber_core::t
         EngineKind::Server => c.model.as_str(),
     };
     let layout = &app.state::<Core>().paths.layout;
-    if c.engine == EngineKind::Local && !local::llm_model(model).is_some_and(|m| layout.llm_model_installed(m)) {
-        return Err("Terminal commands need a language model - download one under Cleanup, or choose a provider there.".into());
+    if c.engine == EngineKind::Local {
+        let model = cleanup_imports::resolve(layout, model).map_err(|e| e.to_string())?;
+        cleanup_imports::available(layout, &model).map_err(|e| e.to_string())?;
     }
     let cleaner = cleaner_for(app, s, Some(model)).map_err(|e| format!("Terminal commands need the cleanup's model: {e}"))?;
     let (system, user) = amber_core::terminal::request(spoken, shell, title);
@@ -573,10 +590,12 @@ mod tests {
     fn helper_key_is_not_in_argv_and_cpu_is_explicit() {
         let layout = local::Layout { root: std::path::PathBuf::from("/test/amber") };
         let rt = local::llm_runtime("cpu").unwrap();
-        let model = &local::LLM_MODELS[0];
-        let cmd = llama_command(&layout, rt, model, 54321, "private-test-key");
+        let model = cleanup_imports::resolve(&layout, local::LLM_MODELS[0].id).unwrap();
+        let cmd = llama_command(&layout, rt, &model, 54321, "private-test-key");
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(!args.iter().any(|a| a.contains("private-test-key") || a == "--api-key"));
+        assert!(args.iter().any(|a| a == "--jinja"));
+        assert!(!args.iter().any(|a| a == "--chat-template"));
         for pair in [["--host", "127.0.0.1"], ["--port", "54321"], ["--parallel", "1"], ["--n-gpu-layers", "0"]] {
             assert!(args.windows(2).any(|w| w == pair));
         }
@@ -585,6 +604,20 @@ mod tests {
         assert_eq!(cmd.get_program(), layout.llm_server_exe(rt).as_os_str());
         #[cfg(target_os = "linux")]
         assert_eq!(std::path::Path::new(cmd.get_program()).file_name().unwrap(), "llama-server");
+    }
+
+    #[test]
+    fn imported_cleanup_uses_managed_directory_leaf_name_and_embedded_template() {
+        let layout = local::Layout { root: std::path::PathBuf::from("/test/amber") };
+        let mut model = cleanup_imports::resolve(&layout, local::LLM_MODELS[0].id).unwrap();
+        model.id = "cleanup-import-0123456789abcdef0123456789abcdef".into();
+        model.path = layout.root.join("cleanup-imports").join(&model.id).join("model.gguf");
+        let cmd = llama_command(&layout, local::llm_runtime("cpu").unwrap(), &model, 54321, "private-key");
+        assert_eq!(cmd.get_current_dir(), model.path.parent());
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["--model", "model.gguf"]));
+        assert!(args.iter().any(|a| a == "--jinja"));
+        assert!(!args.iter().any(|a| a.contains("Qwen") || a == "--chat-template" || a.contains("private-key")));
     }
 
     fn settings(engine: EngineKind) -> Settings {

@@ -472,9 +472,9 @@ impl Removal<'_> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+pub(crate) fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
 
-fn no_follow(options: &mut OpenOptions) {
+pub(crate) fn no_follow(options: &mut OpenOptions) {
     #[cfg(unix)] {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
@@ -485,7 +485,7 @@ fn no_follow(options: &mut OpenOptions) {
     }
 }
 
-fn ensure_regular(meta: &fs::Metadata) -> Result<(), ImportError> {
+pub(crate) fn ensure_regular(meta: &fs::Metadata) -> Result<(), ImportError> {
     if !meta.is_file() || is_link(meta) { return Err(invalid("Model files must be regular files, not links or devices.")); }
     Ok(())
 }
@@ -498,7 +498,7 @@ fn is_link(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
-fn reject_links(path: &Path) -> Result<(), ImportError> {
+pub(crate) fn reject_links(path: &Path) -> Result<(), ImportError> {
     let mut prefix = PathBuf::new();
     for component in path.components() {
         if matches!(component, Component::ParentDir) { return Err(invalid("Parent-directory paths are not allowed for model imports.")); }
@@ -513,7 +513,7 @@ fn reject_links(path: &Path) -> Result<(), ImportError> {
     Ok(())
 }
 
-fn open_regular(path: &Path) -> Result<File, ImportError> {
+pub(crate) fn open_regular(path: &Path) -> Result<File, ImportError> {
     reject_links(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
@@ -523,7 +523,7 @@ fn open_regular(path: &Path) -> Result<File, ImportError> {
     Ok(file)
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ImportError> {
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ImportError> {
     let file = open_regular(path)?;
     if file.metadata()?.len() > limit { return Err(invalid("The model metadata exceeds its size limit.")); }
     let mut bytes = Vec::new();

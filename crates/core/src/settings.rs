@@ -334,7 +334,7 @@ pub struct CleanupSettings {
     pub engine: EngineKind,
     /// "cpu" or "cuda", see `local::LLM_RUNTIMES`.
     pub local_runtime: String,
-    /// See `local::LLM_MODELS`.
+    /// A `local::LLM_MODELS` entry or a managed cleanup import ID.
     pub local_model: String,
     /// A cleanup-capable provider id; credentials are shared per provider.
     pub provider: String,
@@ -472,7 +472,7 @@ impl Settings {
         if crate::local::llm_runtime(&c.local_runtime).is_none() {
             c.local_runtime = d.cleanup.local_runtime.clone();
         }
-        if crate::local::llm_model(&c.local_model).is_none() {
+        if crate::local::llm_model(&c.local_model).is_none() && !crate::cleanup_imports::is_import_id(&c.local_model) {
             c.local_model = d.cleanup.local_model.clone();
         }
         match crate::providers::by_id(&c.provider).filter(|p| p.supports_cleanup()) {
@@ -803,6 +803,21 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert!(err.is_none());
         assert!(!s.onboarded);
+    }
+
+    #[test]
+    fn cleanup_import_selection_survives_sanitization_and_restart_even_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = Settings::default();
+        s.cleanup.local_model = "cleanup-import-0123456789abcdef0123456789abcdef".into();
+        let expected = s.cleanup.local_model.clone();
+        let s = s.sanitized();
+        assert_eq!(s.cleanup.local_model, expected);
+        s.save(&path).unwrap();
+        let (loaded, error) = Settings::load(&path);
+        assert!(error.is_none());
+        assert_eq!(loaded.cleanup.local_model, expected);
     }
 
     #[test]

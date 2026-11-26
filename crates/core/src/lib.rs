@@ -5,6 +5,7 @@ pub mod audio;
 pub mod autostart;
 pub mod chunking;
 pub mod cleanup;
+pub mod cleanup_imports;
 pub mod commas;
 pub mod connections;
 pub mod control;

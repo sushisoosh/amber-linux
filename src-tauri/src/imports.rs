@@ -79,6 +79,75 @@ pub fn cancel_model_import(app: AppHandle) {
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupImportResult {
+    id: String,
+    name: String,
+    selection_error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn browse_cleanup_model(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog().file().set_title("Import a trusted cleanup GGUF model")
+            .add_filter("GGUF chat model", &["gguf"]).blocking_pick_file().map(|p| {
+                p.into_path().map_err(|_| "Choose a local GGUF file.".to_string())?
+                    .into_os_string().into_string().map_err(|_| "The model path must use valid Unicode characters.".to_string())
+            }).transpose()
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_cleanup_model(app: AppHandle, request: amber_core::cleanup_imports::ImportRequest, select_after_import: bool) -> Result<CleanupImportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut active = core.downloads.lock().unwrap();
+            if active.contains_key("cleanup-model-import") { return Err("Another cleanup model import is already running.".into()); }
+            active.insert("cleanup-model-import".into(), cancel.clone());
+        }
+        let _ = app.emit("local-models-changed", ());
+        let result = amber_core::cleanup_imports::import(&core.paths.layout, &request, &cancel, &mut |done, total| {
+            let _ = app.emit("cleanup-model-import-progress", serde_json::json!({ "done": done, "total": total }));
+        }).map_err(|e| e.to_string()).map(|model| {
+            let selection_error = if select_after_import {
+                match core.try_update_settings(|s| s.cleanup.local_model = model.id.clone()) {
+                    Ok(settings) => {
+                        let _ = app.emit("settings-changed", &settings);
+                        if crate::llm::wants_local(&settings) { core.llm.warm(&app, true); }
+                        None
+                    },
+                    Err(error) => Some(error),
+                }
+            } else { None };
+            CleanupImportResult { id: model.id, name: model.name, selection_error }
+        });
+        core.downloads.lock().unwrap().remove("cleanup-model-import");
+        let _ = app.emit("local-models-changed", ());
+        result
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn cancel_cleanup_model_import(app: AppHandle) {
+    if let Some(cancel) = app.state::<Core>().downloads.lock().unwrap().get("cleanup-model-import") {
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[tauri::command]
+pub async fn remove_imported_cleanup_model(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        let removal = amber_core::cleanup_imports::prepare_remove(&core.paths.layout, &id).map_err(|e| e.to_string())?;
+        let result = core.dictation.when_idle(|| core.llm.remove_imported(&app, removal))?;
+        let _ = app.emit("local-models-changed", ());
+        result
+    }).await.map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn remove_imported_model(app: AppHandle, id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -134,6 +203,20 @@ mod tests {
         assert_eq!(value["name"], "My model");
         assert_eq!(value["selectionError"], "Settings were not saved: disk full");
         assert!(value.get("model").is_none(), "the existing imported model response remains flattened");
+    }
+
+    #[test]
+    fn cleanup_import_result_keeps_identity_when_selection_cannot_be_saved() {
+        let result = CleanupImportResult { id: "cleanup-import-0123456789abcdef0123456789abcdef".into(),
+            name: "My GGUF".into(), selection_error: Some("Settings were not saved: disk full".into()) };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["id"], result.id);
+        assert_eq!(value["name"], result.name);
+        assert_eq!(value["selectionError"], "Settings were not saved: disk full");
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert!(serde_json::from_value::<amber_core::cleanup_imports::ImportRequest>(serde_json::json!({
+            "sourcePath": "/tmp/trusted.gguf", "name": "My GGUF"
+        })).is_ok());
     }
 
     #[test]

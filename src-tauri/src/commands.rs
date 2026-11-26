@@ -407,6 +407,7 @@ pub struct LocalInfo {
     llm_status: whisper::Status,
     onnx_runtime_installed: bool,
     imports_error: Option<String>,
+    llm_imports_error: Option<String>,
 }
 
 #[tauri::command]
@@ -415,6 +416,10 @@ pub fn local_info(core: State<Core>) -> LocalInfo {
     let settings = core.settings();
     let has_nvidia = has_nvidia();
     let (imports, imports_error) = match amber_core::imports::list(layout) {
+        Ok(models) => (models, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let (llm_imports, llm_imports_error) = match amber_core::cleanup_imports::list(layout) {
         Ok(models) => (models, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
@@ -464,10 +469,16 @@ pub fn local_info(core: State<Core>) -> LocalInfo {
         llm_models: local::LLM_MODELS
             .iter()
             .map(|m| LocalItem { id: m.id.into(), label: m.label.into(), note: m.note.into(), size_mb: m.size_mb, installed: layout.llm_model_installed(m), wants_gpu: true, replaced: false, family: None, imported: false })
+            .chain(llm_imports.iter().map(|m| LocalItem {
+                id: m.id.clone(), label: m.name.clone(), note: m.note(), size_mb: m.size_mb(),
+                installed: amber_core::cleanup_imports::resolve(layout, &m.id).is_ok_and(|model| amber_core::cleanup_imports::installed(layout, &model)),
+                wants_gpu: true, replaced: false, family: None, imported: true,
+            }))
             .collect(),
         llm_status: core.llm.status(),
         onnx_runtime_installed: amber_core::onnx::runtime_installed(layout),
         imports_error,
+        llm_imports_error,
     }
 }
 
