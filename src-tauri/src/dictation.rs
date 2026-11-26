@@ -35,7 +35,7 @@ pub enum Phase {
 pub struct StateEvent {
     pub state: Phase,
     pub message: Option<String>,
-    /// While recognizing: how long it is expected to take, for the bubble's progress ring.
+    /// Expected remaining work (recognition plus cleanup); refinements never reset the ring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_ms: Option<u64>,
     /// A terminal request, not a dictation: the bubble shows ">_".
@@ -472,6 +472,12 @@ pub fn stop(app: &AppHandle) {
         let stopped = Instant::now();
         let held_ms = started.map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
         let recording = recorder.finish();
+        let settings = core.settings();
+        let audio_ms = audio::duration_ms(recording.samples.len(), recording.rate);
+        let profile = program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
+        let expected = expected_speech_ms(&core, &settings, audio_ms)
+            .saturating_add(crate::llm::expected_ms(&app, &settings, profile, None, estimate::predicted_chars(audio_ms)));
+        if !progress(&app, session, Some(expected), false) { return; }
         // Waits for a part still being recognized; what is left after it is the tail.
         let parts = chunks.map(ChunkJob::finish);
         run(&app, session, recording, parts, target, program, asked, held_ms, stopped, &cancel);
@@ -583,7 +589,7 @@ fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, pr
         // No model, or it failed: a dictation into a terminal is not lost for it.
         Err(e) if !explicit => return dictate(&format!("no command ({e})")),
         Err(e) => {
-            core.memory.remember(&core.settings(), &request, program.unwrap_or(""), "terminal", false, spoken_ms, 0);
+            core.memory.remember(&core.settings(), &request, program.unwrap_or(""), "terminal", false, spoken_ms, 0, None);
             let kept = if settings.history { " What you said is in the history." } else { "" };
             fail(app, session, format!("{e}{kept}"), true);
             return true;
@@ -610,7 +616,7 @@ fn terminal(app: &AppHandle, settings: &Settings, session: u64, spoken: &str, pr
     };
     let outcome = insert::insert(&typed, &how, target);
     let inserted = matches!(outcome, Ok(Outcome::Pasted | Outcome::Typed));
-    core.memory.remember(&core.settings(), &format!("{request} → {typed}"), program.unwrap_or(""), "terminal", inserted, spoken_ms, 0);
+    core.memory.remember(&core.settings(), &format!("{request} → {typed}"), program.unwrap_or(""), "terminal", inserted, spoken_ms, 0, None);
     let what = if settings.log_text { format!("\"{typed}\"") } else { format!("{} characters", typed.chars().count()) };
     crate::diag::info(format!("terminal: {} command {what} into {}", shell.name(), program.unwrap_or("?")));
     match risk {
@@ -684,40 +690,41 @@ fn run(
     let parts = parts.filter(|p| p.usable(recording.samples.len()));
     let tail = parts.as_ref().map(|p| audio::prepare(&recording.samples[p.cut_at..], recording.rate));
 
-    // The bubble's ring fills against what recognition is expected to take here.
-    let (estimate_key, typical) = match settings.engine {
-        EngineKind::Local => (estimate::key("local", &settings.local.runtime, &settings.local.model), 0.1),
-        EngineKind::Server => (estimate::key(&settings.server.provider, "", &settings.server.model), 0.05),
-    };
+    let profile = program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
+    let cleanup_budget = crate::llm::expected_ms(app, &settings, profile, None, estimate::predicted_chars(prepared.spoken_ms));
     let left_ms = match &tail {
         Some(Ok(t)) => t.spoken_ms,
         Some(Err(_)) => 0,
         None => prepared.spoken_ms,
     };
-    let expected = core.estimates.expected_ms(&estimate_key, left_ms, typical, OVERHEAD_MS);
+    let expected = expected_speech_ms(&core, &settings, left_ms).saturating_add(cleanup_budget);
     if !progress(app, session, Some(expected), false) { return; }
+    // Once ready, the actual route (including a previous model or a fallback) owns both the
+    // prediction and observation. Setup/retries may extend the wait, but never train it.
+    let refine = |route: &estimate::Route| {
+        progress(app, session, Some(core.estimates.expected_ms(route, left_ms).saturating_add(cleanup_budget)), false);
+    };
 
+    let transcription_started = Instant::now();
     let recognized = match (&parts, tail) {
         (Some(p), Some(Ok(t))) => {
             // The tail in the parts' language, with the text so far as its prompt.
             let language = p.language.clone().unwrap_or_else(|| settings.language.clone());
             let options = TranscribeOptions::new(&language, &chunking::prompt(&settings.vocabulary, &p.texts));
-            // A short tail costs the context floor, not its length: not worth learning from.
-            let learn = t.spoken_ms >= 5_000;
-            recognize(app, &settings, &t.wav, &options, t.spoken_ms, learn, cancel).map(|(raw, engine, ms)| (p.with_tail(Some(&raw)), engine, ms))
+            recognize(app, &settings, &t.wav, &options, t.spoken_ms, true, cancel, Some(&refine)).map(|(raw, engine, ms, timing)| (p.with_tail(Some(&raw)), engine, ms, timing))
         }
         // The tail held no speech: the parts are the whole dictation.
-        (Some(p), Some(Err(_))) => Ok((p.with_tail(None), p.engine.clone(), 0)),
+        (Some(p), Some(Err(_))) => Ok((p.with_tail(None), p.engine.clone(), 0, None)),
         _ => {
             let options = TranscribeOptions::new(&settings.language, &settings.vocabulary);
-            recognize(app, &settings, &prepared.wav, &options, prepared.spoken_ms, true, cancel)
+            recognize(app, &settings, &prepared.wav, &options, prepared.spoken_ms, true, cancel, Some(&refine))
         }
     };
     if let Some(p) = &parts {
         crate::diag::info(format!("recognized while speaking: {} parts, then the last {} ms", p.texts.len(), left_ms));
     }
     if cancel.is_cancelled() { return; }
-    let (raw, engine, recognize_ms) = match recognized {
+    let (raw, engine, recognize_ms, recognition_timing) = match recognized {
         Ok(r) => r,
         Err(message) => {
             // Kept in memory for a few minutes: one click recognizes it again.
@@ -726,18 +733,33 @@ fn run(
             });
         }
     };
+    let transcription_ms = transcription_started.elapsed().as_millis() as u64;
     let recognized = text::clean(&raw);
     let copy_only = instruction_copy_only(&settings, &recognized);
     if terminal(app, &settings, session, &recognized, program.as_deref(), &asked, target, prepared.spoken_ms) {
+        if core.dictation.phase() == Phase::Done {
+            if let Some(timing) = recognition_timing { timing.learn(&core.estimates, cancel); }
+        }
         return;
     }
-    let profile = program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
+    let cleanup_budget = crate::llm::expected_ms(app, &settings, profile, Some(&recognized), recognized.chars().count() as u64);
+    if !progress(app, session, Some(cleanup_budget), false) { return; }
+    let cleanup_started = Instant::now();
     let (cleaned, skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, cancel);
+    let timings = amber_core::history::Timings {
+        recording_ms: Some(audio::duration_ms(recording.samples.len(), recording.rate)),
+        transcription_ms,
+        cleanup_ms: cleanup_started.elapsed().as_millis() as u64,
+        processing_ms: stopped.elapsed().as_millis() as u64,
+        live: parts.is_some(),
+        cleanup_skipped: skipped.is_some(),
+    };
     if cancel.is_cancelled() { return; }
     if cleaned.is_empty() {
         crate::diag::info(format!("{} ms of audio, nothing recognized", prepared.spoken_ms));
         return fail(app, session, "Nothing recognized.".into(), false);
     }
+    if let Some(timing) = recognition_timing { timing.learn(&core.estimates, cancel); }
 
     #[cfg(target_os = "linux")]
     {
@@ -773,7 +795,7 @@ fn run(
         let message = result.message.clone();
         if keep_result(app, session, result, copy_only) {
             core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
-                prepared.spoken_ms, stopped.elapsed().as_millis() as u64);
+                prepared.spoken_ms, stopped.elapsed().as_millis() as u64, Some(timings));
             crate::notify(app, "Amber", &message);
         }
         let _ = (recognize_ms, target);
@@ -797,7 +819,7 @@ fn run(
             return fail(app, session, format!("The shell instruction could not be copied: {e}"), true);
         }
         core.memory.remember(&core.settings(), &cleaned, program.as_deref().unwrap_or(""), &engine, false,
-            prepared.spoken_ms, stopped.elapsed().as_millis() as u64);
+            prepared.spoken_ms, stopped.elapsed().as_millis() as u64, Some(timings));
         let message = format!("{}Shell instruction copied for review. Amber did not paste it or press Enter.",
             skipped.map(|why| format!("{why} ")).unwrap_or_default());
         core.dictation.inner.lock().unwrap().phase = Phase::Done;
@@ -819,6 +841,7 @@ fn run(
         inserted,
         prepared.spoken_ms,
         stopped.elapsed().as_millis() as u64,
+        Some(timings),
     );
     match outcome {
         Ok(Outcome::OnClipboard(message)) => {
@@ -885,7 +908,14 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
     failed.remote_speech |= settings.engine == EngineKind::Server;
     let started = Instant::now();
     let options = TranscribeOptions::new(&settings.language, &settings.vocabulary);
-    let (raw, engine, _) = match recognize(app, &settings, &failed.wav, &options, failed.spoken_ms, true, &cancel) {
+    let profile = failed.program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
+    let cleanup_budget = crate::llm::expected_ms(app, &settings, profile, None, estimate::predicted_chars(failed.spoken_ms));
+    progress(app, session, Some(expected_speech_ms(&core, &settings, failed.spoken_ms).saturating_add(cleanup_budget)), false);
+    let refine = |route: &estimate::Route| {
+        progress(app, session, Some(core.estimates.expected_ms(route, failed.spoken_ms).saturating_add(cleanup_budget)), false);
+    };
+    let transcription_started = Instant::now();
+    let (raw, engine, _, recognition_timing) = match recognize(app, &settings, &failed.wav, &options, failed.spoken_ms, true, &cancel, Some(&refine)) {
         Ok(r) => r,
         Err(e) => {
             // Still there for another try (another engine, the key fixed) - unless a newer
@@ -895,16 +925,27 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
             return Err(e);
         }
     };
-    let profile = failed.program.as_deref().and_then(|p| amber_core::profiles::find(&settings.profiles, p));
+    let transcription_ms = transcription_started.elapsed().as_millis() as u64;
     cancel.check().map_err(|e| e.message)?;
     let recognized = text::clean(&raw);
     let copy_only = instruction_copy_only(&settings, &recognized);
-    let (text, _, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, &cancel);
+    progress(app, session, Some(crate::llm::expected_ms(app, &settings, profile, Some(&recognized), recognized.chars().count() as u64)), false);
+    let cleanup_started = Instant::now();
+    let (text, skipped, remote_cleanup) = crate::llm::tidy_cancellable(app, &settings, &recognized, profile, true, &cancel);
+    let timings = amber_core::history::Timings {
+        recording_ms: None,
+        transcription_ms,
+        cleanup_ms: cleanup_started.elapsed().as_millis() as u64,
+        processing_ms: started.elapsed().as_millis() as u64,
+        live: false,
+        cleanup_skipped: skipped.is_some(),
+    };
     cancel.check().map_err(|e| e.message)?;
     if text.is_empty() {
         fail(app, session, "Nothing recognized.".into(), false);
         return Err("Nothing recognized.".into());
     }
+    if let Some(timing) = recognition_timing { timing.learn(&core.estimates, &cancel); }
     #[cfg(target_os = "linux")]
     if !keep_result(app, session, DictationResult {
         text: text.clone(),
@@ -933,7 +974,7 @@ pub fn recognize_again(app: &AppHandle) -> Result<String, String> {
         settle(app, session, Duration::from_millis(900));
         let _ = (remote_cleanup, copy_only);
     }
-    core.memory.remember(&settings, &text, failed.program.as_deref().unwrap_or(""), &engine, false, failed.spoken_ms, started.elapsed().as_millis() as u64);
+    core.memory.remember(&core.settings(), &text, failed.program.as_deref().unwrap_or(""), &engine, false, failed.spoken_ms, started.elapsed().as_millis() as u64, Some(timings));
     crate::diag::info(format!("recognized again: {} words", text::words(&text)));
     Ok(text)
 }
@@ -1046,16 +1087,52 @@ impl ChunkJob {
 pub struct Picked {
     pub transcriber: Box<dyn Transcriber>,
     label: String,
-    estimate_key: String,
+    estimate_route: estimate::Route,
     metadata: amber_core::testing::Engine,
 }
 
-/// Fixed cost per request on top of the audio: a round trip, a context switch.
-const OVERHEAD_MS: u64 = 200;
+/// One in-flight measurement, discarded on cancellation. It is merged into moments only
+/// after cleanup returns; no observation record is ever persisted.
+struct RecognitionTiming {
+    route: estimate::Route,
+    audio_ms: u64,
+    took_ms: u64,
+}
+
+impl RecognitionTiming {
+    fn learn(self, estimates: &estimate::Estimates, cancel: &CancellationToken) {
+        estimates.observe(&self.route, self.audio_ms, self.took_ms, !cancel.is_cancelled());
+    }
+}
+
+type Recognition = (String, String, u128, Option<RecognitionTiming>);
+
+/// A non-blocking initial guess. Readiness refines it using the actual Served metadata.
+fn expected_speech_ms(core: &Core, settings: &Settings, audio_ms: u64) -> u64 {
+    let route = match settings.engine {
+        EngineKind::Server => estimate::server_speech(settings),
+        EngineKind::Local => {
+            let onnx = amber_core::imports::resolve(&core.paths.layout, &settings.local.model).is_ok_and(|m| m.is_onnx());
+            Some(local_estimate(settings, &settings.local.model, onnx))
+        }
+    };
+    route.map(|r| core.estimates.expected_ms(&r, audio_ms)).unwrap_or(0)
+}
+
+pub(crate) fn local_estimate(settings: &Settings, model: &str, onnx: bool) -> estimate::Route {
+    let runtime = if onnx { "onnx-cpu" } else if cfg!(target_os = "linux") { "cpu" } else { &settings.local.runtime };
+    let mut threads = if onnx { 0 } else if settings.local.threads == 0 { local::default_threads() } else { settings.local.threads };
+    if !onnx && cfg!(target_os = "linux") {
+        threads = threads.min(std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)).max(1);
+    }
+    estimate::local_speech(settings, runtime, model, threads)
+}
 
 /// Recognizes [wav] with the engine the settings ask for. A local server that went away
 /// mid-request gets one more try; a server that cannot be reached hands the recording to a
-/// downloaded local model (if allowed) - never the other way round. Learns how long it took.
+/// downloaded local model (if allowed) - never the other way round. Returns the successful
+/// attempt's timing for learning after the cancellable pipeline finishes.
+#[allow(clippy::too_many_arguments)]
 fn recognize(
     app: &AppHandle,
     settings: &Settings,
@@ -1064,34 +1141,44 @@ fn recognize(
     spoken_ms: u64,
     learn: bool,
     cancel: &CancellationToken,
-) -> Result<(String, String, u128), String> {
-    recognize_with_report(app, settings, wav, options, spoken_ms, learn, cancel, None)
+    refine: Option<&dyn Fn(&estimate::Route)>,
+) -> Result<Recognition, String> {
+    recognize_with_report(app, settings, wav, options, spoken_ms, learn, cancel, None, refine)
 }
 
 pub(crate) fn recognize_for_test(app: &AppHandle, settings: &Settings, wav: &[u8], result: &mut amber_core::testing::Result, cancel: &CancellationToken) -> Result<String, String> {
     let started = Instant::now();
     let options = TranscribeOptions::new(&settings.language, &settings.vocabulary);
-    let recognized = recognize_with_report(app, settings, wav, &options, result.prepared_audio_ms, false, cancel, Some(result));
+    let recognized = recognize_with_report(app, settings, wav, &options, result.prepared_audio_ms, false, cancel, Some(result), None);
     result.recognition_ms = Some(started.elapsed().as_millis() as u64);
-    recognized.map(|(raw, _, _)| raw)
+    recognized.map(|(raw, _, _, _)| raw)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn recognize_with_report(
     app: &AppHandle, settings: &Settings, wav: &[u8], options: &TranscribeOptions,
     spoken_ms: u64, learn: bool, cancel: &CancellationToken, mut report: Option<&mut amber_core::testing::Result>,
-) -> Result<(String, String, u128), String> {
+    refine: Option<&dyn Fn(&estimate::Route)>,
+) -> Result<Recognition, String> {
     let _quiet = report.is_some().then(crate::diag::silence);
     cancel.check().map_err(|e| e.message)?;
+    // A live tail can use the language detected by earlier parts. Its dynamic prompt may
+    // contain dictated text: never use that prompt in a persistent identity.
+    let mut actual_settings = settings.clone();
+    actual_settings.language = options.language.clone().unwrap_or_else(|| "auto".into());
+    let settings = &actual_settings;
     let core = app.state::<Core>();
     let pick = || if report.is_some() && settings.engine == EngineKind::Local {
         local_snapshot(app, settings)
     } else { transcriber(app, settings) };
     let mut picked = pick()?;
-    let mut t0 = Instant::now();
+    if let Some(refine) = refine { refine(&picked.estimate_route); }
+    cancel.check().map_err(|e| e.message)?;
+    let t0 = Instant::now();
     let (mut result, upload) = picked.transcriber.transcribe_with_upload(wav, options, cancel);
+    let mut took = t0.elapsed().as_millis();
     if let Some(report) = report.as_deref_mut() {
-        report.attempted(picked.metadata.clone(), t0.elapsed().as_millis() as u64, result.as_ref().err().map(|e| e.message.clone()));
+        report.attempted(picked.metadata.clone(), took as u64, result.as_ref().err().map(|e| e.message.clone()));
         if let Some(attempt) = report.attempts.last_mut() { attempt.upload = upload; }
     }
     cancel.check().map_err(|e| e.message)?;
@@ -1102,28 +1189,32 @@ fn recognize_with_report(
             // Restarted for another model, or crashed.
             crate::diag::warn("local engine went away during the request, trying again");
             picked = if report.is_some() { local_snapshot(app, settings)? } else { transcriber(app, settings)? };
-            t0 = Instant::now();
+            if let Some(refine) = refine { refine(&picked.estimate_route); }
+            let t0 = Instant::now();
             result = picked.transcriber.transcribe_cancellable(wav, options, cancel);
+            took = t0.elapsed().as_millis();
             if let Some(report) = report.as_deref_mut() {
-                report.attempted(picked.metadata.clone(), t0.elapsed().as_millis() as u64, result.as_ref().err().map(|e| e.message.clone()));
+                report.attempted(picked.metadata.clone(), took as u64, result.as_ref().err().map(|e| e.message.clone()));
             }
         } else if settings.engine == EngineKind::Server && e.kind.service_unavailable() && settings.server.local_fallback && local_ready(&core, settings) {
             crate::diag::warn(format!("server unavailable ({}), recognizing on this PC", e.detail));
             let server_error = e.message.clone();
-            let local_result = (if report.is_some() { local_snapshot(app, settings) } else { local(app) }).and_then(|p| {
+            let local_result = (if report.is_some() { local_snapshot(app, settings) } else { local(app, settings) }).and_then(|p| {
+                if let Some(refine) = refine { refine(&p.estimate_route); }
                 let t = Instant::now();
                 let r = p.transcriber.transcribe_cancellable(wav, options, cancel).map_err(|e| e.message);
+                let took = t.elapsed().as_millis();
                 if let Some(report) = report.as_deref_mut() {
-                    report.attempted(p.metadata.clone(), t.elapsed().as_millis() as u64, r.as_ref().err().cloned());
+                    report.attempted(p.metadata.clone(), took as u64, r.as_ref().err().cloned());
                 }
-                Ok((p, t, r))
+                Ok((p, took, r))
             });
             match local_result {
                 Ok((p, t, Ok(raw))) => {
                     if report.is_none() { crate::notify(app, "Amber", "The server could not be reached - recognized on this PC instead."); }
                     unload_after_fallback(app);
                     picked = p;
-                    t0 = t;
+                    took = t;
                     result = Ok(raw);
                 }
                 // The server's failure is the one the user needs to hear about.
@@ -1134,13 +1225,17 @@ fn recognize_with_report(
             }
         }
     }
+    finish_recognition(picked, result, spoken_ms, took, learn && report.is_none(), cancel)
+}
+
+fn finish_recognition(picked: Picked, result: Result<String, amber_core::engine::SttError>, spoken_ms: u64, took: u128, learn: bool, cancel: &CancellationToken) -> Result<Recognition, String> {
+    cancel.check().map_err(|e| e.message)?;
     match result {
         Ok(raw) => {
-            let took = t0.elapsed().as_millis();
-            if learn {
-                core.estimates.learn(&picked.estimate_key, spoken_ms, took as u64, OVERHEAD_MS);
-            }
-            Ok((raw, picked.label, took))
+            let timing = (learn && !text::clean(&raw).is_empty()).then_some(RecognitionTiming {
+                route: picked.estimate_route, audio_ms: spoken_ms, took_ms: took.min(u64::MAX as u128) as u64,
+            });
+            Ok((raw, picked.label, took, timing))
         }
         Err(e) => {
             crate::diag::warn(format!("engine error: {}", e.detail));
@@ -1184,25 +1279,25 @@ fn local_ready(core: &Core, s: &Settings) -> bool {
 
 /// The local whisper server - with a short encoder context when the model it runs (which may
 /// still be the previous one while the chosen one downloads) was tuned for it.
-fn local(app: &AppHandle) -> Result<Picked, String> {
-    local_model(app, None)
+fn local(app: &AppHandle, settings: &Settings) -> Result<Picked, String> {
+    local_model(app, None, settings)
 }
 
 /// The local engine with [model] instead of the configured one (the phone's choice).
-fn local_model(app: &AppHandle, model: Option<&str>) -> Result<Picked, String> {
+fn local_model(app: &AppHandle, model: Option<&str>, settings: &Settings) -> Result<Picked, String> {
     let served = app.state::<Core>().whisper.ensure_model(app, model)?;
-    Ok(picked_local(served))
+    Ok(picked_local(served, settings))
 }
 
 fn local_snapshot(app: &AppHandle, settings: &Settings) -> Result<Picked, String> {
-    Ok(picked_local(app.state::<Core>().whisper.ensure_snapshot(app, &settings.local)?))
+    Ok(picked_local(app.state::<Core>().whisper.ensure_snapshot(app, &settings.local)?, settings))
 }
 
-fn picked_local(served: crate::whisper::Served) -> Picked {
+fn picked_local(served: crate::whisper::Served, settings: &Settings) -> Picked {
     Picked {
         transcriber: served.transcriber,
         label: format!("local {}/{}", served.runtime, served.model),
-        estimate_key: estimate::key("local", &served.runtime, &served.model),
+        estimate_route: estimate::local_speech(settings, &served.runtime, &served.model, served.threads),
         metadata: amber_core::testing::Engine::local(&served.runtime, &served.model),
     }
 }
@@ -1214,14 +1309,14 @@ pub fn transcriber_for(app: &AppHandle, settings: &Settings, model: Option<&str>
     if let Some(id) = model.filter(|id| id.starts_with("import-")) {
         let imported = amber_core::imports::resolve(layout, id).map_err(|e| e.to_string())?;
         if !amber_core::imports::installed(layout, &imported) { return Err("The requested imported model is missing or incomplete. Import it again.".into()); }
-        return local_model(app, Some(id));
+        return local_model(app, Some(id), settings);
     }
     if let Some(m) = model.and_then(amber_core::onnx::model).filter(|m| amber_core::onnx::installed(layout, m)) {
-        return local_model(app, Some(m.id));
+        return local_model(app, Some(m.id), settings);
     }
     if let Some(m) = model.and_then(local::model).filter(|m| layout.model_installed(m)) {
         if !(settings.engine == EngineKind::Local && settings.local.model == m.id) {
-            return local_model(app, Some(m.id));
+            return local_model(app, Some(m.id), settings);
         }
     }
     if model.is_some_and(|id| id == settings.server.model) && settings.engine != EngineKind::Server {
@@ -1236,7 +1331,7 @@ pub fn transcriber_for(app: &AppHandle, settings: &Settings, model: Option<&str>
 pub fn transcriber(app: &AppHandle, settings: &Settings) -> Result<Picked, String> {
     let core = app.state::<Core>();
     match settings.engine {
-        EngineKind::Local => local(app),
+        EngineKind::Local => local(app, settings),
         EngineKind::Server => {
             let target = amber_core::connections::resolve_speech(settings)?;
             let key = crate::connections::key_for(&core, &target)?;
@@ -1246,7 +1341,7 @@ pub fn transcriber(app: &AppHandle, settings: &Settings) -> Result<Picked, Strin
             Ok(Picked {
                 transcriber: Box::new(transcriber),
                 label: format!("{} {}", provider.id, settings.server.model),
-                estimate_key: estimate::key(provider.id, "", &settings.server.model),
+                estimate_route: estimate::server_speech(settings).ok_or("Invalid recognition route.")?,
                 metadata: amber_core::testing::Engine::server(provider.id, &base, &settings.server.model),
             })
         }
@@ -1272,6 +1367,57 @@ mod windows_whisper_tests;
 #[cfg(test)]
 mod testing_tests {
     use super::*;
+
+    fn picked(settings: &Settings, runtime: &str, model: &str, threads: u32) -> Picked {
+        picked_local(crate::whisper::Served {
+            transcriber: Box::new(amber_core::engine::WhisperServerTranscriber::new("http://127.0.0.1:9", None)),
+            runtime: runtime.into(), model: model.into(), threads,
+        }, settings)
+    }
+
+    #[test]
+    fn actual_onnx_and_effective_threads_share_prediction_and_observation_keys() {
+        let mut settings = Settings::default();
+        settings.local.runtime = "cuda".into();
+        settings.local.threads = 32;
+        let estimates = estimate::Estimates::in_memory();
+        let cancel = CancellationToken::default();
+        let route = local_estimate(&settings, "onnx-model", true);
+        assert!(estimates.measured_ms(&route, 10_000).is_none());
+        finish_recognition(picked(&settings, "onnx-cpu", "onnx-model", 0), Ok("Hello".into()), 10_000, 1_500, true, &cancel).unwrap().3.unwrap().learn(&estimates, &cancel);
+        assert!(estimates.measured_ms(&route, 10_000).is_some());
+        // The current selection must not replace the engine that actually served the request.
+        let fallback = estimate::local_speech(&settings, "cpu", "previous-model", 2);
+        finish_recognition(picked(&settings, "cpu", "previous-model", 2), Ok("Hello".into()), 10_000, 3_000, true, &cancel).unwrap().3.unwrap().learn(&estimates, &cancel);
+        assert!(estimates.measured_ms(&fallback, 10_000).is_some());
+        assert!(estimates.measured_ms(&local_estimate(&settings, "different-model", false), 10_000).is_none());
+        assert!(estimates.measured_ms(&estimate::server_speech(&settings).unwrap(), 10_000).is_none(), "no failed server timing is attributed to the fallback");
+    }
+
+    #[test]
+    fn testing_failed_cancelled_and_empty_recognition_never_learn() {
+        let settings = Settings::default();
+        let estimates = estimate::Estimates::in_memory();
+        let route = estimate::local_speech(&settings, "cpu", "model", 4);
+        for (learn, cancelled, result) in [
+            (false, false, Ok("Testing text".into())),
+            (true, true, Ok("Cancelled text".into())),
+            (true, false, Err(amber_core::engine::SttError::new(ErrorKind::Server, "failed", "test failure"))),
+            (true, false, Ok(String::new())),
+        ] {
+            let cancel = CancellationToken::default();
+            if cancelled { cancel.cancel(); }
+            if let Ok((_, _, _, Some(timing))) = finish_recognition(picked(&settings, "cpu", "model", 4), result, 10_000, 500, learn, &cancel) {
+                timing.learn(&estimates, &cancel);
+            }
+            assert!(estimates.measured_ms(&route, 10_000).is_none());
+        }
+        let cancel = CancellationToken::default();
+        let pending = finish_recognition(picked(&settings, "cpu", "model", 4), Ok("Recognized before cleanup cancellation".into()), 10_000, 500, true, &cancel).unwrap().3.unwrap();
+        cancel.cancel();
+        pending.learn(&estimates, &cancel);
+        assert!(estimates.measured_ms(&route, 10_000).is_none());
+    }
 
     #[test]
     fn shell_instructions_are_copy_only_even_when_terminal_auto_run_and_paste_are_enabled() {

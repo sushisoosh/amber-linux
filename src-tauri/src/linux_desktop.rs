@@ -1437,12 +1437,17 @@ mod x11 {
             assert!(paste_explicit("stale focus", second, true, "Ctrl+KeyV").unwrap_err().contains("changed"));
             conn.set_input_focus(InputFocus::PARENT, second.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(paste_explicit("stale leaf", leaf, true, "Ctrl+KeyV").unwrap_err().contains("changed"));
+            // Keep i3 from repairing these deliberately invalid focus states before checking them.
+            // Use the grabbing connection; remember_target() opens another and would block.
+            conn.grab_server().unwrap().check().unwrap();
             conn.set_input_focus(InputFocus::PARENT, target.window, x11rb::CURRENT_TIME).unwrap().check().unwrap();
             assert!(snapshot(&conn, root).is_err(), "Unrelated active window and focus must fail closed");
             conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME).unwrap().check().unwrap();
-            assert!(remember_target().is_none());
+            assert_eq!(snapshot(&conn, root).unwrap_err(), "No observable X11 input focus");
+            conn.ungrab_server().unwrap().check().unwrap();
             conn.destroy_window(second.window).unwrap().check().unwrap();
             conn.destroy_window(target.window).unwrap().check().unwrap();
+            assert!(remember_target().is_none());
             assert!(paste_explicit("destroyed", leaf, true, "Ctrl+KeyV").is_err());
             assert!(key_events(&conn).is_empty());
         }

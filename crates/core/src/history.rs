@@ -8,6 +8,21 @@ use serde::{Deserialize, Serialize};
 pub const MAX_ENTRIES: usize = 500;
 pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Wall times for one completed conversion, stored only with its history entry.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Timings {
+    /// Original microphone duration is unavailable when retrying prepared audio.
+    pub recording_ms: Option<u64>,
+    pub transcription_ms: u64,
+    pub cleanup_ms: u64,
+    /// Stop/retry to cleaned text, excluding insertion and recording.
+    pub processing_ms: u64,
+    pub live: bool,
+    /// Smart cleanup was unavailable or failed; fallback text was retained.
+    pub cleanup_skipped: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
@@ -19,6 +34,8 @@ pub struct Entry {
     pub engine: String,
     /// Inserted, or left on the clipboard / only kept here.
     pub inserted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
@@ -73,7 +90,7 @@ mod tests {
     use super::*;
 
     fn entry(at: u64, text: &str) -> Entry {
-        Entry { at, text: text.into(), program: "notepad.exe".into(), engine: "local".into(), inserted: true }
+        Entry { at, text: text.into(), program: "notepad.exe".into(), engine: "local".into(), inserted: true, timings: None }
     }
 
     #[test]
@@ -109,5 +126,29 @@ mod tests {
         h.add(entry(5, "Hallo"), 5, 7);
         assert_eq!(History::from_bytes(&h.to_bytes()), h);
         assert_eq!(History::from_bytes(b"not json"), History::default());
+    }
+
+    #[test]
+    fn legacy_entries_have_no_invented_timings() {
+        let h = History::from_bytes(br#"{"entries":[{"at":5,"text":"old","program":"editor","engine":"local","inserted":true}]}"#);
+        assert_eq!(h.entries().len(), 1);
+        assert_eq!(h.latest().unwrap().timings, None);
+    }
+
+    #[test]
+    fn timings_round_trip_and_follow_history_retention() {
+        let mut h = History::default();
+        let mut e = entry(DAY_MS, "measured");
+        e.timings = Some(Timings {
+            recording_ms: None, transcription_ms: 123, cleanup_ms: 0, processing_ms: 130,
+            live: false, cleanup_skipped: true,
+        });
+        h.add(e, DAY_MS, 7);
+        assert_eq!(History::from_bytes(&h.to_bytes()), h);
+        let json: serde_json::Value = serde_json::from_slice(&h.to_bytes()).unwrap();
+        assert!(json["entries"][0]["timings"]["recordingMs"].is_null());
+        assert_eq!(json["entries"][0]["timings"]["cleanupMs"], 0);
+        h.prune(10 * DAY_MS, 7);
+        assert!(h.entries().is_empty());
     }
 }

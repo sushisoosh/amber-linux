@@ -11,7 +11,7 @@ import { AppPage } from "./pages/AppPage";
 import { CleanupPage } from "./pages/Cleanup";
 import { CredentialLink, CredentialsPage } from "./pages/Credentials";
 import { EnginePage, visibleSpeechModels } from "./pages/Engine";
-import { HistoryPage } from "./pages/History";
+import { HistoryPage, HistoryTimings } from "./pages/History";
 import { accelerator, DEFAULT_PASTE_SHORTCUT, HotkeyInput, HotkeysPage, pretty } from "./pages/Hotkeys";
 import { InsertPage } from "./pages/Insert";
 import { MicrophonePage } from "./pages/Microphone";
@@ -22,6 +22,80 @@ import { availableConnections, chooseConnection, eligibleModels } from "./connec
 import { ConnectionsPage } from "./pages/Connections";
 import { BASH_EXAMPLE, instructionIssue, instructionKeyword, InstructionsPage } from "./pages/Instructions";
 import "./history.test";
+import { progress, ProgressRing } from "../bubble/fire";
+
+test("progress refinements preserve continuity through recognition, cleanup and overruns", () => {
+  const ring = new ProgressRing();
+  assert.equal(ring.at(0), null);
+  ring.expect(1000, 0);
+  assert.equal(ring.at(500), 0.5);
+  ring.expect(10_000, 500);
+  assert.equal(ring.at(500), 0.5, "a slower actual route cannot move backwards");
+  const beforeCleanup = ring.at(1500)!;
+  assert.ok(beforeCleanup > 0.5 && beforeCleanup < 0.9);
+  ring.expect(300, 1500);
+  assert.equal(ring.at(1500), beforeCleanup, "actual text size does not reset or jump");
+  const later = ring.at(1600)!;
+  assert.ok(later > beforeCleanup);
+  ring.expect(0, 1600);
+  assert.equal(ring.at(1600), later, "zero remaining work still needs a terminal state");
+  assert.equal(ring.at(1e20), 0.98);
+  assert.equal(ring.at(0), 0.98, "clock anomalies cannot regress progress");
+  ring.expect(Number.NaN, 1e20);
+  assert.equal(ring.at(1e20), 0.98);
+  ring.reset();
+  assert.equal(ring.at(1e20), null);
+  ring.expect(500, 100);
+  assert.equal(ring.at(100), 0);
+  assert.equal(progress(Number.NaN, 100), 0);
+  assert.equal(progress(100, Number.POSITIVE_INFINITY), 0);
+});
+
+test("history explains independent indefinite aggregate learning even when history is off", () => {
+  const html = render(HistoryPage, props("linux", { history: false, statistics: false }));
+  assert.match(html, /kept locally indefinitely/);
+  assert.match(html, /no audio, transcripts or individual timing records/);
+  assert.match(html, /after deleting history/);
+});
+
+test("everyday timings distinguish legacy, retry, live and skipped cleanup", () => {
+  const base = { at: 100, text: "Everyday text", program: "editor", engine: "local", inserted: false };
+  const html = renderToStaticMarkup(<HistoryTimings entries={[
+    base,
+    { ...base, at: 200, timings: { recordingMs: null, transcriptionMs: 123, cleanupMs: 0, processingMs: 130, live: false, cleanupSkipped: true } },
+    { ...base, at: 300, timings: { recordingMs: 5000, transcriptionMs: 50, cleanupMs: 10, processingMs: 65, live: true, cleanupSkipped: false } },
+  ]} />);
+  assert.match(html, /<table/);
+  assert.match(html, /Recording/);
+  assert.match(html, /Transcription after stop/);
+  assert.match(html, /Processing total/);
+  assert.equal((html.match(/Not measured/g) ?? []).length, 4);
+  assert.match(html, /Retry: no new recording/);
+  assert.match(html, /Live chunking: remaining work only/);
+  assert.match(html, /0<small>Smart cleanup skipped or failed; fallback text kept/);
+  assert.match(html, /Everyday text/);
+});
+
+test("everyday timing table follows history opt-in and filters", (t) => {
+  const entries = [
+    { at: 100, text: "Visible dictation", program: "editor", engine: "local", inserted: false },
+    { at: 200, text: "Filtered dictation", program: "browser", engine: "local", inserted: true },
+  ];
+  const original = React.useState;
+  let calls = 0;
+  t.mock.method(React, "useState", ((initial: unknown) => {
+    const call = calls++;
+    return original(call === 0 ? entries : call === 3
+      ? { query: "", program: "editor", date: "all", status: "all" } : initial);
+  }) as typeof React.useState);
+  const enabled = render(HistoryPage, props("linux", { history: true }));
+  assert.match(enabled, /Everyday dictation timings/);
+  assert.match(enabled, /Visible dictation/);
+  assert.doesNotMatch(enabled, /Filtered dictation/);
+  calls = 0;
+  const disabled = render(HistoryPage, props("linux", { history: false }));
+  assert.doesNotMatch(disabled, /Everyday dictation timings|Visible dictation|Filtered dictation/);
+});
 
 const settings: Settings = {
   engine: "server", local: { runtime: "cpu", model: "tiny", threads: 0, keepLoaded: false, chunking: false },

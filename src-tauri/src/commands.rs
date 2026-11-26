@@ -412,6 +412,7 @@ pub struct LocalInfo {
 #[tauri::command]
 pub fn local_info(core: State<Core>) -> LocalInfo {
     let layout = &core.paths.layout;
+    let settings = core.settings();
     let has_nvidia = has_nvidia();
     let (imports, imports_error) = match amber_core::imports::list(layout) {
         Ok(models) => (models, None),
@@ -443,18 +444,14 @@ pub fn local_info(core: State<Core>) -> LocalInfo {
         measured: local::MODELS
             .iter()
             .filter_map(|m| {
-                let key = amber_core::estimate::key("local", &core.settings().local.runtime, m.id);
                 // What a 10-second dictation takes on this PC, once measured.
-                core.estimates.rate(&key).map(|r| (m.id.to_string(), 200 + (10_000.0 * r.per_ms) as u64))
+                core.estimates.measured_ms(&crate::dictation::local_estimate(&settings, m.id, false), 10_000).map(|ms| (m.id.to_string(), ms))
             })
             .chain(amber_core::onnx::MODELS.iter().filter_map(|m| {
-                let key = amber_core::estimate::key("local", "onnx-cpu", m.id);
-                core.estimates.rate(&key).map(|r| (m.id.to_string(), 200 + (10_000.0 * r.per_ms) as u64))
+                core.estimates.measured_ms(&crate::dictation::local_estimate(&settings, m.id, true), 10_000).map(|ms| (m.id.to_string(), ms))
             }))
             .chain(imports.iter().filter_map(|m| {
-                let runtime = if m.variant == amber_core::imports::Variant::Whisper { core.settings().local.runtime } else { "onnx-cpu".into() };
-                let key = amber_core::estimate::key("local", &runtime, &m.id);
-                core.estimates.rate(&key).map(|r| (m.id.clone(), 200 + (10_000.0 * r.per_ms) as u64))
+                core.estimates.measured_ms(&crate::dictation::local_estimate(&settings, &m.id, m.variant != amber_core::imports::Variant::Whisper), 10_000).map(|ms| (m.id.clone(), ms))
             }))
             .collect(),
         status: core.whisper.status(),

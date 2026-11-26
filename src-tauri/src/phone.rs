@@ -64,7 +64,7 @@ pub fn sync(app: &AppHandle) {
         // ready - never a wait for a model that is still loading.
         record: Arc::new(move |text, audio_ms, wait_ms| {
             let core = r.state::<Core>();
-            core.memory.remember(&core.settings(), text, "phone", "phone API", true, audio_ms, wait_ms);
+            core.memory.remember(&core.settings(), text, "phone", "phone API", true, audio_ms, wait_ms, None);
         }),
         tidy: Arc::new(move |text| {
             let settings = t.state::<Core>().settings();
